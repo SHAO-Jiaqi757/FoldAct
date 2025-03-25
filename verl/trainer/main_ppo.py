@@ -17,7 +17,6 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 import ray
 import hydra
-from functools import partial
 
 
 @hydra.main(config_path='config', config_name='ppo_trainer', version_base=None)
@@ -116,26 +115,9 @@ def main_task(config):
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
     assert config.actor_rollout_ref.rollout.n == 1, "In verl, n>1 is for GRPO. In verl+env, we keep n=1, and achieve GRPO by env.rollout.n"
-    if "gym_cards" in config.env.env_name.lower():
-        from agent_system.environments import GymCardEnvironmentManager
-        from agent_system.environments.gym_cards import make_vec_envs, gym_projection
 
-        train_num_processes = config.data.train_batch_size * config.env.rollout.n
-        val_num_processes = config.data.val_batch_size * config.env.rollout.n
-        print("training env num_processes: ", train_num_processes)
-        print("validation env num_processes: ", val_num_processes)
-        _envs = make_vec_envs(config.env.env_name, config.env.seed, train_num_processes,
-                             config.env.gamma, log_dir=None, device='cpu', allow_early_resets=False, num_frame_stack=1)
-        _eval_envs = make_vec_envs(config.env.env_name, config.env.seed + 1000, val_num_processes,
-                            config.env.gamma, log_dir=None, device='cpu', allow_early_resets=False, num_frame_stack=1)
-        
-        projection_f = partial(gym_projection, env_name=config.env.env_name)
-        envs = GymCardEnvironmentManager(_envs, projection_f, config.env.env_name)
-        eval_envs = GymCardEnvironmentManager(_eval_envs, projection_f, config.env.env_name)
-        print("Environments are created successfully")
-    else:
-        print("Environment not supported")
-        exit(1)
+    from agent_system.environments import make_envs
+    envs, val_envs = make_envs(config)
 
     trainer = RayPPOTrainer(config=config,
                             tokenizer=tokenizer,
@@ -146,7 +128,7 @@ def main_task(config):
                             reward_fn=reward_fn,
                             val_reward_fn=val_reward_fn,
                             envs=envs,
-                            eval_envs=eval_envs,
+                            val_envs=val_envs,
                             )
     trainer.init_workers()
     trainer.fit()

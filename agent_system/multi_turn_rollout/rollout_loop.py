@@ -68,7 +68,7 @@ def preprocess_single_sample(
 
     # Build obs content
     if obs_text is not None or pre_action is not None:
-        obs_content += TEXT_AUXILIARY_START
+        # obs_content += TEXT_AUXILIARY_START
         # Add text observation if exists
         if obs_text is not None:
             # obs_content += OBS_TEXT_START
@@ -313,7 +313,7 @@ def traj_collect_loop(gen_batch: DataProto, actor_rollout_wg, envs: EnvironmentM
     device = gen_batch.batch['input_ids'].device
     
     # Initial observations from the environment
-    obs = envs.reset() # observations is a dict with keys 'image' and 'text'
+    obs, infos = envs.reset()
     
     batch_output = None
     
@@ -322,6 +322,7 @@ def traj_collect_loop(gen_batch: DataProto, actor_rollout_wg, envs: EnvironmentM
     is_done = np.zeros(batch_size, dtype=bool)
     traj_uid = np.array([str(uuid.uuid4()) for _ in range(batch_size)], dtype=object)
     total_batch_list = [list() for _ in range(batch_size)]
+    total_infos = [list() for _ in range(batch_size)]
     episode_lengths = np.zeros(batch_size, dtype=np.int32)
     episode_rewards = np.zeros(batch_size, dtype=np.float32)
     # Trajectory collection loop
@@ -384,6 +385,7 @@ def traj_collect_loop(gen_batch: DataProto, actor_rollout_wg, envs: EnvironmentM
 
         for i in range(batch_size):
             total_batch_list[i].append(batch_list[i])
+            total_infos[i].append(infos[i])
 
         # Update done states
         is_done = np.logical_or(is_done, dones)
@@ -396,9 +398,11 @@ def traj_collect_loop(gen_batch: DataProto, actor_rollout_wg, envs: EnvironmentM
             break
     
     success = envs.success_evaluator(
+                total_infos=total_infos,
+                total_batch_list=total_batch_list,
                 episode_rewards=episode_rewards, 
                 episode_lengths=episode_lengths,
-                **batch.non_tensor_batch)
+                )
 
     # Create trajectory data
     gen_batch_output: DataProto = gather_rollout_data(

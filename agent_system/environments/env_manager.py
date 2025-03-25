@@ -1,27 +1,53 @@
 from typing import List, Tuple, Dict, Union, Any
 import torch
 import numpy as np
+from functools import partial
+import os
+from .env_package.alfworld.alfworld.agents.utils.misc import get_templated_task_desc
+from .env_package.alfworld.envs import AlfworldEnvs
+from .prompts import ALFWORLD_INIT_TEXT_OBS, ALFWORLD_TEXT_OBS
 
 def to_numpy(tensor):
     if isinstance(tensor, torch.Tensor):
         tensor = tensor.detach().cpu().numpy()
     elif isinstance(tensor, np.ndarray):
         tensor = tensor
+    elif isinstance(tensor, (int, float, bool, Tuple, List)):
+        tensor = np.array(tensor)
     else:
         raise ValueError(f"Unsupported type: {type(tensor)})")
     return tensor
 
+def parse_infos(infos_dict):
+    """
+    Some environments may return infos as a dictionary of lists, e.g. {'key1': [value1, value2, ...], 'key2': [value1, value2, ...]}.
+    This function parses infos as a unified format, e.g. [{'key1': value1, 'key2': value1}, {'key1': value2, 'key2': value2}, ...].
+    """
+    infos_list = []
+    
+    num_elements = len(infos_dict[list(infos_dict.keys())[0]])
+    
+    for i in range(num_elements):
+        item_dict = {}
+        for key, value_list in infos_dict.items():
+            item_dict[key] = value_list[i]
+        infos_list.append(item_dict)
+    
+    return infos_list
+
 class EnvironmentManagerBase:
-    def __init__(self, envs, projection_f):
+    def __init__(self, envs, projection_f, env_name=None):
         """
         Initialize the environment manager.
         
         Parameters:
         - envs: The environment instance, usually a vectorized environment containing multiple sub-environments.
         - projection_f: A function that maps text actions to environment actions.
+        - env_name (str): The name of the environment.
         """
         self.envs = envs
         self.projection_f = projection_f
+        self.env_name = env_name
 
     def reset(self) -> Dict[str, Any]:
         """
@@ -32,11 +58,8 @@ class EnvironmentManagerBase:
           - 'text' (None or List[str]): The textual observation.
           - 'image' (np.ndarray or torch.Tensor): The image observation as either a NumPy array or a PyTorch tensor.
         """
-        obs = self.envs.reset()
-        return {
-            'text': None,
-            'image': obs
-        }
+        obs, infos = self.envs.reset()
+        return {'text': None, 'image': obs}, infos
     
     def step(self, text_actions: List[str]):
         """
@@ -56,7 +79,7 @@ class EnvironmentManagerBase:
         Exceptions:
         - NotImplementedError: If an observation key is not in ('text', 'image').
         """
-        actions, valid = self.projection_f(text_actions)
+        actions, valids = self.projection_f(text_actions)
         next_obs, rewards, dones, infos = self.envs.step(actions)
 
         next_observations = {
@@ -65,7 +88,7 @@ class EnvironmentManagerBase:
         }
         # add action_valid to infos
         for i, info in enumerate(infos):
-            info['is_action_valid'] = to_numpy(valid[i])
+            info['is_action_valid'] = to_numpy(valids[i])
 
         return next_observations, rewards, dones, infos
 
@@ -83,37 +106,71 @@ class EnvironmentManagerBase:
         Returns:
         - success (np.ndarray or torch.Tensor): 1 if the episode is successful, 0 otherwise.
         """
-        episode_rewards = kwargs['episode_rewards']
-        success = episode_rewards > 0
-        return success
+        raise NotImplementedError("success_evaluator should be implemented in the subclass.")
+    
+    def save_image(self, image, step):
+        """
+        Save an image to a file.
+        
+        Parameters:
+        - image (np.ndarray or torch.Tensor): The image to save.
+        - path (str): The path to save the image.
+        """
+        path = os.path.join(os.path.dirname(__file__), os.path.join("images", self.env_name))
+        if not os.path.exists(path):
+            os.makedirs(path)
+        path = os.path.join(path, f"step{step}.png")
+        if isinstance(image, torch.Tensor):
+            image = image.detach().cpu().numpy()
+        if isinstance(image, np.ndarray):
+            image = image
+        else:
+            raise ValueError(f"Unsupported type: {type(image)})")
+        
+        if len(image.shape) == 4:
+            image = image[0]
+        if image.shape[0] == 3:
+            image = np.transpose(image, (1, 2, 0))
+        if image.max() <= 1.0:
+            image = (image * 255)
+
+        image = image.astype(np.uint8)
+        
+        from PIL import Image
+        image = Image.fromarray(image)
+        image.save(path)
 
 
 # Customizing the your own environment manager: 
 class GymCardEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, env_name):
-        self.env_name = env_name
-        super().__init__(envs, projection_f)
+        super().__init__(envs, projection_f, env_name)
     
     def reset(self) -> Dict[str, Any]:
-        observations = super().reset()
+        obs = self.envs.reset()
+        observations = {'text': None, 'image': obs}
         if self.env_name == 'gym_cards/EZPoints-v0' or self.env_name == 'gym_cards/Points24-v0':
             observations['text'] = ["The current formula is empty. Now it's your turn to choose a number or operator as the beginning of the formula."] * len(observations)
         
-        return observations
+        infos = [None] * self.envs.num_envs
+        return observations, infos
 
     def step(self, text_actions: List[str]):
         next_observations, rewards, dones, infos = super().step(text_actions)
         
         # add text observation to next_observations
         if self.env_name == 'gym_cards/EZPoints-v0' or self.env_name == 'gym_cards/Points24-v0':
-            next_observations['text'] = self.build_text_observation(infos)
+            next_observations['text'] = self.build_text_obs(infos)
 
         return next_observations, rewards, dones, infos
     
     def success_evaluator(self, *args, **kwargs):
-        return super().success_evaluator(*args, **kwargs)
+        episode_rewards = kwargs['episode_rewards']
+        success = episode_rewards > 0
+        return success
+
     
-    def build_text_observation(self, infos: Tuple[Dict]) -> List[str]:
+    def build_text_obs(self, infos: Tuple[Dict]) -> List[str]:
         text_observations = []
         for info in infos:
             text_formula = ''.join(str(element) for element in info['Formula'])
@@ -125,7 +182,199 @@ class GymCardEnvironmentManager(EnvironmentManagerBase):
 
         return text_observations
 
-    
-    
 
+class AlfWorldEnvironmentManager(EnvironmentManagerBase):
+    def __init__(self, envs: AlfworldEnvs, projection_f, env_name):
+        super().__init__(envs, projection_f, env_name)
+    
+    def reset(self):
+        text_obs, image_obs, infos = self.envs.reset()
+
+        # initialize the history buffer
+        self.buffers = [[] for _ in range(len(text_obs))]
+        self.tasks = []
+        self.extract_task(text_obs)
+
+        text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands, init=True)
+        return {'text': text_obs, 'image': image_obs}, parse_infos(infos)
+    
+    def step(self, text_actions: List[str]):
+        actions, valids = self.projection_f(text_actions, self.envs.get_admissible_commands)
+        text_obs, image_obs, rewards, dones, infos = self.envs.step(actions)
+        self.save_to_history_buffer(actions, text_obs)
+
+        text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands)
+
+        infos = parse_infos(infos)
+
+        # add action_valid to infos
+        for i, info in enumerate(infos):
+            info['is_action_valid'] = to_numpy(valids[i])
+
+        rewards = self.invalid_action_penalty(rewards, valids)
+    
+        next_obs = {'text': text_obs, 'image': image_obs}
+        dones = to_numpy(dones)
+
+        return next_obs, rewards, dones, infos
+    
+    def invalid_action_penalty(self, rewards, valids):
+        for i, valid in enumerate(valids):
+            if not valid:
+                rewards[i] -= 0.1
+        return rewards
+     
+    def extract_task(self, text_obs: List[str]):
+        for obs in text_obs:
+            task_start = obs.find('Your task is to: ')
+            
+            if task_start != -1:
+                self.tasks.append(obs[task_start + len('Your task is to: '):].strip())
+            else:
+                raise ValueError("Task description not found in text observation.")
         
+
+    def build_text_obs(self, text_obs: List[str], admissible_actions: List[List[str]], init: bool = False, history_length: int = 5) -> List[str]:
+        """
+        This function builds the text observation for the agent.
+        """
+        postprocess_text_obs = []
+        for i in range(len(text_obs)):
+            reformatted_admissible_actions = "\n ".join(f"'{s}'" for s in admissible_actions[i])
+
+            if init:
+                obs = ALFWORLD_INIT_TEXT_OBS.format(
+                    current_observation=text_obs[i],
+                    admissible_actions=reformatted_admissible_actions
+                )
+            else:
+                # Get last `history_length` steps
+                recent_history = self.buffers[i][-history_length:]
+                valid_history_length = len(recent_history)
+                start_index = len(self.buffers[i]) - valid_history_length
+                action_history = ""
+                for j, record in enumerate(recent_history):
+                    step_number = start_index + j + 1
+                    action = record["action"]
+                    feedback = record["text_obs"]
+                    action_history += f"[Action {step_number}: '{action}', Feedback {step_number}: '{feedback}']"
+                obs = ALFWORLD_TEXT_OBS.format(
+                    task_description=self.tasks[i],
+                    step_count=len(self.buffers[i]),
+                    history_length=valid_history_length,
+                    action_history=action_history.strip(),
+                    current_step=len(self.buffers[i]) + 1,
+                    current_observation=text_obs[i],
+                    admissible_actions=reformatted_admissible_actions
+                )
+
+            postprocess_text_obs.append(obs)
+
+        return postprocess_text_obs
+
+    def save_to_history_buffer(self, actions, text_obs):
+        for i in range(len(actions)):
+            self.buffers[i].append({'action': actions[i], 'text_obs': text_obs[i]})
+
+    def success_evaluator(self, *args, **kwargs):
+        total_infos = kwargs['total_infos']
+        total_batch_list = kwargs['total_batch_list']
+        batch_size = len(total_batch_list)
+
+        # print("~~len(total_infos): ", len(total_infos))
+        # print("~~len(total_infos[0]): ", len(total_infos[0]))
+        # print("~~total_infos[0]: ", total_infos[0])
+
+        success = [None] * batch_size
+
+        for bs in range(batch_size):   
+            for i, data in enumerate(total_batch_list[bs]):
+                if data['active_masks']:
+                    success[bs] = total_infos[bs][i]['won']
+                else:
+                    break
+        return success
+
+
+
+def make_envs(config):
+    """
+    Create enviroments 
+    """
+    train_num_processes = config.data.train_batch_size * config.env.rollout.n
+    val_num_processes = config.data.val_batch_size * config.env.rollout.n
+    
+    if "gym_cards" in config.env.env_name.lower():
+        from agent_system.environments.env_package import build_gymcards_envs, gym_projection
+        _envs = build_gymcards_envs(config.env.env_name, config.env.seed, train_num_processes,
+                             config.env.gamma, log_dir=None, device='cpu', allow_early_resets=False, num_frame_stack=1)
+        _val_envs = build_gymcards_envs(config.env.env_name, config.env.seed + 1000, val_num_processes,
+                            config.env.gamma, log_dir=None, device='cpu', allow_early_resets=False, num_frame_stack=1)
+        
+        projection_f = partial(gym_projection, env_name=config.env.env_name)
+        envs = GymCardEnvironmentManager(_envs, projection_f, config.env.env_name)
+        val_envs = GymCardEnvironmentManager(_val_envs, projection_f, config.env.env_name)
+        return envs, val_envs
+    elif "alfworld" in config.env.env_name.lower():
+        from agent_system.environments.env_package import build_alfworld_envs, alfworld_projection
+        if config.env.env_name == 'alfworld/AlfredThorEnv':
+            alf_config_path = os.path.join(os.path.dirname(__file__), 'env_package/alfworld/configs/config_tw.yaml')
+        elif config.env.env_name == 'alfworld/AlfredTWEnv':
+            alf_config_path = os.path.join(os.path.dirname(__file__), 'env_package/alfworld/configs/config_tw.yaml')
+        else:
+            raise ValueError(f"Unsupported environment: {config.env.env_name}")
+        _envs = build_alfworld_envs(alf_config_path, config.env.seed, train_num_processes)
+        _val_envs = build_alfworld_envs(alf_config_path, config.env.seed + 1000, val_num_processes)
+        
+        projection_f = partial(alfworld_projection)
+        envs = AlfWorldEnvironmentManager(_envs, projection_f, config.env.env_name)
+        val_envs = AlfWorldEnvironmentManager(_val_envs, projection_f, config.env.env_name)
+        return envs, val_envs
+    else:
+        print("Environment not supported")
+        exit(1)
+
+
+if __name__ == "__main__":
+    env_name = "alfworld"
+    if env_name == "gym_cards":
+        # Test GymCardEnvironmentManager
+        from agent_system.environments.env_package import build_gymcards_envs, gym_projection
+        envs = build_gymcards_envs('gym_cards/EZPoints-v0', 0, 4, 0.99, log_dir=None, device='cpu', allow_early_resets=False, num_frame_stack=1)
+        projection_f = partial(gym_projection, env_name='gym_cards/EZPoints-v0')
+        env_manager = GymCardEnvironmentManager(envs, projection_f, 'gym_cards/EZPoints-v0')
+        obs, infos = env_manager.reset()
+        for i in range(100):
+            random_actions = [str(np.random.randint(0, 10)) for i in range(len(infos))]
+            obs, rewards, dones, infos = env_manager.step(random_actions)
+            env_manager.save_image(obs['image'], i)
+        print("completed")
+    elif env_name == "alfworld":
+        # Test AlfWorldEnvironmentManager
+        from agent_system.environments.env_package import alfworld_projection
+        from agent_system.environments.env_package import build_alfworld_envs
+        import time
+        alf_config_path = os.path.join(os.path.dirname(__file__), 'env_package/alfworld/configs/config_tw.yaml')
+        envs = build_alfworld_envs(alf_config_path, 1, 2)
+        # val_envs = build_alfworld_envs(alf_config_path, 1000, 4)
+        env_manager = AlfWorldEnvironmentManager(envs, alfworld_projection, 'alfworld/AlfredThorEnv')
+        # val_env_manager = AlfWorldEnvironmentManager(val_envs, alfworld_projection, 'alfworld/AlfredTWEnv')
+        obs, infos = env_manager.reset()
+        time1 = time.time()
+        for i in range(100):
+            # get random actions from admissible 'valid' commands (not available for AlfredThorEnv)
+            print("step: ", i)
+            random_actions = [np.random.choice(infos[i]['admissible_commands']) for i in range(len(infos))]
+            # step
+            obs, rewards, dones, infos = env_manager.step(random_actions)
+            if np.array(dones).any():
+                print("Episode completed")
+
+            for k in range(len(infos)):
+                assert infos[k]['won'] == False
+            if obs['image'] is not None:
+                env_manager.save_image(obs['image'], i)
+            # print("obs['image'].shape: ", obs['image'].shape)
+        time2 = time.time()
+        print("Time elapsed: ", time2 - time1)
+        print("completed")

@@ -3,7 +3,7 @@
 # export VLLM_ATTENTION_BACKEND=XFORMERS
 # export CUDA_VISIBLE_DEVICES=2,3,4,5
 
-# python3 -m verl.trainer.main_ppo_debug \
+# python3 -m verl.trainer.main_ppo \
 #     algorithm.adv_estimator=grpo \
 #     data.train_files=$HOME/data/gym_cards/ezpoints/train.parquet \
 #     data.val_files=$HOME/data/gym_cards/ezpoints/test.parquet \
@@ -56,7 +56,7 @@ set -x
 export VLLM_ATTENTION_BACKEND=XFORMERS
 export CUDA_VISIBLE_DEVICES=4,5
 
-python3 -m verl.trainer.main_ppo_debug \
+python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files=$HOME/data/gym_cards/ezpoints/train.parquet \
     data.val_files=$HOME/data/gym_cards/ezpoints/test.parquet \

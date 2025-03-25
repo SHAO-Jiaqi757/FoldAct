@@ -423,7 +423,7 @@ class RayPPOTrainer(object):
                  reward_fn=None,
                  val_reward_fn=None,
                  envs=None,
-                 eval_envs=None,
+                 val_envs=None,
                  ):
 
         # assert torch.cuda.is_available(), 'cuda must be available on driver'
@@ -434,7 +434,7 @@ class RayPPOTrainer(object):
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
         self.envs = envs
-        self.eval_envs = eval_envs
+        self.val_envs = val_envs
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, 'Currently, only support hybrid engine'
@@ -691,7 +691,7 @@ class RayPPOTrainer(object):
 
             test_output_gen_batch = traj_collect_loop(gen_batch=test_gen_batch,
                                                     actor_rollout_wg=self.actor_rollout_wg,
-                                                    envs=self.eval_envs,
+                                                    envs=self.val_envs,
                                                     tokenizer=self.tokenizer,
                                                     processor=self.processor,
                                                     config=self.config,

@@ -1,1 +1,1 @@
-from .env_manager import GymCardEnvironmentManager, EnvironmentManagerBase
+from .env_manager import GymCardEnvironmentManager, EnvironmentManagerBase, make_envs
