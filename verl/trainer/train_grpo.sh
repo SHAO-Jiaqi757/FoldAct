@@ -1,6 +1,6 @@
 export CUDA_VISIBLE_DEVICES=0,1
 export DATA_DIR='/datapool/data/nq_search'
-export WAN
+
 WAND_PROJECT='Search-R1'
 
 # export BASE_MODEL='meta-llama/Llama-3.2-3B'
