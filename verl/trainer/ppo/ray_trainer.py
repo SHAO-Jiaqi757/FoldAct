@@ -708,7 +708,11 @@ class RayPPOTrainer:
             num_gpus=self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes,
             no_think_rl=self.config.algorithm.no_think_rl,
             search_url = self.config.retriever.url,
-            topk = self.config.retriever.topk,        
+            topk = self.config.retriever.topk,
+            retriever_num_workers= self.config.retriever.num_workers ,
+            retriever_rate_limit= self.config.retriever.rate_limit ,
+            retriever_timeout = self.config.retriever.timeout ,
+            retriever_enable_global_rate_limit = self.config.retriever.enable_global_rate_limit         
         )
 
         #Agent config preparation
@@ -1107,7 +1111,11 @@ class RayPPOTrainer:
             num_gpus=self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes,
             no_think_rl=self.config.algorithm.no_think_rl,
             search_url = self.config.retriever.url,
-            topk = self.config.retriever.topk,    
+            topk = self.config.retriever.topk,  
+            retriever_num_workers= self.config.retriever.num_workers ,
+            retriever_rate_limit= self.config.retriever.rate_limit ,
+            retriever_timeout = self.config.retriever.timeout ,
+            retriever_enable_global_rate_limit = self.config.retriever.enable_global_rate_limit  
         )
 
         generation_manager = LLMGenerationManager(

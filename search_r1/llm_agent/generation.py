@@ -50,6 +50,10 @@ class GenerationConfig:
     no_think_rl: bool=False
     search_url: str = None
     topk: int = 3
+    retriever_num_workers:int = 5 
+    retriever_rate_limit:int = 120 
+    retriever_timeout:int = 30 
+    retriever_enable_global_rate_limit:bool = True 
 
 class LLMGenerationManager:
     def __init__(

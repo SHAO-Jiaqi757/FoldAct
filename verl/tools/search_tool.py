@@ -153,17 +153,17 @@ class SearchTool(BaseTool):
         self._instance_dict = {}
 
         # Worker and rate limiting configuration
-        self.num_workers = config.get("num_workers", 120)
-        self.rate_limit = config.get("rate_limit", 120)
-        self.timeout = config.get("timeout", 30)
+        self.num_workers = config.retriever_num_workers
+        self.rate_limit = config.retriever_rate_limit
+        self.timeout = config.retriever_timeout
 
-        self.enable_global_rate_limit = config.get("enable_global_rate_limit", True)
+        self.enable_global_rate_limit = config.retriever_enable_global_rate_limit
         self.execution_pool = init_search_execution_pool(num_workers=self.num_workers, enable_global_rate_limit=self.enable_global_rate_limit, rate_limit=self.rate_limit, mode=PoolMode.ThreadMode)
 
         # Retrieval service configuration
-        self.retrieval_service_url = config.get("retrieval_service_url")
-        assert self.retrieval_service_url, "Configuration must include 'retrieval_service_url'"
-        self.topk = config.get("topk", 3)
+        self.retrieval_service_url = config.search_url
+        assert self.retrieval_service_url, "Configuration must include 'retriever.url'"
+        self.topk = config.topk
         if self.retrieval_service_url == "":
             raise ValueError("retrieval_service_url is not set")
 
