@@ -16,37 +16,38 @@
 from verl import DataProto
 import torch
 import numpy as np
-from verl.utils.reward_score import search_r1_like_qa_em
+from verl.utils.reward_score import qa_em_format,search_r1_like_qa_em
 
 def _select_rm_score_fn(data_source):
     if data_source in ['nq', 'triviaqa', 'popqa', 'hotpotqa', '2wikimultihopqa', 'musique', 'bamboogle']:
-        return search_r1_like_qa_em.compute_score
+        return qa_em_format.compute_score
     else:
         raise NotImplementedError
 
 
 
-class EpisodeRewardManager:
+class EpisodeRewardManager():
     """The reward manager.
     """
 
-    def __init__(self, tokenizer, num_examine, format_score=0.,normalize_by_length=False) -> None:
+    def __init__(self, tokenizer, num_examine, structure_format_score=0., final_format_score=0., retrieval_score=0., format_score=0.) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
-        self.normalize_by_length = normalize_by_length
-        self.format_score=format_score
+        self.format_score = format_score
+        self.structure_format_score = structure_format_score
+        self.final_format_score = final_format_score
+        self.retrieval_score = retrieval_score
 
-    def __call__(self, data: DataProto, return_dict=False):
+    def __call__(self, data: DataProto):
         """We will expand this function gradually based on the available datasets"""
 
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
-        if "rm_scores" in data.batch.keys():
-            if return_dict:
-                return {"reward_tensor": data.batch["rm_scores"]}
-            # else:
-            #     return data.batch["rm_scores"]
+        if 'rm_scores' in data.batch.keys():
+            return data.batch['rm_scores']
 
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
+
+        # all_scores = []
 
         already_print_data_sources = {}
 
@@ -65,49 +66,29 @@ class EpisodeRewardManager:
             valid_response_ids = response_ids[:valid_response_length]
 
             # decode
-            prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=False)
-            response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
-
             sequences = torch.cat((valid_prompt_ids, valid_response_ids))
             sequences_str = self.tokenizer.decode(sequences)
 
-
             ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
+
             # select rm_score
-
             data_source = data_item.non_tensor_batch['data_source']
-            compute_score_fn=_select_rm_score_fn(data_source)
-            score = compute_score_fn(solution_str=sequences_str, ground_truth=ground_truth, format_score=self.format_score)
+            compute_score_fn = _select_rm_score_fn(data_source)
 
-            # extra_info = data_item.non_tensor_batch.get('extra_info', None)
-            # multi_modal_inputs = data_item.non_tensor_batch.get('multi_modal_inputs', None)
-            # if multi_modal_inputs is not None:
-            #     pixel_values = multi_modal_inputs['pixel_values']
-            #     image_grid_thw = multi_modal_inputs['image_grid_thw']
+            score = compute_score_fn(solution_str=sequences_str, ground_truth=ground_truth, 
+                                     structure_format_score=self.structure_format_score, 
+                                     final_format_score=self.final_format_score, 
+                                     retrieval_score=self.retrieval_score,
+                                     format_score=self.format_score)
 
-
-            # episode_rewards = data_item.non_tensor_batch['episode_rewards']
-            # episode_lengths = data_item.non_tensor_batch['episode_lengths']
-
-            # if self.normalize_by_length:
-            #     score = episode_rewards / episode_lengths
-            # else:
-            #     score = episode_rewards
             reward_tensor[i, valid_response_length - 1] = score
+            # all_scores.append(score)
 
             if data_source not in already_print_data_sources:
                 already_print_data_sources[data_source] = 0
 
-            if already_print_data_sources[data_source] < self.num_examine and np.random.random() < 0.1:
+            if already_print_data_sources[data_source] < self.num_examine:
                 already_print_data_sources[data_source] += 1
-                print("[prompt]", prompt_str)
-                print("[response]", response_str)
-                print("[score]", score)
+                print(sequences_str)
 
-        if return_dict:
-            return {
-                "reward_tensor": reward_tensor,
-                "reward_extra_info": {},
-            }
-        else:
-            return reward_tensor
+        return reward_tensor
