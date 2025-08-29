@@ -13,22 +13,30 @@ import shutil
 import requests
 
 
-TOOL_SCHEMA=OpenAIFunctionToolSchema(
-    name="search",
-    description="Searches for relevant information based on queries.",
-    parameters={
-        "query_list":{
-            "type":"array",
-            "items":{"type":"string"},
-            "description":"List of search queries"
-        },
-        "topk":{
-            "type":"integer",
-            "description":"Number of top results to return"
+TOOL_SCHEMA = OpenAIFunctionToolSchema(
+    type="function",
+    function={
+        "name": "search",
+        "description": "Searches for relevant information based on queries.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query_list": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of search queries"
+                },
+                "topk": {
+                    "type": "integer",
+                    "description": "Number of top results to return"
+                }
+            },
+            "required": ["query_list"]
         }
-    },
-    required=['query_list']
+    }
 )
+
+
 
 
 @dataclass

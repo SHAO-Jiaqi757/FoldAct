@@ -24,8 +24,10 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager
 
 
+
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
+    print(config)
     run_ppo(config)
 
 
@@ -58,7 +60,7 @@ class TaskRunner:
         local_path = copy_to_local(config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False))
 
         from agent_system.environments import make_envs
-        envs, val_envs = make_envs(config)
+        # envs, val_envs = make_envs(config)
 
         # instantiate tokenizer
         from verl.utils import hf_processor, hf_tokenizer
@@ -173,8 +175,8 @@ class TaskRunner:
             train_sampler=train_sampler,
             device_name=config.trainer.device,
             traj_collector=traj_collector,
-            envs=envs,
-            val_envs=val_envs,
+            # envs=envs,
+            # val_envs=val_envs,
         )
         trainer.init_workers()
         trainer.fit()

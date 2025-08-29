@@ -23,6 +23,7 @@ license = {file = "LICENSE"}  # or "Apache-2.0", if you prefer an SPDX identifie
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.8"
 
+
 # -------------------------------
 # tool.ruff - Linting configuration
 # -------------------------------

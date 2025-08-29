@@ -296,7 +296,7 @@ trainer:
   logger: ['console', 'wandb']
   log_val_generations: 0
   nnodes: 1
-  n_gpus_per_node: 8
+  n_gpus_per_node: 1
   save_freq: -1
   # auto: find the last ckpt to resume. If can't find, start from scratch
   resume_mode: auto # or disable or resume_path if resume_from_path is set
