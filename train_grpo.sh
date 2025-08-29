@@ -1,5 +1,7 @@
 export CUDA_VISIBLE_DEVICES=0,1
 export DATA_DIR='/datapool/data/nq_search'
+export WANDB_API_KEY=""
+export WANDB_HOST=""
 
 WAND_PROJECT='Search-R1'
 
@@ -73,7 +75,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.default_hdfs_dir=null \
     trainer.default_local_dir=verl_checkpoints/$EXPERIMENT_NAME \
     +max_turns=2 \
-    +retriever.url="http://127.0.0.1:8000/retrieve" \
+    +retriever.url="http://127.0.0.1:5005/retrieve" \
     +retriever.num_workers=5 \
     +retriever.rate_limit=120 \
     +retriever.timeout=30 \
