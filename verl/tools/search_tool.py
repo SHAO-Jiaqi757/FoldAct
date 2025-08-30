@@ -236,7 +236,7 @@ class SearchTool(BaseTool):
         # Execute search using Ray execution pool
         try:
             result_text, metadata = await self.execution_pool.execute.remote(self.execute_search, instance_id, query_list_from_params, self.retrieval_service_url, self.topk, timeout)
-
+            
             # Store results in instance dictionary
             self._instance_dict[instance_id]["reward"].append(result_text.strip())
 

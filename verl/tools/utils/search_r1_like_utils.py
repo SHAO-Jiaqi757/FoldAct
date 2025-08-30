@@ -190,25 +190,25 @@ def perform_single_search_batch(retrieval_service_url: str, query_list: List[str
                     pretty_results.append(formatted)
                     total_results += len(retrieval) if isinstance(retrieval, list) else 1
 
-                final_result = "\n---\n".join(pretty_results)
+                final_result = pretty_results
                 result_text = json.dumps({"result": final_result})
                 metadata["status"] = "success"
                 metadata["total_results"] = total_results
-                metadata["formatted_result"] = final_result
+                metadata["formatted_result"] = "\n--\n".join(final_result)
                 logger.info(f"Batch search: Successful, got {total_results} total results")
             else:
-                result_text = json.dumps({"result": "No search results found."})
+                result_text = json.dumps({"result": ["No search results found." for i in len(total_results)]})
                 metadata["status"] = "no_results"
                 metadata["total_results"] = 0
                 logger.info("Batch search: No results found")
         except Exception as e:
             error_msg = f"Error processing search results: {e}"
-            result_text = json.dumps({"result": error_msg})
+            result_text = json.dumps({"result": [error_msg for i in len(total_results)]})
             metadata["status"] = "processing_error"
             logger.error(f"Batch search: {error_msg}")
     else:
         metadata["status"] = "unknown_api_state"
-        result_text = json.dumps({"result": "Unknown API state (no response and no error message)."})
+        result_text = json.dumps({"result": ["Unknown API state (no response and no error message)." for i in len(total_results)]})
         logger.error("Batch search: Unknown API state.")
 
     return result_text, metadata

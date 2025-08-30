@@ -409,9 +409,13 @@ class LLMGenerationManager:
         if do_search and search_queries:
             parameters={"query_list":search_queries,"topk":self.config.topk}
             import asyncio
+            import json
 
             #execute returns search_result, 0.0, metrics. We do not require metrics 
-            search_results,*_=asyncio.run(self.search_tool.execute("default",parameters))
+            instance= asyncio.run(self.search_tool.create())
+            search_results_json,*_=asyncio.run(self.search_tool.execute(instance_id=instance, parameters=parameters))
+            search_results=json.loads(search_results_json)['result']
+            print(len(search_results),sum([1 for action in cur_actions if action=="search"]))
             assert len(search_results) ==sum([1 for action in cur_actions if action=="search"])
         else:
             search_results = [''] * sum([1 for action in cur_actions if action == 'search'])
