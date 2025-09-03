@@ -1,0 +1,11 @@
+# @package _global_
+# This configuration enables the SimpleDenseFeedbackRewardManager
+
+reward_manager:
+  _target_: verl.workers.reward_manager.SimpleDenseFeedbackRewardManager
+  # dense_feedback_config can be customized here
+  dense_feedback_config:
+    max_tool_steps: 3
+    insufficient_info_penalty: -0.5
+    repeated_tool_penalty: -0.3
+    max_steps_exceeded_penalty: -0.8 

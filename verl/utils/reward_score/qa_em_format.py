@@ -1,4 +1,3 @@
-mitations under the License.
 
 import re
 import string

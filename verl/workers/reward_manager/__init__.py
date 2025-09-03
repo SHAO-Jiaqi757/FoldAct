@@ -14,7 +14,8 @@
 
 from .batch import BatchRewardManager
 from .dapo import DAPORewardManager
+from .simple_dense_feedback import SimpleDenseFeedbackRewardManager
 from .naive import NaiveRewardManager
 from .prime import PrimeRewardManager
 
-__all__ = ["BatchRewardManager", "DAPORewardManager", "NaiveRewardManager", "PrimeRewardManager"]
+__all__ = ["BatchRewardManager", "DAPORewardManager", "SimpleDenseFeedbackRewardManager", "NaiveRewardManager", "PrimeRewardManager"]
