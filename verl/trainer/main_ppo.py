@@ -137,16 +137,36 @@ class TaskRunner:
             mapping[Role.RefPolicy] = global_pool_id
 
         reward_manager_name = config.reward_model.get("reward_manager", "episode")
+        print("[reward_manager_name]", reward_manager_name)
         if reward_manager_name == 'episode':
             from agent_system.reward_manager.episode import EpisodeRewardManager
             reward_manager_cls = EpisodeRewardManager
+        elif reward_manager_name == "simple_dense_feedback":
+            from verl.workers.reward_manager import SimpleDenseFeedbackRewardManager
+            print("Loading SimpleDenseFeedbackRewardManager...")
+            reward_manager_cls = SimpleDenseFeedbackRewardManager
         else:
             raise NotImplementedError
 
-        reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=0, normalize_by_length=False)
-
-        # Note that we always use function-based RM for validation
-        val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=1, normalize_by_length=False)
+        # Initialize reward manager with appropriate parameters
+        if reward_manager_name == "simple_dense_feedback":
+            print(f"\n🎯 Initializing SimpleDenseFeedbackRewardManager...")
+            reward_fn = reward_manager_cls(
+                tokenizer=tokenizer, 
+                num_examine=0, 
+                compute_score=None,  # Will use default
+                reward_fn_key=config.data.get("reward_fn_key", "data_source")
+            )
+            val_reward_fn = reward_manager_cls(
+                tokenizer=tokenizer, 
+                num_examine=1, 
+                compute_score=None,  # Will use default
+                reward_fn_key=config.data.get("reward_fn_key", "data_source")
+            )
+            print(f"✅ SimpleDenseFeedbackRewardManager initialized successfully!")
+        else:
+            reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=0, normalize_by_length=False)
+            val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=1, normalize_by_length=False)
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 

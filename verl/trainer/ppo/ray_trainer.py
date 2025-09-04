@@ -695,6 +695,10 @@ class RayPPOTrainer:
         """    
         import torch
 
+        print(f"\n{'='*80}")
+        print(f"[VALIDATION] Starting validation at step {self.global_steps}")
+        print(f"{'='*80}\n")
+
         reward_tensor_lst = []
         data_source_lst = []
         success_rate_dict = {}
@@ -874,6 +878,11 @@ class RayPPOTrainer:
 
         for k, v in success_rate.items():
             metric_dict[f'val/{k}'] = v
+            
+        # Add debug logging to check metrics
+        print(f"DEBUG: Validation metrics: {metric_dict}")
+        print(f"DEBUG: Validation metrics keys: {list(metric_dict.keys())}")
+        print(f"DEBUG: Validation metrics values: {list(metric_dict.values())}")
 
         return metric_dict
 
@@ -970,7 +979,12 @@ class RayPPOTrainer:
         # path: given_path + `/global_step_{global_steps}` + `/actor`
         local_global_step_folder = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
 
-        print(f"local_global_step_folder: {local_global_step_folder}")
+        print(f"[CHECKPOINT] Saving checkpoint at step {self.global_steps}")
+        print(f"[CHECKPOINT] local_global_step_folder: {local_global_step_folder}")
+        
+        # Ensure directory exists
+        os.makedirs(self.config.trainer.default_local_dir, exist_ok=True)
+        
         actor_local_path = os.path.join(local_global_step_folder, "actor")
 
         actor_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "actor")
@@ -981,6 +995,7 @@ class RayPPOTrainer:
         max_actor_ckpt_to_keep = self.config.trainer.get("max_actor_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
         max_critic_ckpt_to_keep = self.config.trainer.get("max_critic_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
 
+        print(f"[CHECKPOINT] Saving actor checkpoint to {actor_local_path}")
         self.actor_rollout_wg.save_checkpoint(actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep)
 
         if self.use_critic:
@@ -995,8 +1010,16 @@ class RayPPOTrainer:
 
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt")
+        print(f"[CHECKPOINT] Writing latest checkpoint tracker to {local_latest_checkpointed_iteration}")
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
+        
+        print(f"[CHECKPOINT] Successfully saved checkpoint at step {self.global_steps}")
+        # List the checkpoint directory contents to verify
+        if os.path.exists(local_global_step_folder):
+            print(f"[CHECKPOINT] Directory contents of {local_global_step_folder}:")
+            for item in os.listdir(local_global_step_folder):
+                print(f"  - {item}")
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
@@ -1091,7 +1114,17 @@ class RayPPOTrainer:
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
+            
+            # Add debug logging for Wandb logging
+            print(f"DEBUG: Logging metrics to Wandb: {val_metrics}")
+            print(f"DEBUG: Logger: {logger}")
+            print(f"DEBUG: Logger backends: {logger.logger}")
+            
             logger.log(data=val_metrics, step=self.global_steps)
+            
+            # Add debug logging after Wandb logging
+            print(f"DEBUG: Metrics logged to Wandb")
+            
             if self.config.trainer.get("val_only", False):
                 return
 
@@ -1101,6 +1134,16 @@ class RayPPOTrainer:
         # we start from step 1
         self.global_steps += 1
         last_val_metrics = None
+        
+        # Print training configuration and checkpoint schedule
+        print(f"\n{'='*80}")
+        print(f"[TRAINING] Starting training from step {self.global_steps}")
+        print(f"[TRAINING] Total training steps: {self.total_training_steps}")
+        print(f"[TRAINING] Checkpoint directory: {self.config.trainer.default_local_dir}")
+        print(f"[TRAINING] Save frequency: Every {self.config.trainer.save_freq} steps")
+        print(f"[TRAINING] Expected checkpoints at steps: {', '.join(str(i) for i in range(self.config.trainer.save_freq, self.total_training_steps + 1, self.config.trainer.save_freq))}")
+        print(f"[TRAINING] Test frequency: Every {self.config.trainer.test_freq} steps")
+        print(f"{'='*80}\n")
 
         gen_config=GenerationConfig(
             max_turns=self.config.max_turns,
@@ -1146,6 +1189,10 @@ class RayPPOTrainer:
                 )
 
                 is_last_step = self.global_steps >= self.total_training_steps
+
+                print(f"\n{'*'*40}")
+                print(f"[TRAINING] Processing step {self.global_steps}/{self.total_training_steps} (Epoch {epoch})")
+                print(f"{'*'*40}")
 
                 with _timer("step", timing_raw):
                     # generate a batch
@@ -1401,8 +1448,10 @@ class RayPPOTrainer:
 
                     if self.config.trainer.save_freq > 0 and \
                             self.global_steps % self.config.trainer.save_freq == 0:
+                        print(f"\n[CHECKPOINT] Triggering checkpoint save at step {self.global_steps}")
                         with _timer('save_checkpoint', timing_raw):
                             self._save_checkpoint()
+                        print(f"[CHECKPOINT] Checkpoint save completed for step {self.global_steps}\n")
 
                 # training metrics
                 metrics.update(
@@ -1411,6 +1460,11 @@ class RayPPOTrainer:
                         "training/epoch": epoch,
                     }
                 )
+                
+                # Print current training progress
+                print(f"[TRAINING] Step {self.global_steps}/{self.total_training_steps} (Epoch {epoch})")
+                if self.global_steps % 10 == 0:
+                    print(f"[TRAINING] Next checkpoint will be saved at step {((self.global_steps // self.config.trainer.save_freq) + 1) * self.config.trainer.save_freq}")
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
@@ -1420,6 +1474,17 @@ class RayPPOTrainer:
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
+                
+                # Print end of step summary
+                print(f"\n{'*'*40}")
+                print(f"[TRAINING] Completed step {self.global_steps}/{self.total_training_steps}")
+                if 'training/loss' in metrics:
+                    print(f"[TRAINING] Loss: {metrics['training/loss']:.6f}")
+                if 'training/actor_loss' in metrics:
+                    print(f"[TRAINING] Actor Loss: {metrics['training/actor_loss']:.6f}")
+                if 'training/throughput_tokens_per_gpu_per_sec' in metrics:
+                    print(f"[TRAINING] Throughput: {metrics['training/throughput_tokens_per_gpu_per_sec']:.2f} tokens/gpu/sec")
+                print(f"{'*'*40}\n")
                 
                 progress_bar.update(1)
                 self.global_steps += 1
