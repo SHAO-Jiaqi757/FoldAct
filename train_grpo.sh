@@ -1,8 +1,5 @@
 export CUDA_VISIBLE_DEVICES=0,1
 export DATA_DIR='/datapool/data/deepresearcher'
-export WANDB_API_KEY="local-2314758ef863db749474b2717c92cd28030fbc52"
-export WANDB_HOST="http://10.200.14.82:9005"
-
 WAND_PROJECT='Search-R1'
 
 # export BASE_MODEL='meta-llama/Llama-3.2-3B'
@@ -33,11 +30,10 @@ export VLLM_ATTENTION_BACKEND=XFORMERS # vllm + qwen2-7b with flash_attn has som
 
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
-    ++reward_model.reward_manager=simple_dense_feedback \
-    data.train_files=$TRAIN_DATA_DIR/train.parquet \
-    data.val_files=$TEST_DATA_DIR/test.parquet \
-    data.train_batch_size=32 \
-    data.val_batch_size=16 \
+    data.train_files=$TRAIN_DATA_DIR/train_transformed.parquet \
+    data.val_files=$TEST_DATA_DIR/test_transformed.parquet \
+    data.train_batch_size=16 \
+    data.val_batch_size=4 \
     data.max_prompt_length=4096 \
     data.max_response_length=500 \
     algorithm.adv_estimator=grpo \
@@ -47,8 +43,8 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.285 \
     actor_rollout_ref.actor.use_kl_loss=true \
-    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
-    actor_rollout_ref.actor.ppo_micro_batch_size=8 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=8 \
+    actor_rollout_ref.actor.ppo_micro_batch_size=4 \
     actor_rollout_ref.actor.fsdp_config.param_offload=true \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
     actor_rollout_ref.rollout.log_prob_micro_batch_size=16 \

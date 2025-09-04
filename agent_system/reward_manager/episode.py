@@ -22,7 +22,7 @@ def _select_rm_score_fn(data_source):
     if data_source in ['nq', 'triviaqa', 'popqa', 'hotpotqa', '2wikimultihopqa', 'musique', 'bamboogle']:
         return search_r1_like_qa_em.compute_score
     else:
-        raise NotImplementedError
+       return search_r1_like_qa_em.compute_score
 
 
 
@@ -77,6 +77,13 @@ class EpisodeRewardManager:
 
             data_source = data_item.non_tensor_batch['data_source']
             compute_score_fn=_select_rm_score_fn(data_source)
+
+            # Convert ground_truth to the expected format if it's not already a dictionary
+            if isinstance(ground_truth, str):
+                ground_truth = {"target": ground_truth}
+            elif isinstance(ground_truth, list) or isinstance(ground_truth, np.ndarray):
+                ground_truth = {"target": ground_truth}
+
             score = compute_score_fn(solution_str=sequences_str, ground_truth=ground_truth, format_score=self.format_score)
 
             # extra_info = data_item.non_tensor_batch.get('extra_info', None)

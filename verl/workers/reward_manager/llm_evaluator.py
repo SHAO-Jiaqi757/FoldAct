@@ -14,7 +14,6 @@
 
 """
 LLM Evaluator for Reward Manager
-Integrates llm_judge.py functionality to evaluate information quality and reasoning grounding
 """
 
 import json

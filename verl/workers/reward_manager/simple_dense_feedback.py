@@ -101,18 +101,18 @@ class SimpleDenseFeedbackRewardManager:
         logger.info(f"LLM evaluation enabled: {self.enable_llm_evaluation}")
     
     def _get_simplified_config(self):
-        """获取简化的配置"""
+        """Get simplified configuration"""
         return {
             "max_tool_steps": 5,
-            "insufficient_info_penalty": -0.3,        # 信息不足时直接回答的惩罚
-            "refinement_bonus": 0.5,                  # 从不足到充足的改进奖励
-            "grounding_bonus": 0.3,                   # 正确grounding的奖励
-            "ungrounded_penalty": 0,               # 未grounded的惩罚
-            "format_bonus": 0.3,                      # 格式奖励：sequence以answer结尾时的奖励
-            # 防止奖励黑客：限制与衰减
-            "grounding_bonus_max_steps": 2,           # grounding奖励最多应用的步数（例如只奖励前2次）
-            "grounding_bonus_decay": 0.6,            # grounding奖励的衰减系数，按步数递减
-            "max_grounding_bonus_total": 1.0,         # grounding奖励在一个trajectory中的总上限
+            "insufficient_info_penalty": -0.3,        # Penalty for answering directly with insufficient information
+            "refinement_bonus": 0.5,                  # Reward for improving from insufficient to sufficient
+            "grounding_bonus": 0.3,                   # Reward for correct grounding
+            "ungrounded_penalty": 0,                  # Penalty for ungrounded responses
+            "format_bonus": 0.3,                      # Format reward: bonus when sequence ends with answer
+            # Prevent reward hacking: limits and decay
+            "grounding_bonus_max_steps": 2,           # Maximum number of steps to apply grounding bonus (e.g., only reward first 2 times)
+            "grounding_bonus_decay": 0.6,             # Decay coefficient for grounding bonus, decreasing by step
+            "max_grounding_bonus_total": 1.0,         # Total upper limit for grounding bonus in a trajectory
             "min_component_length": 5,
             "max_log_length": 200,
             "enable_debug_logs": True,
@@ -123,7 +123,7 @@ class SimpleDenseFeedbackRewardManager:
         }
     
     def _setup_logging(self):
-        """设置日志级别和格式"""
+        """Set up logging level and format"""
         if self.config.get("enable_debug_logs", True):
             logging.getLogger().setLevel(logging.DEBUG)
         else:
@@ -143,9 +143,9 @@ class SimpleDenseFeedbackRewardManager:
             logger.addHandler(handler)
     
     def _run_async(self, coro):
-        """在同步环境中安全地运行协程。
-        - 若当前无事件循环，直接使用 asyncio.run。
-        - 若已有事件循环（如在Ray/uvloop环境），在新线程中新建事件循环并运行。
+        """Run coroutine in a safe manner in a synchronous environment.
+        - If there is no event loop running, use asyncio.run.
+        - If there is an event loop running (e.g. in Ray/uvloop environment), create a new event loop in a new thread and run it.
         """
         try:
             asyncio.get_running_loop()
@@ -179,19 +179,24 @@ class SimpleDenseFeedbackRewardManager:
             raise error_holder["error"]
         return result_holder.get("result")
     
-    def parse_trajectory_components(self, response_str: str, response_tokens: List[int]) -> List[TrajectoryComponent]:
+    def parse_trajectory_components(self, response_str: str, response_tokens: List[int] = None) -> List[TrajectoryComponent]:
         """Parse trajectory components with accurate token positioning and fallback parsing."""
-        logger.debug(f"Parsing response with {len(response_tokens)} tokens")
+        logger.debug(f"Parsing response with {len(response_tokens) if response_tokens else 'unknown'} tokens")
         
-        # 记录到文件
+        # Log to file
         file_logger.info(f"=== PARSING TRAJECTORY COMPONENTS ===")
         file_logger.info(f"Response string: {response_str}")
-        file_logger.info(f"Response tokens count: {len(response_tokens)}")
+        file_logger.info(f"Response tokens count: {len(response_tokens) if response_tokens else 'unknown'}")
+        
+        # If response_tokens is not provided, tokenize the response
+        if response_tokens is None:
+            response_tokens = self.tokenizer.encode(response_str, add_special_tokens=False)
+            logger.debug(f"Tokenized response with {len(response_tokens)} tokens")
         
         components = []
         step_number = 1
         
-        # 首先解析所有已知的标签组件
+        # First parse all known label components
         known_components = []
         for component_type, pattern in self.patterns.items():
             matches = list(re.finditer(pattern, response_str, re.DOTALL))
@@ -201,11 +206,11 @@ class SimpleDenseFeedbackRewardManager:
                     logger.debug(f"Skipping {component_type} component {i+1} (too short: {len(content)})")
                     continue
                 
-                # 计算准确的token位置
+                # Calculate accurate token positions
                 start_char = match.start()
                 end_char = match.end()
                 
-                # 将字符位置转换为token位置
+                # Convert character positions to token positions
                 start_token_idx = self._char_to_token_position(response_str, response_tokens, start_char)
                 end_token_idx = self._char_to_token_position(response_str, response_tokens, end_char)
                 
@@ -225,30 +230,30 @@ class SimpleDenseFeedbackRewardManager:
         
                 logger.debug(f"Found {component_type} component at tokens {start_token_idx}-{end_token_idx}: {content[:50]}...")
                 
-                # 记录到文件
+                # Log to file
                 file_logger.info(f"Component {step_number-1}: {component_type}")
                 file_logger.info(f"  Content: {content}")
                 file_logger.info(f"  Token range: {start_token_idx}-{end_token_idx}")
                 file_logger.info(f"  Step number: {step_number-1}")
         
-        # 按token位置排序已知组件
+        # Sort known components by token positions
         known_components.sort(key=lambda x: x.start_token_idx)
         
-        # 处理剩余的内容作为think组件
+        # Process remaining content as think components
         think_components = self._extract_think_components(response_str, response_tokens, known_components, step_number)
         
-        # 合并所有组件
+        # Merge all components
         components = known_components + think_components
         
-        # 如果没有找到组件，记录警告
+        # If no components are found, log a warning
         if not components:
             logger.warning("No structured components found in response")
         
-        # 按token位置排序
+        # Sort components by token positions
         components.sort(key=lambda x: x.start_token_idx)
         logger.info(f"Parsed {len(components)} trajectory components")
         
-        # 记录解析结果到文件
+        # Log parsed results to file
         file_logger.info(f"Total components parsed: {len(components)}")
         file_logger.info(f"Component types: {[c.component_type for c in components]}")
         file_logger.info("=" * 50)
@@ -258,11 +263,11 @@ class SimpleDenseFeedbackRewardManager:
     def _extract_think_components(self, response_str: str, response_tokens: List[int], 
                                  known_components: List[TrajectoryComponent], 
                                  start_step_number: int) -> List[TrajectoryComponent]:
-        """提取剩余内容作为think组件"""
+        """Extract remaining content as think components"""
         think_components = []
         step_number = start_step_number
         
-        # 获取所有已知组件的字符位置范围
+        # Get all known components' character position ranges
         covered_ranges = []
         for comp in known_components:
             start_char = self._token_to_char_position(response_str, response_tokens, comp.start_token_idx)
@@ -270,17 +275,17 @@ class SimpleDenseFeedbackRewardManager:
             if start_char is not None and end_char is not None:
                 covered_ranges.append((start_char, end_char))
         
-        # 合并重叠的范围
+        # Merge overlapping ranges
         covered_ranges = self._merge_overlapping_ranges(covered_ranges)
         
-        # 找到未被覆盖的文本段
+        # Find un-covered text segments
         last_end = 0
         for start, end in covered_ranges:
             if last_end < start:
-                # 提取think内容
+                # Extract think content
                 think_content = response_str[last_end:start].strip()
                 if len(think_content) >= self.config.get("min_component_length", 5):
-                    # 计算token位置
+                    # Calculate token positions
                     start_token_idx = self._char_to_token_position(response_str, response_tokens, last_end)
                     end_token_idx = self._char_to_token_position(response_str, response_tokens, start)
                     
@@ -297,7 +302,7 @@ class SimpleDenseFeedbackRewardManager:
                         
                         logger.debug(f"Found think component at tokens {start_token_idx}-{end_token_idx}: {think_content[:50]}...")
                         
-                        # 记录到文件
+                        # Log to file
                         file_logger.info(f"Component {step_number-1}: think")
                         file_logger.info(f"  Content: {think_content}")
                         file_logger.info(f"  Token range: {start_token_idx}-{end_token_idx}")
@@ -305,7 +310,7 @@ class SimpleDenseFeedbackRewardManager:
             
             last_end = max(last_end, end)
         
-        # 处理最后一段
+        # Process last segment
         if last_end < len(response_str):
             think_content = response_str[last_end:].strip()
             if len(think_content) >= self.config.get("min_component_length", 5):
@@ -324,7 +329,7 @@ class SimpleDenseFeedbackRewardManager:
                     
                     logger.debug(f"Found think component at tokens {start_token_idx}-{end_token_idx}: {think_content[:50]}...")
                     
-                    # 记录到文件
+                    # Log to file
                     file_logger.info(f"Component {step_number}: think")
                     file_logger.info(f"  Content: {think_content}")
                     file_logger.info(f"  Token range: {start_token_idx}-{end_token_idx}")
@@ -333,126 +338,70 @@ class SimpleDenseFeedbackRewardManager:
         return think_components
     
     def _token_to_char_position(self, text: str, tokens: List[int], token_pos: int) -> Optional[int]:
-        """将token位置转换为字符位置"""
+        """Convert token positions to character positions"""
         try:
             if token_pos >= len(tokens):
                 return len(text)
             
-            # 解码到指定token位置
+            # Decode to specified token positions
             partial_tokens = tokens[:token_pos]
             partial_text = self.tokenizer.decode(partial_tokens, skip_special_tokens=True)
             return len(partial_text)
         except Exception as e:
             logger.warning(f"Error converting token position {token_pos} to char position: {e}")
             return None
+
+    def _char_to_token_position(self, text: str, tokens: List[int], char_pos: int) -> Optional[int]:
+        """Convert character positions to token positions"""
+        try:
+            if char_pos <= 0:
+                return 0
+            if char_pos >= len(text):
+                return len(tokens)
+            
+            # Binary search to find corresponding token positions
+            left, right = 0, len(tokens)
+            while left < right:
+                mid = (left + right) // 2
+                partial_tokens = tokens[:mid]
+                partial_text = self.tokenizer.decode(partial_tokens, skip_special_tokens=True)
+                partial_length = len(partial_text)
+                
+                if partial_length < char_pos:
+                    left = mid + 1
+                else:
+                    right = mid
+            
+            return left
+        except Exception as e:
+            logger.warning(f'Error converting char position {char_pos} to token position: {e}')
+            return None
     
     def _merge_overlapping_ranges(self, ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
-        """合并重叠的范围"""
+        """Merge overlapping ranges"""
         if not ranges:
             return []
         
-        # 按起始位置排序
+        # Sort by starting position
         sorted_ranges = sorted(ranges)
         merged = [sorted_ranges[0]]
         
         for start, end in sorted_ranges[1:]:
             last_start, last_end = merged[-1]
-            if start <= last_end:  # 重叠或相邻
+            if start <= last_end:  # Overlapping or adjacent
                 merged[-1] = (last_start, max(last_end, end))
             else:
                 merged.append((start, end))
         
         return merged
     
-    def analyze_trajectory(self, components: List[TrajectoryComponent], 
-                               ground_truth, question: str = None) -> TrajectoryFeedback:
-        """分析整个轨迹并计算feedback，支持异步LLM评估"""
-        logger.info(f"Analyzing trajectory with {len(components)} components")
-        
-        # 记录到文件
-        file_logger.info(f"=== TRAJECTORY ANALYSIS ===")
-        file_logger.info(f"Ground truth: {ground_truth}")
-        file_logger.info(f"Question: {question}")
-        file_logger.info(f"Components count: {len(components)}")
-        
-        # Extract key information
-        search_components = [c for c in components if c.component_type == "search"]
-        information_components = [c for c in components if c.component_type == "information"]
-        answer_components = [c for c in components if c.component_type == "answer"]
-        
-        logger.debug(f"Component breakdown: search={len(search_components)}, "
-                    f"information={len(information_components)}, answer={len(answer_components)}")
-        
-        # 记录组件分布到文件
-        file_logger.info(f"Component breakdown:")
-        file_logger.info(f"  Search components: {len(search_components)}")
-        file_logger.info(f"  Information components: {len(information_components)}")
-        file_logger.info(f"  Answer components: {len(answer_components)}")
-        
-        # 分析时序依赖和信息流（同步评估）
-        temporal_analysis = self._analyze_temporal_dependencies(components, ground_truth, question)
-        
-        # Compute component scores with improved logic
-        answer_quality_score = self._score_answer_quality_simplified(answer_components, ground_truth)
-        
-        logger.info(f"Component scores - Answer: {answer_quality_score:.3f}")
-        
-        # 记录评分结果到文件
-        file_logger.info(f"Component scores:")
-        file_logger.info(f"  Answer quality: {answer_quality_score:.3f}")
-        
-        # Check for penalties with temporal awareness
-        has_insufficient_info = temporal_analysis["has_insufficient_info"]
-        has_repeated_searches = self._has_repeated_searches(search_components)
-        exceeds_max_steps = len(search_components) > self.config["max_tool_steps"]
-        
-        logger.info(f"Temporal analysis - Insufficient info: {has_insufficient_info}, "
-                   f"Repeated searches: {has_repeated_searches}, Exceeds max steps: {exceeds_max_steps}")
-        
-        # 记录惩罚信息到文件
-        file_logger.info(f"Penalty analysis:")
-        file_logger.info(f"  Has insufficient info: {has_insufficient_info}")
-        file_logger.info(f"  Has repeated searches: {has_repeated_searches}")
-        file_logger.info(f"  Exceeds max steps: {exceeds_max_steps}")
-        
-        # Create trajectory feedback
-        feedback = TrajectoryFeedback(
-            trajectory_id="trajectory_1",
-            components=components,
-            final_answer=answer_components[-1].content if answer_components else "",
-            ground_truth=ground_truth,
-            think_score=0.0,
-            answer_quality_score=answer_quality_score,
-            has_insufficient_info=has_insufficient_info,
-            has_repeated_tools=has_repeated_searches,
-            exceeds_max_steps=exceeds_max_steps
-        )
-        
-        # 将时序分析结果存储为类属性
-        feedback._temporal_analysis = temporal_analysis
-        
-        # 记录时序分析结果到文件
-        file_logger.info(f"Temporal analysis results:")
-        for key, value in temporal_analysis.items():
-            if key != "llm_evaluation_results":  # 避免记录过长的LLM结果
-                file_logger.info(f"  {key}: {value}")
-        
-        # 记录LLM评估结果摘要
-        if "llm_evaluation_results" in temporal_analysis:
-            file_logger.info(f"  LLM evaluation results count: {len(temporal_analysis['llm_evaluation_results'])}")
-            for i, result in enumerate(temporal_analysis["llm_evaluation_results"]):
-                file_logger.info(f"    Component {i+1}: {result.get('information_quality', 'Unknown')}")
-        
-        file_logger.info("=" * 50)
-        
-        return feedback
-    
+  
     def analyze_trajectory_sync(self, components: List[TrajectoryComponent], 
                                ground_truth, question: str = None) -> TrajectoryFeedback:
-        """分析整个轨迹并计算feedback（同步版本，使用fallback评估）"""
+        """Analyze entire trajectory and calculate feedback (Synchronous version, using fallback evaluation)"""
         logger.info(f"Analyzing trajectory with {len(components)} components (sync version)")
         
-        # 记录到文件
+        # Log to file
         file_logger.info(f"=== TRAJECTORY ANALYSIS (SYNC) ===")
         file_logger.info(f"Ground truth: {ground_truth}")
         file_logger.info(f"Question: {question}")
@@ -466,13 +415,13 @@ class SimpleDenseFeedbackRewardManager:
         logger.debug(f"Component breakdown: search={len(search_components)}, "
                     f"information={len(information_components)}, answer={len(answer_components)}")
         
-        # 记录组件分布到文件
+        # Log component distribution to file
         file_logger.info(f"Component breakdown:")
         file_logger.info(f"  Search components: {len(search_components)}")
         file_logger.info(f"  Information components: {len(information_components)}")
         file_logger.info(f"  Answer components: {len(answer_components)}")
         
-        # 分析时序依赖和信息流（同步fallback评估）
+        # Analyze temporal dependencies and information flow (Synchronous fallback evaluation)
         temporal_analysis = self._analyze_temporal_dependencies_sync(components, ground_truth, question)
         
         # Compute component scores with improved logic
@@ -480,7 +429,7 @@ class SimpleDenseFeedbackRewardManager:
         
         logger.info(f"Component scores - Answer: {answer_quality_score:.3f}")
         
-        # 记录评分结果到文件
+        # Log评分结果到文件
         file_logger.info(f"Component scores:")
         file_logger.info(f"  Answer quality: {answer_quality_score:.3f}")
         
@@ -492,7 +441,7 @@ class SimpleDenseFeedbackRewardManager:
         logger.info(f"Temporal analysis - Insufficient info: {has_insufficient_info}, "
                    f"Repeated searches: {has_repeated_searches}, Exceeds max steps: {exceeds_max_steps}")
         
-        # 记录惩罚信息到文件
+        # Log penalty information to file
         file_logger.info(f"Penalty analysis:")
         file_logger.info(f"  Has insufficient info: {has_insufficient_info}")
         file_logger.info(f"  Has repeated searches: {has_repeated_searches}")
@@ -511,16 +460,16 @@ class SimpleDenseFeedbackRewardManager:
             exceeds_max_steps=exceeds_max_steps
         )
         
-        # 将时序分析结果存储为类属性
+        # Store temporal analysis results as class attribute
         feedback._temporal_analysis = temporal_analysis
         
-        # 记录时序分析结果到文件
+        # Log temporal analysis results to file
         file_logger.info(f"Temporal analysis results:")
         for key, value in temporal_analysis.items():
-            if key != "llm_evaluation_results":  # 避免记录过长的LLM结果
+            if key != "llm_evaluation_results":  # Avoid logging too long LLM results
                 file_logger.info(f"  {key}: {value}")
         
-        # 记录fallback评估结果摘要
+        # Log fallback evaluation results summary
         if "llm_evaluation_results" in temporal_analysis:
             file_logger.info(f"  Fallback evaluation results count: {len(temporal_analysis['llm_evaluation_results'])}")
             for i, result in enumerate(temporal_analysis["llm_evaluation_results"]):
@@ -536,18 +485,18 @@ class SimpleDenseFeedbackRewardManager:
         try:
             logger.info(f"Creating dense reward tensor for response length: {response_length}")
             
-            # 记录到文件
+            # Log to file
             file_logger.info(f"=== CREATING DENSE REWARD TENSOR ===")
             file_logger.info(f"Response length: {response_length}")
             file_logger.info(f"Components count: {len(feedback.components)}")
             file_logger.info(f"Reward allocation strategy: {self.config['reward_allocation_strategy']}")
             
-            # 参数验证
+            # Parameter validation
             if response_length <= 0:
                 logger.warning(f"Invalid response_length: {response_length}, using default 500")
                 response_length = 500
             
-            # 创建reward tensor
+            # Create reward tensor
             reward_tensor = torch.zeros(response_length, dtype=torch.float32)
             
             if not feedback.components:
@@ -555,7 +504,7 @@ class SimpleDenseFeedbackRewardManager:
                 file_logger.info("=" * 50)
                 return reward_tensor
             
-            # 使用改进的reward分配策略
+            # Use improved reward allocation strategy
             if self.config["reward_allocation_strategy"] == "component_based":
                 reward_tensor = self._allocate_rewards_component_based(feedback, response_length)
                 file_logger.info("Used component-based reward allocation")
@@ -563,12 +512,12 @@ class SimpleDenseFeedbackRewardManager:
                 reward_tensor = self._allocate_rewards_uniform(feedback, response_length)
                 file_logger.info("Used uniform reward allocation")
             
-            # 应用平滑过渡
+            # Apply smooth transition
             if self.config["smooth_reward_transition"]:
                 reward_tensor = self._smooth_reward_transitions(reward_tensor)
                 file_logger.info("Applied smooth reward transitions")
             
-            # 限制reward范围
+            # Limit reward range
             reward_tensor = torch.clamp(reward_tensor, 
                                         self.config["min_reward_value"], 
                                         self.config["max_reward_value"])
@@ -576,14 +525,14 @@ class SimpleDenseFeedbackRewardManager:
             # Log reward tensor statistics
             self._log_reward_statistics(reward_tensor)
             
-            # 记录reward tensor详细信息到文件
+            # Log reward tensor details to file
             self._log_reward_tensor_details(reward_tensor, feedback)
             
             return reward_tensor
             
         except Exception as e:
             logger.error(f"Error creating dense reward tensor: {e}")
-            # 返回默认的reward tensor
+            # Return default reward tensor
             default_reward = torch.zeros(response_length, dtype=torch.float32)
             default_reward[:] = 0.5
             return default_reward
@@ -591,25 +540,25 @@ class SimpleDenseFeedbackRewardManager:
     def _apply_core_reward_adjustments(self, base_score: float, feedback: TrajectoryFeedback, 
                                      component: TrajectoryComponent, sorted_components: List[TrajectoryComponent], 
                                      component_idx: int, temporal_meta: Dict) -> float:
-        """应用四个核心方面的reward调整（grounding仅对search/think，带衰减与上限）"""
+        """Apply reward adjustments for four core aspects (grounding only for search/think, with decay and upper limit)"""
         score = base_score
         
-        # 1. 信息不足直接答penalty
+        # 1. Information insufficient penalty
         if temporal_meta.get("has_insufficient_info", False):
             if component.component_type == "answer":
-                # 检查前面是否有不足的information
+                # Check if there is insufficient information before
                 for i in range(component_idx - 1, -1, -1):
                     prev_component = sorted_components[i]
                     if prev_component.component_type == "information":
-                        # 应用信息不足惩罚
+                        # Apply information insufficient penalty
                         score += self.config["insufficient_info_penalty"]
                         logger.debug(f"Penalizing answer after insufficient info: {score:.3f}")
                         break
                     elif prev_component.component_type == "search":
-                        # 如果前面是search，说明这个answer没有直接受到信息不足影响
+                        # If previous component is search, means this answer is not directly affected by insufficient information
                         break
         
-        # 2. 推理grounding评估（仅对search/think，且加入衰减与总上限，避免reward hacking）
+        # 2. Reasoning grounding evaluation (only for search/think, with decay and total upper limit, to avoid reward hacking)
         if component.component_type in ["search", "think"]:
             reasoning_grounded = temporal_meta.get("reasoning_grounded", True)
             if reasoning_grounded:
@@ -622,7 +571,7 @@ class SimpleDenseFeedbackRewardManager:
                 if applied_steps < max_steps and total_bonus < max_total:
                     step_decay = decay ** applied_steps
                     raw_bonus = self.config.get("grounding_bonus", 0.4) * step_decay
-                    # 保证总bonus不超过上限
+                    # Ensure total bonus does not exceed upper limit
                     allowed_bonus = min(raw_bonus, max_total - total_bonus)
                     score += allowed_bonus
                     temporal_meta["grounding_applied"] = applied_steps + 1
@@ -632,21 +581,21 @@ class SimpleDenseFeedbackRewardManager:
                 score += self.config.get("ungrounded_penalty", -0.3)
                 logger.debug(f"Penalizing ungrounded reasoning: {score:.3f}")
         
-        # 3. 信息改进奖励（从不足到充足）
+        # 3. Information improvement reward (from insufficient to sufficient)
         if component.component_type == "information":
             refinement_success = temporal_meta.get("refinement_success", False)
             if refinement_success:
                 refinement_steps = temporal_meta.get("refinement_steps", 0)
-                # 改进步数越少，奖励越多
+                # The less steps, the more reward
                 refinement_bonus = self.config["refinement_bonus"] * (1.0 - refinement_steps * 0.1)
                 score += refinement_bonus
                 logger.debug(f"Rewarding information refinement: {score:.3f}")
         
-        # 4. 格式奖励：如果sequence以answer结尾，给予格式奖励
+        # 4. Format reward: if sequence ends with answer, give format reward
         if component.component_type == "answer":
             temporal_sequence = temporal_meta.get("temporal_sequence", [])
             if temporal_sequence and temporal_sequence[-1] == "answer":
-                # 检查这是否是最后一个answer组件
+                # Check if this is the last answer component
                 is_last_answer = True
                 for j in range(component_idx + 1, len(sorted_components)):
                     if sorted_components[j].component_type == "answer":
@@ -659,48 +608,48 @@ class SimpleDenseFeedbackRewardManager:
                     logger.debug(f"Rewarding proper format (sequence ends with answer): {score:.3f}")
                     file_logger.info(f"Applied format bonus {format_bonus:.3f} for sequence ending with answer")
         
-        # 5. 最终答案质量（已经在base_score中考虑）
+        # 5. Final answer quality (already considered in base_score)
         
-        # 确保分数在合理范围内
+        # Ensure score is in a reasonable range
         return max(self.config["min_reward_value"], score)
     
     def _allocate_rewards_component_based(self, feedback: TrajectoryFeedback, response_length: int) -> torch.Tensor:
-        """基于四个核心方面分配reward：1. grounding, 2. insufficient info penalty, 3. refinement, 4. final answer"""
+        """Allocate rewards based on four core aspects: 1. grounding, 2. insufficient info penalty, 3. refinement, 4. final answer"""
         reward_tensor = torch.zeros(response_length, dtype=torch.float32)
         
-        # 获取时序分析结果
+        # Get temporal analysis results
         temporal_meta = getattr(feedback, '_temporal_analysis', {})
         
-        # 初始化grounding奖励追踪
+        # Initialize grounding reward tracking
         if "grounding_applied" not in temporal_meta:
             temporal_meta["grounding_applied"] = 0
         if "grounding_bonus_total" not in temporal_meta:
             temporal_meta["grounding_bonus_total"] = 0.0
         
-        # 按时间顺序排序组件
+        # Sort
         sorted_components = sorted(feedback.components, key=lambda x: x.start_token_idx)
         
         for i, component in enumerate(sorted_components):
             if component.start_token_idx >= response_length or component.end_token_idx > response_length:
                 continue
             
-            # 基础分数：仅基于最终答案质量
+            # Base score: only based on final answer quality
             base_score = feedback.answer_quality_score if component.component_type == "answer" else 0.0
             
-            # 应用四个核心方面的reward调整
+            # Apply reward adjustments for four core aspects
             final_score = self._apply_core_reward_adjustments(
                 base_score, feedback, component, sorted_components, i, temporal_meta
             )
             
-            # 分配reward
+            # Allocate reward
             start_idx = min(component.start_token_idx, response_length - 1)
             end_idx = min(component.end_token_idx, response_length)
             reward_tensor[start_idx:end_idx] = final_score
             
-            # 记录到文件
+            # Log to file
             file_logger.info(f"Component {i+1} ({component.component_type}): base_score={base_score:.3f}, final_score={final_score:.3f}, tokens={start_idx}-{end_idx}")
         
-        # 记录grounding奖励统计
+        # Log grounding reward statistics
         grounding_applied = temporal_meta.get("grounding_applied", 0)
         grounding_total = temporal_meta.get("grounding_bonus_total", 0.0)
         file_logger.info(f"Grounding rewards applied: {grounding_applied} steps, total bonus: {grounding_total:.3f}")
@@ -710,11 +659,11 @@ class SimpleDenseFeedbackRewardManager:
     
 
     def _smooth_reward_transitions(self, reward_tensor: torch.Tensor) -> torch.Tensor:
-        """平滑reward过渡，避免突变"""
+        """Smooth reward transitions, to avoid sudden changes"""
         if len(reward_tensor) < 3:
             return reward_tensor
         
-        # 使用简单的移动平均平滑
+        # Use simple moving average to smooth
         smoothed = reward_tensor.clone()
         kernel_size = 3
         
@@ -726,7 +675,7 @@ class SimpleDenseFeedbackRewardManager:
         return smoothed
     
     def _log_reward_statistics(self, reward_tensor: torch.Tensor):
-        """记录reward tensor的统计信息"""
+        """Log reward tensor statistics"""
         non_zero_rewards = reward_tensor[reward_tensor != 0]
         if len(non_zero_rewards) > 0:
             logger.info(f"Reward tensor created - Shape: {reward_tensor.shape}, "
@@ -739,14 +688,14 @@ class SimpleDenseFeedbackRewardManager:
             logger.warning("No non-zero rewards in tensor")
     
     def _log_reward_tensor_details(self, reward_tensor: torch.Tensor, feedback: TrajectoryFeedback):
-        """记录reward tensor的详细信息到文件"""
+        """Log reward tensor details to file"""
         file_logger.info(f"Reward tensor details:")
         file_logger.info(f"  Shape: {reward_tensor.shape}")
         file_logger.info(f"  Min value: {reward_tensor.min().item():.3f}")
         file_logger.info(f"  Max value: {reward_tensor.max().item():.3f}")
         file_logger.info(f"  Mean value: {reward_tensor.mean().item():.3f}")
         
-        # 统计非零reward的数量和分布
+        # Count non-zero rewards and their distribution
         non_zero_rewards = reward_tensor[reward_tensor != 0]
         file_logger.info(f"  Non-zero rewards: {len(non_zero_rewards)}")
         if len(non_zero_rewards) > 0:
@@ -755,7 +704,7 @@ class SimpleDenseFeedbackRewardManager:
             file_logger.info(f"  Non-zero mean: {non_zero_rewards.mean().item():.3f}")
             file_logger.info(f"  Non-zero std: {non_zero_rewards.std().item():.3f}")
         
-        # 记录每个组件的reward分配
+        # Log reward allocation for each component
         if feedback.components:
             file_logger.info(f"  Component reward allocation:")
             for i, component in enumerate(feedback.components):
@@ -774,22 +723,22 @@ class SimpleDenseFeedbackRewardManager:
     
     def _score_answer_quality_simplified(self, answer_components: List[TrajectoryComponent], 
                                        ground_truth) -> float:
-        """简化的答案质量评分：只考虑完全匹配"""
+        """Simplified answer quality score: only consider exact matches"""
         if not answer_components:
             return 0.0
         
         final_answer = answer_components[-1].content.strip()
         logger.debug(f"Scoring final answer: {final_answer[:100]}...")
         
-        # 处理ground truth格式
+        # Process ground truth format
         if isinstance(ground_truth, str):
-            # 处理分隔符格式
+            # Process separator format
             if "<|answer_split|>" in ground_truth:
                 gt_parts = [gt.strip() for gt in ground_truth.split("<|answer_split|>")]
             else:
                 gt_parts = [ground_truth.strip()]
         elif isinstance(ground_truth, dict):
-            # 从常见字段中提取答案列表
+            # Extract answer list from common fields
             candidate_keys = ["target", "targets", "answers", "answer", "labels"]
             gt_values = []
             for k in candidate_keys:
@@ -809,7 +758,7 @@ class SimpleDenseFeedbackRewardManager:
         
         logger.debug(f"Ground truth parts: {gt_parts}")
         
-        # 只检查完全匹配（不区分大小写）
+        # Only check exact matches (case-insensitive)
         fa_lower = final_answer.lower()
         for gt_part in gt_parts:
             if not gt_part:
@@ -818,12 +767,12 @@ class SimpleDenseFeedbackRewardManager:
                 logger.debug(f"Exact match found: {final_answer} == {gt_part}")
                 return 1.0
         
-        # 没有完全匹配，返回0分
+        # No exact match, return 0
         logger.debug(f"No exact match found for: {final_answer}")
         return 0.0
     
     def _check_repeated_searches_improved(self, search_components: List[TrajectoryComponent]) -> List[Tuple[int, int, float]]:
-        """改进的重复搜索检测，返回完全相同查询的详细信息"""
+        """Improved repeated search detection, return detailed information for completely identical queries"""
         if len(search_components) < 2:
             return []
         
@@ -833,34 +782,22 @@ class SimpleDenseFeedbackRewardManager:
         for i in range(len(search_contents)):
             for j in range(i + 1, len(search_contents)):
                 if search_contents[i] == search_contents[j]:
-                    # 完全相同的查询，相似度为1.0
+                    # Completely identical queries, similarity is 1.0
                     repeated_pairs.append((i, j, 1.0))
                     logger.debug(f"Found identical queries: '{search_contents[i]}' and '{search_contents[j]}'")
         
         return repeated_pairs
     
     def _has_repeated_searches(self, search_components: List[TrajectoryComponent]) -> bool:
-        """检查是否有重复搜索"""
+        """Check if there are repeated searches"""
         return len(self._check_repeated_searches_improved(search_components)) > 0
     
-    def _compute_query_similarity(self, query1: str, query2: str) -> float:
-        """计算两个查询的相似度 - 仅检查完全相同"""
-        if query1 == query2:
-            return 1.0
-        return 0.0
+
     
-    def _check_insufficient_information(self, information_components: List[TrajectoryComponent]) -> bool:
-        """检查信息是否不足"""
-        for component in information_components:
-            content = component.content.lower()
-            if any(indicator in content for indicator in ["error", "failed", "not found", "insufficient", "no results", "empty"]):
-                logger.debug(f"Found insufficient info indicator: {component.content[:50]}...")
-                return True
-        return False
-    
+
     def _evaluate_reasoning_grounding(self, reasoning_text: str, search_evidence: List[Dict], 
                                       question: str) -> Dict[str, Any]:
-        """同步包装：调用LLM评估器（内部安全运行协程）。"""
+        """Synchronous wrapper: call LLM evaluator (internal safe running coroutine)."""
         if not self.llm_evaluator:
             raise RuntimeError("LLM evaluator not available")
         try:
@@ -877,24 +814,11 @@ class SimpleDenseFeedbackRewardManager:
                 "premise_justification": f"Evaluation error: {str(e)}",
                 "evaluation_success": False
             }
-     
-    def _evaluate_search_result_quality(self, query: str, documents: List[Dict]) -> Dict[str, Any]:
-        """同步包装：调用LLM评估器（内部安全运行协程）。"""
-        if not self.llm_evaluator:
-            raise RuntimeError("LLM evaluator not available")
-        try:
-            return self._run_async(self.llm_evaluator.evaluate_information_quality(query, documents))
-        except Exception as e:
-            logger.error(f"Error evaluating information quality: {e}")
-            return {
-                "information_quality": "Unspecified",
-                "evaluation_success": False
-            }
-     
+
     def _evaluate_information_quality_batch(self, information_components: List[TrajectoryComponent], 
                                            search_components: List[TrajectoryComponent], 
                                            ground_truth: str) -> List[Dict[str, Any]]:
-        """同步包装：将批量请求交给LLM评估器（内部安全运行协程）。"""
+        """Synchronous wrapper: pass batch requests to LLM evaluator (internal safe running coroutine)"""
         if not self.llm_evaluator:
             raise RuntimeError("LLM evaluator not available")
         evaluation_requests = []
@@ -911,13 +835,13 @@ class SimpleDenseFeedbackRewardManager:
             return self._run_async(self.llm_evaluator.batch_evaluate(evaluation_requests))
         except Exception as e:
             logger.error(f"Error in batch information quality evaluation: {e}")
-            # 维持原行为：抛出异常让上层处理
+            # Maintain original behavior: throw exception to upper layer
             raise RuntimeError(f"Batch information quality evaluation failed: {e}")
     
     def _find_corresponding_search_query(self, info_component: TrajectoryComponent, 
                                        search_components: List[TrajectoryComponent]) -> str:
-        """找到对应的search query"""
-        # 简单的启发式：找到最近的search组件
+        """Find corresponding search query"""
+        # Simple heuristic: find the nearest search component
         for search_comp in reversed(search_components):
             if search_comp.start_token_idx < info_component.start_token_idx:
                 return search_comp.content
@@ -930,70 +854,34 @@ class SimpleDenseFeedbackRewardManager:
     
     
     def _is_information_sufficient_llm(self, evaluation_result: Dict[str, Any]) -> bool:
-        """基于LLM评估结果判断信息是否足够（同步版占位，未调用LLM）"""
+        """Based on LLM evaluation results, determine if information is sufficient (Synchronous version, not calling LLM)"""
         if not evaluation_result.get("evaluation_success", False):
             return False
         quality = evaluation_result.get("information_quality", "Unspecified")
         return quality == "Sufficient"
     
-    def _analyze_temporal_dependencies(self, components: List[TrajectoryComponent], 
-                                      ground_truth, question: str = None) -> Dict:
-        """分析时序依赖，专注于四个核心方面（同步fallback评估）"""
-        logger.info("Analyzing temporal dependencies with simplified focus (sync)")
-        
-        # 按时间顺序排序组件
-        sorted_components = sorted(components, key=lambda x: x.start_token_idx)
-        
-        # 提取不同类型的组件
-        search_components = [c for c in sorted_components if c.component_type == "search"]
-        information_components = [c for c in sorted_components if c.component_type == "information"]
-        
-        # 1. 信息质量分析（同步fallback）
-        info_quality_analysis = self._analyze_information_quality_flow_llm(
-            sorted_components, ground_truth, search_components, information_components
-        )
-        
-        # 2. 推理grounding分析（同步fallback）
-        grounding_analysis = self._analyze_reasoning_grounding(sorted_components, question, search_components)
-        
-        # 3. 改进分析（从不足到充足）
-        refinement_analysis = self._analyze_information_refinement_llm(
-            sorted_components, ground_truth, info_quality_analysis["llm_evaluation_results"]
-        )
-        
-        temporal_analysis = {
-            "has_insufficient_info": info_quality_analysis["has_insufficient_info"],
-            "reasoning_grounded": grounding_analysis["reasoning_grounded"],
-            "refinement_success": refinement_analysis["refinement_success"],
-            "refinement_steps": refinement_analysis["refinement_steps"],
-            "temporal_sequence": [comp.component_type for comp in sorted_components],
-            "llm_evaluation_results": info_quality_analysis["llm_evaluation_results"]
-        }
-        
-        logger.info(f"Enhanced temporal analysis results: {temporal_analysis}")
-        return temporal_analysis
-    
+ 
     def _analyze_temporal_dependencies_sync(self, components: List[TrajectoryComponent], 
                                            ground_truth, question: str = None) -> Dict:
-        """分析时序依赖，专注于四个核心方面（使用LLM评估）"""
+        """Analyze temporal dependencies, focusing on four core aspects (using LLM evaluation)"""
         logger.info("Analyzing temporal dependencies with LLM evaluation")
         
-        # 按时间顺序排序组件
+        # Sort components by time order
         sorted_components = sorted(components, key=lambda x: x.start_token_idx)
         
-        # 提取不同类型的组件
+        # Extract different types of components
         search_components = [c for c in sorted_components if c.component_type == "search"]
         information_components = [c for c in sorted_components if c.component_type == "information"]
         
-        # 1. 信息质量分析（使用LLM评估）
+        # 1. Information quality analysis (using LLM evaluation)
         info_quality_analysis = self._analyze_information_quality_flow_llm(
             sorted_components, ground_truth, search_components, information_components
         )
         
-        # 2. 推理grounding分析（使用LLM评估）
+        # 2. Reasoning grounding analysis (using LLM evaluation)
         grounding_analysis = self._analyze_reasoning_grounding(sorted_components, question, search_components)
         
-        # 3. 改进分析（从不足到充足）
+        # 3. Improved analysis (from insufficient to sufficient)
         refinement_analysis = self._analyze_information_refinement_llm(
             sorted_components, ground_truth, info_quality_analysis["llm_evaluation_results"]
         )
@@ -1013,7 +901,7 @@ class SimpleDenseFeedbackRewardManager:
     def _analyze_information_quality_flow_llm(self, sorted_components: List[TrajectoryComponent], 
                                              ground_truth, search_components: List[TrajectoryComponent], 
                                              information_components: List[TrajectoryComponent]) -> Dict:
-        """使用LLM批量评估信息质量流（同步，内部用asyncio.run）"""
+        """Use LLM to batch evaluate information quality flow (Synchronous, internal using asyncio.run)"""
         has_insufficient_info = False
         llm_evaluation_results = []
         if information_components:
@@ -1035,7 +923,7 @@ class SimpleDenseFeedbackRewardManager:
 
     def _analyze_reasoning_grounding(self, sorted_components: List[TrajectoryComponent], 
                                     question: str, search_components: List[TrajectoryComponent]) -> Dict:
-        """分析推理grounding（同步包装，内部用asyncio.run调用LLM）"""
+        """Analyze reasoning grounding (Synchronous wrapper, internal using asyncio.run to call LLM)"""
         if not self.llm_evaluator:
             raise RuntimeError("LLM evaluator not available")
         search_evidence = []
@@ -1065,18 +953,18 @@ class SimpleDenseFeedbackRewardManager:
     
     def _analyze_information_refinement_llm(self, sorted_components: List[TrajectoryComponent], 
                                           ground_truth, llm_evaluation_results: List[Dict[str, Any]]) -> Dict:
-        """基于LLM评估结果分析信息改进"""
+        """Based on LLM evaluation results, analyze information improvement"""
         refinement_success = False
         refinement_steps = 0
         
         if not llm_evaluation_results:
-            # 如果没有LLM评估结果，返回默认值
+            # If there is no LLM evaluation results, return default values
             return {
                 "refinement_success": False,
                 "refinement_steps": 0
             }
         
-        # 找到第一个信息不足的information
+        # Find the first information that is insufficient
         first_insufficient_idx = None
         for i, eval_result in enumerate(llm_evaluation_results):
             if eval_result.get("information_quality") == "Insufficient":
@@ -1084,7 +972,7 @@ class SimpleDenseFeedbackRewardManager:
                 break
         
         if first_insufficient_idx is not None:
-            # 检查后续是否有改进
+            # Check if there is improvement after
             for i in range(first_insufficient_idx + 1, len(llm_evaluation_results)):
                 eval_result = llm_evaluation_results[i]
                 if eval_result.get("information_quality") == "Sufficient":
@@ -1101,15 +989,15 @@ class SimpleDenseFeedbackRewardManager:
 
     
     def __call__(self, data: DataProto, return_dict=False):
-        """处理batch数据并返回dense reward tensors（同步版本）"""
+        """Process batch data and return dense reward tensors (Synchronous version)"""
         logger.info(f"Processing batch with {len(data)} items")
         
-        # 记录到文件
+        # Log to file
         file_logger.info(f"=== BATCH PROCESSING START ===")
         file_logger.info(f"Batch size: {len(data)}")
         file_logger.info(f"Return dict: {return_dict}")
         
-        # 安全检查
+        # Safe check
         if not data or len(data) == 0:
             logger.warning("Empty data batch received")
             file_logger.warning("Empty data batch received")
@@ -1125,13 +1013,13 @@ class SimpleDenseFeedbackRewardManager:
                     data_item = data[i]
                     file_logger.info(f"--- Processing item {i+1}/{len(data)} ---")
                     
-                    # 安全检查数据项
+                    # Safe check data item
                     if not hasattr(data_item, 'batch') or not hasattr(data_item, 'non_tensor_batch'):
                         logger.warning(f"Data item {i} missing required attributes, skipping")
                         file_logger.warning(f"Data item {i} missing required attributes, skipping")
                         continue
                     
-                    # 检查必要的字段
+                    # Check necessary fields
                     required_fields = ["prompts", "responses", "attention_mask"]
                     for field in required_fields:
                         if field not in data_item.batch:
@@ -1144,7 +1032,7 @@ class SimpleDenseFeedbackRewardManager:
                         file_logger.warning(f"Data item {i} missing reward_model field, skipping")
                         continue
                     
-                    # 处理单个数据项（同步调用）
+                    # Process single data item (Synchronous call)
                     result = self._process_single_item_sync(data_item, i)
                     if result:
                         dense_reward_tensors.append(result["reward_tensor"])
@@ -1155,12 +1043,12 @@ class SimpleDenseFeedbackRewardManager:
                 except Exception as e:
                     logger.error(f"Error processing data item {i}: {e}")
                     file_logger.error(f"Error processing data item {i}: {e}")
-                    # 创建默认的reward tensor作为fallback
+                    # Create default reward tensor as fallback
                     default_reward = torch.zeros(500, dtype=torch.float32)
                     dense_reward_tensors.append(default_reward)
                     continue
             
-            # 检查是否有有效的reward tensors
+            # Check if there are valid reward tensors
             if not dense_reward_tensors:
                 logger.warning("No valid reward tensors generated")
                 if return_dict:
@@ -1168,12 +1056,12 @@ class SimpleDenseFeedbackRewardManager:
                 else:
                     return torch.tensor([])
             
-            # 确保所有reward tensor长度一致
+            # Ensure all reward tensor lengths are consistent
             target_length = 500
             normalized_rewards = []
             for reward_tensor in dense_reward_tensors:
                 if len(reward_tensor) != target_length:
-                    # 调整长度
+                    # Adjust length
                     if len(reward_tensor) > target_length:
                         normalized_reward = reward_tensor[:target_length]
                     else:
@@ -1183,11 +1071,11 @@ class SimpleDenseFeedbackRewardManager:
                 else:
                     normalized_rewards.append(reward_tensor)
             
-            # 直接stack，避免padding问题
+            # Direct stack, to avoid padding problems
             stacked_rewards = torch.stack(normalized_rewards, dim=0)
             logger.info(f"Final stacked rewards shape: {stacked_rewards.shape}")
             
-            # 返回结果
+            # Return result
             if return_dict:
                 result = {"reward_tensor": stacked_rewards}
                 logger.info(f"Returning dict with keys: {list(result.keys())}")
@@ -1198,7 +1086,7 @@ class SimpleDenseFeedbackRewardManager:
                 
         except Exception as e:
             logger.error(f"Critical error in reward manager: {e}")
-            # 返回默认值
+            # Return default values
             default_reward = torch.zeros((len(data), 500), dtype=torch.float32)
             if return_dict:
                 return {"reward_tensor": default_reward}
@@ -1206,23 +1094,23 @@ class SimpleDenseFeedbackRewardManager:
                 return default_reward
     
     def _process_single_item_sync(self, data_item, item_index):
-        """处理单个数据项，返回feedback和reward tensor（同步版本）"""
+        """Process single data item, return feedback and reward tensor (Synchronous version)"""
         try:
-            # 记录到文件
+            # Log to file
             file_logger.info(f"=== PROCESSING SINGLE ITEM {item_index+1} ===")
             
-            # 获取response数据
+            # Get response data
             response_ids = data_item.batch["responses"]
             response_ids_shape = response_ids.shape
             logger.debug(f"Response IDs shape: {response_ids_shape}")
             file_logger.info(f"Response IDs shape: {response_ids_shape}")
             
-            # 计算prompt长度
+            # Calculate prompt length
             prompts_shape = data_item.batch["prompts"].shape
             logger.debug(f"Prompts shape: {prompts_shape}")
             file_logger.info(f"Prompts shape: {prompts_shape}")
             
-            # 安全地获取prompt长度
+            # Safe get prompt length
             if len(prompts_shape) >= 2:
                 prompt_length = prompts_shape[1]
             elif len(prompts_shape) == 1:
@@ -1235,12 +1123,12 @@ class SimpleDenseFeedbackRewardManager:
             logger.debug(f"Prompt length: {prompt_length}")
             file_logger.info(f"Prompt length: {prompt_length}")
             
-            # 获取attention mask
+            # Get attention mask
             attention_mask_shape = data_item.batch["attention_mask"].shape
             logger.debug(f"Attention mask shape: {attention_mask_shape}")
             file_logger.info(f"Attention mask shape: {attention_mask_shape}")
             
-            # 安全地移除batch维度
+            # Safe remove batch dimensions
             if len(attention_mask_shape) >= 2:
                 attention_mask = data_item.batch["attention_mask"][0]
             elif len(attention_mask_shape) == 1:
@@ -1250,7 +1138,7 @@ class SimpleDenseFeedbackRewardManager:
                 file_logger.warning(f"Unexpected attention_mask shape: {attention_mask_shape}, using default")
                 attention_mask = torch.ones(1000, dtype=torch.long)
             
-            # 确保attention_mask是1D
+            # Ensure attention_mask is 1D
             if attention_mask.dim() == 0:
                 attention_mask = attention_mask.unsqueeze(0)
             
@@ -1260,13 +1148,13 @@ class SimpleDenseFeedbackRewardManager:
             logger.debug(f"Final attention_mask shape: {attention_mask.shape}")
             file_logger.info(f"Final attention_mask shape: {attention_mask.shape}")
             
-            # 计算有效的response长度
+            # Calculate valid response length
             if prompt_length > 0 and prompt_length < len(attention_mask):
                 valid_response_length = attention_mask[prompt_length:].sum()
             else:
                 valid_response_length = 100
             
-            # 确保长度是有效的整数
+            # Ensure length is a valid integer
             if hasattr(valid_response_length, 'item'):
                 valid_response_length = valid_response_length.item()
                 valid_response_length = int(valid_response_length)
@@ -1274,7 +1162,7 @@ class SimpleDenseFeedbackRewardManager:
             logger.info(f"Final valid response length: {valid_response_length}")
             file_logger.info(f"Final valid response length: {valid_response_length}")
             
-            # 获取有效的response IDs
+            # Get valid response IDs
             if len(response_ids_shape) >= 2:
                 if valid_response_length > 0 and valid_response_length < response_ids.shape[1]:
                     valid_response_ids = response_ids[0, :valid_response_length]
@@ -1286,42 +1174,42 @@ class SimpleDenseFeedbackRewardManager:
                 else:
                     valid_response_ids = response_ids[:100]
             
-            # 确保valid_response_ids是1D tensor
+            # Ensure valid_response_ids is 1D tensor
             if valid_response_ids.dim() > 1:
                 valid_response_ids = valid_response_ids.flatten()
             
-            # 解码response
+            # Decode response
             response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
             ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
             data_source = data_item.non_tensor_batch.get(self.reward_fn_key, "unknown")
             
-            # 尝试获取question（如果存在）
+            # Try to get question (if exists)
             question = None
             if "question" in data_item.non_tensor_batch:
                 question = data_item.non_tensor_batch["question"]
             elif "prompt" in data_item.non_tensor_batch:
-                # 从prompt字段提取问题内容
+                # Extract question content from prompt field
                 prompt_data = data_item.non_tensor_batch["prompt"]
                 if isinstance(prompt_data, (list, np.ndarray)) and len(prompt_data) > 0:
-                    # prompt是消息列表，提取第一个用户消息的内容
+                    # prompt is message list, extract content of first user message
                     first_message = prompt_data[0] if isinstance(prompt_data, list) else prompt_data.tolist()[0]
                     if isinstance(first_message, dict) and "content" in first_message:
                         question = first_message["content"]
                     elif isinstance(first_message, (list, np.ndarray)) and len(first_message) > 0:
-                        # 处理嵌套结构
+                        # Process nested structure
                         first_content = first_message[0] if isinstance(first_message, list) else first_message.tolist()[0]
                         if isinstance(first_content, dict) and "content" in first_content:
                             question = first_content["content"]
             elif "raw_prompt" in data_item.non_tensor_batch:
-                # 从raw_prompt字段提取问题内容
+                # Extract question content from raw_prompt field
                 raw_prompt = data_item.non_tensor_batch["raw_prompt"]
                 if isinstance(raw_prompt, (list, np.ndarray)) and len(raw_prompt) > 0:
-                    # raw_prompt是消息列表，提取第一个用户消息的内容
+                    # raw_prompt is message list, extract content of first user message
                     first_message = raw_prompt[0] if isinstance(raw_prompt, list) else raw_prompt.tolist()[0]
                     if isinstance(first_message, dict) and "content" in first_message:
                         question = first_message["content"]
                     elif isinstance(first_message, (list, np.ndarray)) and len(first_message) > 0:
-                        # 处理嵌套结构
+                        # Process nested structure
                         first_content = first_message[0] if isinstance(first_message, list) else first_message.tolist()[0]
                         if isinstance(first_content, dict) and "content" in first_content:
                             question = first_content["content"]
@@ -1332,23 +1220,23 @@ class SimpleDenseFeedbackRewardManager:
             logger.info(f"Question: {question}")
             logger.info(f"Response: {response_str[:self.config.get('max_log_length', 200)]}...")
             
-            # 记录到文件
+            # Log to file
             file_logger.info(f"Data source: {data_source}")
             file_logger.info(f"Ground truth: {ground_truth}")
             file_logger.info(f"Question: {question}")
             file_logger.info(f"Response: {response_str}")
             
-            # 解析轨迹组件（使用改进的token位置计算）
+            # Parse trajectory components (using improved token position calculation)
             components = self.parse_trajectory_components(response_str, valid_response_ids.tolist())
             
-            # 分析整个轨迹（同步调用）
+            # Analyze entire trajectory (Synchronous call)
             feedback = self.analyze_trajectory_sync(components, ground_truth, question)
             
-            # 创建dense reward tensor
+            # Create dense reward tensor
             target_length = 500
             dense_reward = self.create_dense_reward_tensor(feedback, target_length)
             
-            # 打印分析摘要
+            # Print analysis summary
             if item_index < self.num_examine:
                 self._print_analysis_summary(data_source, item_index, response_str, ground_truth, components, feedback, dense_reward)
             
@@ -1365,7 +1253,7 @@ class SimpleDenseFeedbackRewardManager:
             return None
     
     def _print_analysis_summary(self, data_source, item_index, response_str, ground_truth, components, feedback, dense_reward):
-        """打印分析摘要"""
+        """Print analysis summary"""
         print(f"\n{'='*80}")
         print(f"[{data_source}] Trajectory Analysis for Item {item_index+1}:")
         print(f"{'='*80}")
@@ -1392,10 +1280,10 @@ class SimpleDenseFeedbackRewardManager:
         print(f"{'='*80}") 
 
     def _allocate_rewards_uniform(self, feedback: TrajectoryFeedback, response_length: int) -> torch.Tensor:
-        """均匀分配reward到整个response（备用策略）"""
+        """Uniformly allocate reward to the entire response (backup strategy)"""
         reward_tensor = torch.zeros(response_length, dtype=torch.float32)
         
-        # 仅使用最终答案质量作为稳定均匀信号，避免累积导致的reward hacking
+        # Only use final answer quality as stable uniform signal, to avoid reward hacking caused by accumulation
         avg_score = float(feedback.answer_quality_score) if feedback.answer_quality_score is not None else 0.0
         reward_tensor[:] = avg_score
         logger.info(f"Applied uniform score {avg_score:.3f} to entire response")
