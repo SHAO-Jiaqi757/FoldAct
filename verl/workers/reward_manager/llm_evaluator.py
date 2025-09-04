@@ -41,7 +41,7 @@ class LLMEvaluator:
         if not self.api_key:
             raise ValueError("OpenAI API key is required")
         
-        self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.url)
+        # client is created per-call to bind to the active event loop
         
         # Prompts from llm_judge.py
         self.SEARCH_RESULT_ANALYSIS_PROMPT = """
@@ -116,8 +116,10 @@ Return a single JSON object:
     async def _call_llm(self, prompt: str, max_retries: int = 3, delay: float = 1.0) -> Optional[Dict]:
         """Call OpenAI API with retry logic and robust JSON parsing"""
         for attempt in range(max_retries):
+            client = None
             try:
-                response = await self.client.chat.completions.create(
+                client = AsyncOpenAI(api_key=self.api_key, base_url=self.url)
+                response = await client.chat.completions.create(
                     model=self.model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.0,
@@ -139,6 +141,12 @@ Return a single JSON object:
                 if attempt < max_retries - 1:
                     await asyncio.sleep(delay)
                 continue
+            finally:
+                try:
+                    if client is not None:
+                        await client.close()
+                except Exception:
+                    pass
         
         return None
     

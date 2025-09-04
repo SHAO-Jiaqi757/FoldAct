@@ -106,8 +106,6 @@ class TrajectoryFeedback(BaseModel):
     final_answer: str
     ground_truth: Any  # 改为Any类型，接受各种格式（dict, list, str等）
     think_score: float
-    tool_effectiveness_score: float
-    information_sufficiency_score: float
     answer_quality_score: float
     has_insufficient_info: bool
     has_repeated_tools: bool
