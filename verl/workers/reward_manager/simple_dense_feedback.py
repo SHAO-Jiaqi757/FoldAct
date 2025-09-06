@@ -26,61 +26,81 @@ from verl.tools.schemas import TrajectoryComponent, TrajectoryFeedback
 from verl.utils.reward_score import default_compute_score
 from .llm_evaluator import LLMEvaluator
 
-# 设置debug logging
+# 基本 logger（控制台）
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 设置文件日志记录器
-file_logger = logging.getLogger('file_logger')
-file_logger.setLevel(logging.INFO)
-
-# 创建文件处理器
+# 文件日志：使用绝对路径与进程唯一文件，避免多进程混淆
 import os
 from datetime import datetime
 
-# 确保logs目录存在
-os.makedirs('logs', exist_ok=True)
+def _ensure_file_logger() -> tuple[logging.Logger, str]:
+    """Create/return a per-process file logger and its file path.
+    - Absolute log dir: env REWARD_LOG_DIR or ./logs (abspath)
+    - File name includes date and PID to disambiguate Ray workers
+    """
+    file_logger = logging.getLogger(f'file_logger.{os.getpid()}')
+    if getattr(file_logger, '_configured', False):
+        return file_logger, getattr(file_logger, '_log_path', '')
 
-# 创建带时间戳的日志文件名
-timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-log_filename = f'logs/reward_manager_{timestamp}.log'
+    log_dir = os.environ.get('REWARD_LOG_DIR', 'logs')
+    log_dir = os.path.abspath(log_dir)
+    os.makedirs(log_dir, exist_ok=True)
 
-file_handler = logging.FileHandler(log_filename, encoding='utf-8')
-file_handler.setLevel(logging.INFO)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_filename = os.path.join(log_dir, f'reward_manager_{timestamp}_{os.getpid()}.log')
 
-# 设置文件日志格式
-file_formatter = logging.Formatter(
-    '%(asctime)s - %(levelname)s - %(message)s'
-)
-file_handler.setFormatter(file_formatter)
+    file_handler = logging.FileHandler(log_filename, encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_formatter)
 
-# 添加文件处理器到logger
-file_logger.addHandler(file_handler)
-file_logger.propagate = False  # 避免重复输出到控制台
+    # 清理旧 handler，避免重复添加
+    for h in list(file_logger.handlers):
+        file_logger.removeHandler(h)
+    file_logger.addHandler(file_handler)
+    file_logger.setLevel(logging.INFO)
+    file_logger.propagate = False
+    file_logger._configured = True  # type: ignore[attr-defined]
+    file_logger._log_path = log_filename  # type: ignore[attr-defined]
 
-logger.info(f"Reward manager logging to file: {log_filename}")
+    logger.info(f"Reward manager logging to file: {log_filename}")
+    return file_logger, log_filename
+
+# 初始化模块级别文件 logger（供未实例化场景使用）
+file_logger, log_filename = _ensure_file_logger()
 
 class SimpleDenseFeedbackRewardManager:
     """Simplified reward manager focused on grounding, information sufficiency, and refinement."""
     
     def __init__(self, tokenizer, num_examine=2, compute_score=None, reward_fn_key="data_source", 
-                 enable_llm_evaluation=True, llm_model="gpt-4.1-mini"):
+                 enable_llm_evaluation=True, llm_model="gpt-4.1-mini", log_dir: Optional[str] = None):
         self.tokenizer = tokenizer
         self.num_examine = num_examine
         self.compute_score = compute_score or default_compute_score
         self.reward_fn_key = reward_fn_key
         
-        # 强制启用LLM评估
-        self.enable_llm_evaluation = True
+        # 是否启用LLM评估（允许通过入参关闭，便于离线/测试环境）
+        self.enable_llm_evaluation = enable_llm_evaluation
         self.llm_model = llm_model
         
+        # 初始化文件日志器（如果传入了自定义目录则重新绑定到该目录）
+        if log_dir is not None:
+            os.environ['REWARD_LOG_DIR'] = log_dir
+            self.file_logger, self.log_filename = _ensure_file_logger()
+        else:
+            self.file_logger, self.log_filename = _ensure_file_logger()
+
         # 初始化LLM评估器
-        try:
-            self.llm_evaluator = LLMEvaluator(model=llm_model)
-            logger.info(f"LLM Evaluator initialized with model: {llm_model}")
-        except Exception as e:
-            logger.error(f"Failed to initialize LLM Evaluator: {e}")
-            raise RuntimeError(f"LLM Evaluator is required but failed to initialize: {e}")
+        if self.enable_llm_evaluation:
+            try:
+                self.llm_evaluator = LLMEvaluator(model=llm_model)
+                logger.info(f"LLM Evaluator initialized with model: {llm_model}")
+            except Exception as e:
+                logger.error(f"Failed to initialize LLM Evaluator: {e}")
+                raise RuntimeError(f"LLM Evaluator is required but failed to initialize: {e}")
+        else:
+            self.llm_evaluator = None
         
         # 简化的配置
         self.config = self._get_simplified_config()
@@ -93,12 +113,13 @@ class SimpleDenseFeedbackRewardManager:
             "search": r"<search>(.*?)</search>",
             "information": r"<information>(.*?)</information>",
             "answer": r"<answer>(.*?)</answer>",
-            "think": r"<think>(.*?)</think>",
+            # "think": r"<think>(.*?)</think>", # 不在这里解析think标签，而是在_extract_think_components中解析
+            "complete": r"<complete>(.*?)</complete>",  # 添加complete标签支持
         }
     
-        logger.info(f"SimpleDenseFeedbackRewardManager initialized with LLM evaluation enabled")
+        logger.info(f"SimpleDenseFeedbackRewardManager initialized. LLM evaluation enabled: {self.enable_llm_evaluation}")
         logger.info(f"Using patterns for: {list(self.patterns.keys())}")
-        logger.info(f"LLM evaluation enabled: {self.enable_llm_evaluation}")
+        self.file_logger.info(f"Reward file path: {self.log_filename}")
     
     def _get_simplified_config(self):
         """Get simplified configuration"""
@@ -184,9 +205,9 @@ class SimpleDenseFeedbackRewardManager:
         logger.debug(f"Parsing response with {len(response_tokens) if response_tokens else 'unknown'} tokens")
         
         # Log to file
-        file_logger.info(f"=== PARSING TRAJECTORY COMPONENTS ===")
-        file_logger.info(f"Response string: {response_str}")
-        file_logger.info(f"Response tokens count: {len(response_tokens) if response_tokens else 'unknown'}")
+        self.file_logger.info(f"=== PARSING TRAJECTORY COMPONENTS ===")
+        self.file_logger.info(f"Response string: {response_str}")
+        self.file_logger.info(f"Response tokens count: {len(response_tokens) if response_tokens else 'unknown'}")
         
         # If response_tokens is not provided, tokenize the response
         if response_tokens is None:
@@ -199,7 +220,13 @@ class SimpleDenseFeedbackRewardManager:
         # First parse all known label components
         known_components = []
         for component_type, pattern in self.patterns.items():
+            # Debug the pattern being used
+            logger.debug(f"Searching for pattern: {pattern} for component type: {component_type}")
+            
+            # Use re.DOTALL to make '.' match newlines as well
             matches = list(re.finditer(pattern, response_str, re.DOTALL))
+            logger.debug(f"Found {len(matches)} matches for {component_type}")
+            
             for i, match in enumerate(matches):
                 content = match.group(1).strip()
                 if len(content) < self.config.get("min_component_length", 5):
@@ -209,6 +236,9 @@ class SimpleDenseFeedbackRewardManager:
                 # Calculate accurate token positions
                 start_char = match.start()
                 end_char = match.end()
+                
+                # Log the match details for debugging
+                logger.debug(f"Match for {component_type}: start={start_char}, end={end_char}, content={content[:30]}...")
                 
                 # Convert character positions to token positions
                 start_token_idx = self._char_to_token_position(response_str, response_tokens, start_char)
@@ -231,10 +261,10 @@ class SimpleDenseFeedbackRewardManager:
                 logger.debug(f"Found {component_type} component at tokens {start_token_idx}-{end_token_idx}: {content[:50]}...")
                 
                 # Log to file
-                file_logger.info(f"Component {step_number-1}: {component_type}")
-                file_logger.info(f"  Content: {content}")
-                file_logger.info(f"  Token range: {start_token_idx}-{end_token_idx}")
-                file_logger.info(f"  Step number: {step_number-1}")
+                self.file_logger.info(f"Component {step_number-1}: {component_type}")
+                self.file_logger.info(f"  Content: {content}")
+                self.file_logger.info(f"  Token range: {start_token_idx}-{end_token_idx}")
+                self.file_logger.info(f"  Step number: {step_number-1}")
         
         # Sort known components by token positions
         known_components.sort(key=lambda x: x.start_token_idx)
@@ -254,21 +284,72 @@ class SimpleDenseFeedbackRewardManager:
         logger.info(f"Parsed {len(components)} trajectory components")
         
         # Log parsed results to file
-        file_logger.info(f"Total components parsed: {len(components)}")
-        file_logger.info(f"Component types: {[c.component_type for c in components]}")
-        file_logger.info("=" * 50)
+        self.file_logger.info(f"Total components parsed: {len(components)}")
+        self.file_logger.info(f"Component types: {[c.component_type for c in components]}")
+        self.file_logger.info("=" * 50)
         
         return components
     
     def _extract_think_components(self, response_str: str, response_tokens: List[int], 
                                  known_components: List[TrajectoryComponent], 
                                  start_step_number: int) -> List[TrajectoryComponent]:
-        """Extract remaining content as think components"""
+        """Extract remaining content as think components and also explicitly parse <think> tags"""
         think_components = []
         step_number = start_step_number
         
+        # 1. 首先，显式查找<think>标签 (这是新增的部分)
+        think_pattern = r"<think>(.*?)</think>"
+        think_matches = list(re.finditer(think_pattern, response_str, re.DOTALL))
+        logger.debug(f"Found {len(think_matches)} explicit <think> tags")
+        
+        for i, match in enumerate(think_matches):
+            content = match.group(1).strip()
+            if len(content) < self.config.get("min_component_length", 5):
+                logger.debug(f"Skipping explicit think component {i+1} (too short: {len(content)})")
+                continue
+            
+            # Calculate accurate token positions
+            start_char = match.start()
+            end_char = match.end()
+            
+            # Log the match details for debugging
+            logger.debug(f"Explicit think match: start={start_char}, end={end_char}, content={content[:30]}...")
+            
+            # Convert character positions to token positions
+            start_token_idx = self._char_to_token_position(response_str, response_tokens, start_char)
+            end_token_idx = self._char_to_token_position(response_str, response_tokens, end_char)
+            
+            if start_token_idx is None or end_token_idx is None:
+                logger.warning(f"Could not determine token positions for explicit think component")
+                continue
+            
+            component = TrajectoryComponent(
+                component_type="think",
+                content=content,
+                start_token_idx=start_token_idx,
+                end_token_idx=end_token_idx,
+                step_number=step_number
+            )
+            think_components.append(component)
+            step_number += 1
+            
+            logger.debug(f"Found explicit think component at tokens {start_token_idx}-{end_token_idx}: {content[:50]}...")
+            
+            # Log to file
+            self.file_logger.info(f"Component {step_number-1}: think (explicit tag)")
+            self.file_logger.info(f"  Content: {content}")
+            self.file_logger.info(f"  Token range: {start_token_idx}-{end_token_idx}")
+            self.file_logger.info(f"  Step number: {step_number-1}")
+        
+        # 2. 然后，处理未被标记的内容 (原有的逻辑)
         # Get all known components' character position ranges
         covered_ranges = []
+        
+        # 添加显式think标签的范围
+        for match in think_matches:
+            covered_ranges.append((match.start(), match.end()))
+        
+        # 添加其他已知组件的范围
         for comp in known_components:
             start_char = self._token_to_char_position(response_str, response_tokens, comp.start_token_idx)
             end_char = self._token_to_char_position(response_str, response_tokens, comp.end_token_idx)
@@ -300,13 +381,13 @@ class SimpleDenseFeedbackRewardManager:
                         think_components.append(component)
                         step_number += 1
                         
-                        logger.debug(f"Found think component at tokens {start_token_idx}-{end_token_idx}: {think_content[:50]}...")
+                        logger.debug(f"Found implicit think component at tokens {start_token_idx}-{end_token_idx}: {think_content[:50]}...")
                         
                         # Log to file
-                        file_logger.info(f"Component {step_number-1}: think")
-                        file_logger.info(f"  Content: {think_content}")
-                        file_logger.info(f"  Token range: {start_token_idx}-{end_token_idx}")
-                        file_logger.info(f"  Step number: {step_number-1}")
+                        self.file_logger.info(f"Component {step_number-1}: think (implicit)")
+                        self.file_logger.info(f"  Content: {think_content}")
+                        self.file_logger.info(f"  Token range: {start_token_idx}-{end_token_idx}")
+                        self.file_logger.info(f"  Step number: {step_number-1}")
             
             last_end = max(last_end, end)
         
@@ -327,13 +408,13 @@ class SimpleDenseFeedbackRewardManager:
                     )
                     think_components.append(component)
                     
-                    logger.debug(f"Found think component at tokens {start_token_idx}-{end_token_idx}: {think_content[:50]}...")
+                    logger.debug(f"Found trailing think component at tokens {start_token_idx}-{end_token_idx}: {think_content[:50]}...")
                     
                     # Log to file
-                    file_logger.info(f"Component {step_number}: think")
-                    file_logger.info(f"  Content: {think_content}")
-                    file_logger.info(f"  Token range: {start_token_idx}-{end_token_idx}")
-                    file_logger.info(f"  Step number: {step_number}")
+                    self.file_logger.info(f"Component {step_number}: think (trailing)")
+                    self.file_logger.info(f"  Content: {think_content}")
+                    self.file_logger.info(f"  Token range: {start_token_idx}-{end_token_idx}")
+                    self.file_logger.info(f"  Step number: {step_number}")
         
         return think_components
     
@@ -402,10 +483,10 @@ class SimpleDenseFeedbackRewardManager:
         logger.info(f"Analyzing trajectory with {len(components)} components (sync version)")
         
         # Log to file
-        file_logger.info(f"=== TRAJECTORY ANALYSIS (SYNC) ===")
-        file_logger.info(f"Ground truth: {ground_truth}")
-        file_logger.info(f"Question: {question}")
-        file_logger.info(f"Components count: {len(components)}")
+        self.file_logger.info(f"=== TRAJECTORY ANALYSIS (SYNC) ===")
+        self.file_logger.info(f"Ground truth: {ground_truth}")
+        self.file_logger.info(f"Question: {question}")
+        self.file_logger.info(f"Components count: {len(components)}")
         
         # Extract key information
         search_components = [c for c in components if c.component_type == "search"]
@@ -416,10 +497,10 @@ class SimpleDenseFeedbackRewardManager:
                     f"information={len(information_components)}, answer={len(answer_components)}")
         
         # Log component distribution to file
-        file_logger.info(f"Component breakdown:")
-        file_logger.info(f"  Search components: {len(search_components)}")
-        file_logger.info(f"  Information components: {len(information_components)}")
-        file_logger.info(f"  Answer components: {len(answer_components)}")
+        self.file_logger.info(f"Component breakdown:")
+        self.file_logger.info(f"  Search components: {len(search_components)}")
+        self.file_logger.info(f"  Information components: {len(information_components)}")
+        self.file_logger.info(f"  Answer components: {len(answer_components)}")
         
         # Analyze temporal dependencies and information flow (Synchronous fallback evaluation)
         temporal_analysis = self._analyze_temporal_dependencies_sync(components, ground_truth, question)
@@ -430,8 +511,8 @@ class SimpleDenseFeedbackRewardManager:
         logger.info(f"Component scores - Answer: {answer_quality_score:.3f}")
         
         # Log评分结果到文件
-        file_logger.info(f"Component scores:")
-        file_logger.info(f"  Answer quality: {answer_quality_score:.3f}")
+        self.file_logger.info(f"Component scores:")
+        self.file_logger.info(f"  Answer quality: {answer_quality_score:.3f}")
         
         # Check for penalties with temporal awareness
         has_insufficient_info = temporal_analysis["has_insufficient_info"]
@@ -442,10 +523,10 @@ class SimpleDenseFeedbackRewardManager:
                    f"Repeated searches: {has_repeated_searches}, Exceeds max steps: {exceeds_max_steps}")
         
         # Log penalty information to file
-        file_logger.info(f"Penalty analysis:")
-        file_logger.info(f"  Has insufficient info: {has_insufficient_info}")
-        file_logger.info(f"  Has repeated searches: {has_repeated_searches}")
-        file_logger.info(f"  Exceeds max steps: {exceeds_max_steps}")
+        self.file_logger.info(f"Penalty analysis:")
+        self.file_logger.info(f"  Has insufficient info: {has_insufficient_info}")
+        self.file_logger.info(f"  Has repeated searches: {has_repeated_searches}")
+        self.file_logger.info(f"  Exceeds max steps: {exceeds_max_steps}")
         
         # Create trajectory feedback
         feedback = TrajectoryFeedback(
@@ -464,18 +545,18 @@ class SimpleDenseFeedbackRewardManager:
         feedback._temporal_analysis = temporal_analysis
         
         # Log temporal analysis results to file
-        file_logger.info(f"Temporal analysis results:")
+        self.file_logger.info(f"Temporal analysis results:")
         for key, value in temporal_analysis.items():
             if key != "llm_evaluation_results":  # Avoid logging too long LLM results
-                file_logger.info(f"  {key}: {value}")
+                self.file_logger.info(f"  {key}: {value}")
         
         # Log fallback evaluation results summary
         if "llm_evaluation_results" in temporal_analysis:
-            file_logger.info(f"  Fallback evaluation results count: {len(temporal_analysis['llm_evaluation_results'])}")
+            self.file_logger.info(f"  Fallback evaluation results count: {len(temporal_analysis['llm_evaluation_results'])}")
             for i, result in enumerate(temporal_analysis["llm_evaluation_results"]):
-                file_logger.info(f"    Component {i+1}: {result.get('information_quality', 'Unknown')}")
+                self.file_logger.info(f"    Component {i+1}: {result.get('information_quality', 'Unknown')}")
         
-        file_logger.info("=" * 50)
+        self.file_logger.info("=" * 50)
         
         return feedback
     
@@ -486,10 +567,10 @@ class SimpleDenseFeedbackRewardManager:
             logger.info(f"Creating dense reward tensor for response length: {response_length}")
             
             # Log to file
-            file_logger.info(f"=== CREATING DENSE REWARD TENSOR ===")
-            file_logger.info(f"Response length: {response_length}")
-            file_logger.info(f"Components count: {len(feedback.components)}")
-            file_logger.info(f"Reward allocation strategy: {self.config['reward_allocation_strategy']}")
+            self.file_logger.info(f"=== CREATING DENSE REWARD TENSOR ===")
+            self.file_logger.info(f"Response length: {response_length}")
+            self.file_logger.info(f"Components count: {len(feedback.components)}")
+            self.file_logger.info(f"Reward allocation strategy: {self.config['reward_allocation_strategy']}")
             
             # Parameter validation
             if response_length <= 0:
@@ -500,22 +581,22 @@ class SimpleDenseFeedbackRewardManager:
             reward_tensor = torch.zeros(response_length, dtype=torch.float32)
             
             if not feedback.components:
-                file_logger.info("No components found, applying uniform score: 0.0")
-                file_logger.info("=" * 50)
+                self.file_logger.info("No components found, applying uniform score: 0.0")
+                self.file_logger.info("=" * 50)
                 return reward_tensor
             
             # Use improved reward allocation strategy
             if self.config["reward_allocation_strategy"] == "component_based":
                 reward_tensor = self._allocate_rewards_component_based(feedback, response_length)
-                file_logger.info("Used component-based reward allocation")
+                self.file_logger.info("Used component-based reward allocation")
             else:
                 reward_tensor = self._allocate_rewards_uniform(feedback, response_length)
-                file_logger.info("Used uniform reward allocation")
+                self.file_logger.info("Used uniform reward allocation")
             
             # Apply smooth transition
             if self.config["smooth_reward_transition"]:
                 reward_tensor = self._smooth_reward_transitions(reward_tensor)
-                file_logger.info("Applied smooth reward transitions")
+                self.file_logger.info("Applied smooth reward transitions")
             
             # Limit reward range
             reward_tensor = torch.clamp(reward_tensor, 
@@ -606,7 +687,7 @@ class SimpleDenseFeedbackRewardManager:
                     format_bonus = self.config.get("format_bonus", 0.3)
                     score += format_bonus
                     logger.debug(f"Rewarding proper format (sequence ends with answer): {score:.3f}")
-                    file_logger.info(f"Applied format bonus {format_bonus:.3f} for sequence ending with answer")
+            self.file_logger.info(f"Applied format bonus {format_bonus:.3f} for sequence ending with answer")
         
         # 5. Final answer quality (already considered in base_score)
         
@@ -652,7 +733,7 @@ class SimpleDenseFeedbackRewardManager:
         # Log grounding reward statistics
         grounding_applied = temporal_meta.get("grounding_applied", 0)
         grounding_total = temporal_meta.get("grounding_bonus_total", 0.0)
-        file_logger.info(f"Grounding rewards applied: {grounding_applied} steps, total bonus: {grounding_total:.3f}")
+        self.file_logger.info(f"Grounding rewards applied: {grounding_applied} steps, total bonus: {grounding_total:.3f}")
         
         return reward_tensor
     
@@ -689,36 +770,36 @@ class SimpleDenseFeedbackRewardManager:
     
     def _log_reward_tensor_details(self, reward_tensor: torch.Tensor, feedback: TrajectoryFeedback):
         """Log reward tensor details to file"""
-        file_logger.info(f"Reward tensor details:")
-        file_logger.info(f"  Shape: {reward_tensor.shape}")
-        file_logger.info(f"  Min value: {reward_tensor.min().item():.3f}")
-        file_logger.info(f"  Max value: {reward_tensor.max().item():.3f}")
-        file_logger.info(f"  Mean value: {reward_tensor.mean().item():.3f}")
+        self.file_logger.info(f"Reward tensor details:")
+        self.file_logger.info(f"  Shape: {reward_tensor.shape}")
+        self.file_logger.info(f"  Min value: {reward_tensor.min().item():.3f}")
+        self.file_logger.info(f"  Max value: {reward_tensor.max().item():.3f}")
+        self.file_logger.info(f"  Mean value: {reward_tensor.mean().item():.3f}")
         
         # Count non-zero rewards and their distribution
         non_zero_rewards = reward_tensor[reward_tensor != 0]
-        file_logger.info(f"  Non-zero rewards: {len(non_zero_rewards)}")
+        self.file_logger.info(f"  Non-zero rewards: {len(non_zero_rewards)}")
         if len(non_zero_rewards) > 0:
-            file_logger.info(f"  Non-zero min: {non_zero_rewards.min().item():.3f}")
-            file_logger.info(f"  Non-zero max: {non_zero_rewards.max().item():.3f}")
-            file_logger.info(f"  Non-zero mean: {non_zero_rewards.mean().item():.3f}")
-            file_logger.info(f"  Non-zero std: {non_zero_rewards.std().item():.3f}")
+            self.file_logger.info(f"  Non-zero min: {non_zero_rewards.min().item():.3f}")
+            self.file_logger.info(f"  Non-zero max: {non_zero_rewards.max().item():.3f}")
+            self.file_logger.info(f"  Non-zero mean: {non_zero_rewards.mean().item():.3f}")
+            self.file_logger.info(f"  Non-zero std: {non_zero_rewards.std().item():.3f}")
         
         # Log reward allocation for each component
         if feedback.components:
-            file_logger.info(f"  Component reward allocation:")
+            self.file_logger.info(f"  Component reward allocation:")
             for i, component in enumerate(feedback.components):
                 start_idx = component.start_token_idx
                 end_idx = min(component.end_token_idx, len(reward_tensor))
                 if start_idx < len(reward_tensor):
                     component_rewards = reward_tensor[start_idx:end_idx]
                     if len(component_rewards) > 0:
-                        file_logger.info(f"    {component.component_type} (step {component.step_number}): "
+                        self.file_logger.info(f"    {component.component_type} (step {component.step_number}): "
                                        f"tokens {start_idx}-{end_idx}, "
                                        f"reward range [{component_rewards.min().item():.3f}, {component_rewards.max().item():.3f}], "
                                        f"mean {component_rewards.mean().item():.3f}")
         
-        file_logger.info("=" * 50)
+        self.file_logger.info("=" * 50)
     
     
     def _score_answer_quality_simplified(self, answer_components: List[TrajectoryComponent], 
@@ -913,9 +994,9 @@ class SimpleDenseFeedbackRewardManager:
                 if not is_sufficient:
                     has_insufficient_info = True
                     logger.debug(f"LLM evaluation: Low quality information at step {i+1}: {eval_result.get('information_quality', 'Unknown')}")
-                    file_logger.info(f"LLM evaluation result for {component.component_type} component {i+1}:")
-                    file_logger.info(f"  Content: {component.content[:100]}...")
-                    file_logger.info(f"  Quality: {eval_result.get('information_quality', 'Unknown')}")
+                    self.file_logger.info(f"LLM evaluation result for {component.component_type} component {i+1}:")
+                    self.file_logger.info(f"  Content: {component.content[:100]}...")
+                    self.file_logger.info(f"  Quality: {eval_result.get('information_quality', 'Unknown')}")
         return {
             "has_insufficient_info": has_insufficient_info,
             "llm_evaluation_results": llm_evaluation_results
@@ -993,9 +1074,9 @@ class SimpleDenseFeedbackRewardManager:
         logger.info(f"Processing batch with {len(data)} items")
         
         # Log to file
-        file_logger.info(f"=== BATCH PROCESSING START ===")
-        file_logger.info(f"Batch size: {len(data)}")
-        file_logger.info(f"Return dict: {return_dict}")
+        self.file_logger.info(f"=== BATCH PROCESSING START ===")
+        self.file_logger.info(f"Batch size: {len(data)}")
+        self.file_logger.info(f"Return dict: {return_dict}")
         
         # Safe check
         if not data or len(data) == 0:
@@ -1011,12 +1092,12 @@ class SimpleDenseFeedbackRewardManager:
             for i in range(len(data)):
                 try:
                     data_item = data[i]
-                    file_logger.info(f"--- Processing item {i+1}/{len(data)} ---")
+                    self.file_logger.info(f"--- Processing item {i+1}/{len(data)} ---")
                     
                     # Safe check data item
                     if not hasattr(data_item, 'batch') or not hasattr(data_item, 'non_tensor_batch'):
                         logger.warning(f"Data item {i} missing required attributes, skipping")
-                        file_logger.warning(f"Data item {i} missing required attributes, skipping")
+                        self.file_logger.warning(f"Data item {i} missing required attributes, skipping")
                         continue
                     
                     # Check necessary fields
@@ -1024,25 +1105,25 @@ class SimpleDenseFeedbackRewardManager:
                     for field in required_fields:
                         if field not in data_item.batch:
                             logger.warning(f"Data item {i} missing required field: {field}, skipping")
-                            file_logger.warning(f"Data item {i} missing required field: {field}, skipping")
+                            self.file_logger.warning(f"Data item {i} missing required field: {field}, skipping")
                             continue
                     
                     if "reward_model" not in data_item.non_tensor_batch:
                         logger.warning(f"Data item {i} missing reward_model field, skipping")
-                        file_logger.warning(f"Data item {i} missing reward_model field, skipping")
+                        self.file_logger.warning(f"Data item {i} missing reward_model field, skipping")
                         continue
                     
                     # Process single data item (Synchronous call)
                     result = self._process_single_item_sync(data_item, i)
                     if result:
                         dense_reward_tensors.append(result["reward_tensor"])
-                        file_logger.info(f"Item {i+1} processed successfully")
+                        self.file_logger.info(f"Item {i+1} processed successfully")
                     else:
-                        file_logger.warning(f"Item {i+1} processing returned None")
+                        self.file_logger.warning(f"Item {i+1} processing returned None")
                     
                 except Exception as e:
                     logger.error(f"Error processing data item {i}: {e}")
-                    file_logger.error(f"Error processing data item {i}: {e}")
+                    self.file_logger.error(f"Error processing data item {i}: {e}")
                     # Create default reward tensor as fallback
                     default_reward = torch.zeros(500, dtype=torch.float32)
                     dense_reward_tensors.append(default_reward)
@@ -1097,18 +1178,18 @@ class SimpleDenseFeedbackRewardManager:
         """Process single data item, return feedback and reward tensor (Synchronous version)"""
         try:
             # Log to file
-            file_logger.info(f"=== PROCESSING SINGLE ITEM {item_index+1} ===")
+            self.file_logger.info(f"=== PROCESSING SINGLE ITEM {item_index+1} ===")
             
             # Get response data
             response_ids = data_item.batch["responses"]
             response_ids_shape = response_ids.shape
             logger.debug(f"Response IDs shape: {response_ids_shape}")
-            file_logger.info(f"Response IDs shape: {response_ids_shape}")
+            self.file_logger.info(f"Response IDs shape: {response_ids_shape}")
             
             # Calculate prompt length
             prompts_shape = data_item.batch["prompts"].shape
             logger.debug(f"Prompts shape: {prompts_shape}")
-            file_logger.info(f"Prompts shape: {prompts_shape}")
+            self.file_logger.info(f"Prompts shape: {prompts_shape}")
             
             # Safe get prompt length
             if len(prompts_shape) >= 2:
@@ -1118,15 +1199,15 @@ class SimpleDenseFeedbackRewardManager:
             else:
                 prompt_length = 0
                 logger.warning(f"Unexpected prompts shape: {prompts_shape}, using default prompt_length=0")
-                file_logger.warning(f"Unexpected prompts shape: {prompts_shape}, using default prompt_length=0")
+                self.file_logger.warning(f"Unexpected prompts shape: {prompts_shape}, using default prompt_length=0")
             
             logger.debug(f"Prompt length: {prompt_length}")
-            file_logger.info(f"Prompt length: {prompt_length}")
+            self.file_logger.info(f"Prompt length: {prompt_length}")
             
             # Get attention mask
             attention_mask_shape = data_item.batch["attention_mask"].shape
             logger.debug(f"Attention mask shape: {attention_mask_shape}")
-            file_logger.info(f"Attention mask shape: {attention_mask_shape}")
+            self.file_logger.info(f"Attention mask shape: {attention_mask_shape}")
             
             # Safe remove batch dimensions
             if len(attention_mask_shape) >= 2:
@@ -1135,7 +1216,7 @@ class SimpleDenseFeedbackRewardManager:
                 attention_mask = data_item.batch["attention_mask"]
             else:
                 logger.warning(f"Unexpected attention_mask shape: {attention_mask_shape}, using default")
-                file_logger.warning(f"Unexpected attention_mask shape: {attention_mask_shape}, using default")
+                self.file_logger.warning(f"Unexpected attention_mask shape: {attention_mask_shape}, using default")
                 attention_mask = torch.ones(1000, dtype=torch.long)
             
             # Ensure attention_mask is 1D
@@ -1146,7 +1227,7 @@ class SimpleDenseFeedbackRewardManager:
                 raise ValueError(f"Invalid attention_mask dimensions: {attention_mask.dim()}")
             
             logger.debug(f"Final attention_mask shape: {attention_mask.shape}")
-            file_logger.info(f"Final attention_mask shape: {attention_mask.shape}")
+            self.file_logger.info(f"Final attention_mask shape: {attention_mask.shape}")
             
             # Calculate valid response length
             if prompt_length > 0 and prompt_length < len(attention_mask):
@@ -1160,7 +1241,7 @@ class SimpleDenseFeedbackRewardManager:
                 valid_response_length = int(valid_response_length)
             
             logger.info(f"Final valid response length: {valid_response_length}")
-            file_logger.info(f"Final valid response length: {valid_response_length}")
+            self.file_logger.info(f"Final valid response length: {valid_response_length}")
             
             # Get valid response IDs
             if len(response_ids_shape) >= 2:
@@ -1180,16 +1261,16 @@ class SimpleDenseFeedbackRewardManager:
             
             # Decode response
             response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
-            ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
+            ground_truth = data_item.non_tensor_batch.get("reward_model", {}).get("ground_truth", "")
             data_source = data_item.non_tensor_batch.get(self.reward_fn_key, "unknown")
             
             # Try to get question (if exists)
             question = None
             if "question" in data_item.non_tensor_batch:
-                question = data_item.non_tensor_batch["question"]
+                question = data_item.non_tensor_batch.get("question", None)
             elif "prompt" in data_item.non_tensor_batch:
                 # Extract question content from prompt field
-                prompt_data = data_item.non_tensor_batch["prompt"]
+                prompt_data = data_item.non_tensor_batch.get("prompt", None)
                 if isinstance(prompt_data, (list, np.ndarray)) and len(prompt_data) > 0:
                     # prompt is message list, extract content of first user message
                     first_message = prompt_data[0] if isinstance(prompt_data, list) else prompt_data.tolist()[0]
@@ -1202,7 +1283,7 @@ class SimpleDenseFeedbackRewardManager:
                             question = first_content["content"]
             elif "raw_prompt" in data_item.non_tensor_batch:
                 # Extract question content from raw_prompt field
-                raw_prompt = data_item.non_tensor_batch["raw_prompt"]
+                raw_prompt = data_item.non_tensor_batch.get("raw_prompt", None)
                 if isinstance(raw_prompt, (list, np.ndarray)) and len(raw_prompt) > 0:
                     # raw_prompt is message list, extract content of first user message
                     first_message = raw_prompt[0] if isinstance(raw_prompt, list) else raw_prompt.tolist()[0]
@@ -1221,10 +1302,10 @@ class SimpleDenseFeedbackRewardManager:
             logger.info(f"Response: {response_str[:self.config.get('max_log_length', 200)]}...")
             
             # Log to file
-            file_logger.info(f"Data source: {data_source}")
-            file_logger.info(f"Ground truth: {ground_truth}")
-            file_logger.info(f"Question: {question}")
-            file_logger.info(f"Response: {response_str}")
+            self.file_logger.info(f"Data source: {data_source}")
+            self.file_logger.info(f"Ground truth: {ground_truth}")
+            self.file_logger.info(f"Question: {question}")
+            self.file_logger.info(f"Response: {response_str}")
             
             # Parse trajectory components (using improved token position calculation)
             components = self.parse_trajectory_components(response_str, valid_response_ids.tolist())
@@ -1240,7 +1321,7 @@ class SimpleDenseFeedbackRewardManager:
             if item_index < self.num_examine:
                 self._print_analysis_summary(data_source, item_index, response_str, ground_truth, components, feedback, dense_reward)
             
-            file_logger.info(f"Item {item_index+1} processing completed successfully")
+            self.file_logger.info(f"Item {item_index+1} processing completed successfully")
             
             return {
                 "feedback": feedback,
@@ -1249,7 +1330,7 @@ class SimpleDenseFeedbackRewardManager:
             
         except Exception as e:
             logger.error(f"Error processing single item {item_index}: {e}")
-            file_logger.error(f"Error processing single item {item_index}: {e}")
+            self.file_logger.error(f"Error processing single item {item_index}: {e}")
             return None
     
     def _print_analysis_summary(self, data_source, item_index, response_str, ground_truth, components, feedback, dense_reward):
