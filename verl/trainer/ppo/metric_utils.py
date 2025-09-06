@@ -164,19 +164,24 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         "prompt_length/max": torch.max(prompt_length).detach().item(),
         "prompt_length/min": torch.min(prompt_length).detach().item(),
         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
-        # episode
-        "episode/reward/mean": 
-            batch.non_tensor_batch["episode_rewards_mean"][0].item(),
-        "episode/reward/max": 
-            batch.non_tensor_batch["episode_rewards_max"][0].item(),
-        "episode/reward/min": 
-            batch.non_tensor_batch["episode_rewards_min"][0].item(),
-        "episode/length/mean": 
-            batch.non_tensor_batch["episode_lengths_mean"][0].item(),
-        "episode/length/max":
-            batch.non_tensor_batch["episode_lengths_max"][0].item(),
-        "episode/length/min": 
-            batch.non_tensor_batch["episode_lengths_min"][0].item(),
+        # episode (only if present; used by env/multi-turn trainers)
+        **(
+            {
+                "episode/reward/mean": batch.non_tensor_batch["episode_rewards_mean"][0].item(),
+                "episode/reward/max": batch.non_tensor_batch["episode_rewards_max"][0].item(),
+                "episode/reward/min": batch.non_tensor_batch["episode_rewards_min"][0].item(),
+                "episode/length/mean": batch.non_tensor_batch["episode_lengths_mean"][0].item(),
+                "episode/length/max": batch.non_tensor_batch["episode_lengths_max"][0].item(),
+                "episode/length/min": batch.non_tensor_batch["episode_lengths_min"][0].item(),
+            }
+            if "episode_rewards_mean" in batch.non_tensor_batch
+            and "episode_rewards_max" in batch.non_tensor_batch
+            and "episode_rewards_min" in batch.non_tensor_batch
+            and "episode_lengths_mean" in batch.non_tensor_batch
+            and "episode_lengths_max" in batch.non_tensor_batch
+            and "episode_lengths_min" in batch.non_tensor_batch
+            else {}
+        ),
         **({f"episode/{k}": v[0].item() for k, v in batch.non_tensor_batch.items() if "success_rate" in k}),
     }
     return metrics

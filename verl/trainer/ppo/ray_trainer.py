@@ -860,17 +860,43 @@ class RayPPOTrainer:
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
-        reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
-        data_sources = np.concatenate(data_source_lst, axis=0)
+        # 确保所有reward_tensor的维度一致
+        if len(reward_tensor_lst) > 0:
+            # 获取所有张量的形状
+            shapes = [tensor.shape for tensor in reward_tensor_lst]
+            print(f"DEBUG: Reward tensor shapes before processing: {shapes}")
+            
+            # 找到最小的序列长度
+            min_seq_len = min(tensor.shape[1] for tensor in reward_tensor_lst)
+            print(f"DEBUG: Using minimum sequence length: {min_seq_len}")
+            
+            # 截断所有张量到相同的序列长度
+            processed_tensors = [tensor[:, :min_seq_len] for tensor in reward_tensor_lst]
+            
+            # 拼接张量
+            reward_tensor = torch.cat(processed_tensors, dim=0).sum(-1).cpu()  # (batch_size,)
+            print(f"DEBUG: Final reward tensor shape: {reward_tensor.shape}")
+        else:
+            reward_tensor = torch.tensor([])
+            
+        # 处理data_source_lst可能为空的情况
+        if data_source_lst:
+            data_sources = np.concatenate(data_source_lst, axis=0)
+        else:
+            data_sources = np.array([])
+            
         success_rate = {k: np.mean(v) for k, v in success_rate_dict.items()}
 
         # evaluate test_score based on data source
         data_source_reward = {}
-        for i in range(reward_tensor.shape[0]):
-            data_source = data_sources[i]
-            if data_source not in data_source_reward:
-                data_source_reward[data_source] = []
-            data_source_reward[data_source].append(reward_tensor[i].item())
+        
+        # 确保reward_tensor不为空
+        if reward_tensor.numel() > 0 and len(data_sources) > 0:
+            for i in range(reward_tensor.shape[0]):
+                data_source = data_sources[i]
+                if data_source not in data_source_reward:
+                    data_source_reward[data_source] = []
+                data_source_reward[data_source].append(reward_tensor[i].item())
 
         metric_dict = {}
         for data_source, rewards in data_source_reward.items():
@@ -1158,7 +1184,8 @@ class RayPPOTrainer:
             retriever_num_workers= self.config.retriever.num_workers ,
             retriever_rate_limit= self.config.retriever.rate_limit ,
             retriever_timeout = self.config.retriever.timeout ,
-            retriever_enable_global_rate_limit = self.config.retriever.enable_global_rate_limit  
+            retriever_enable_global_rate_limit = self.config.retriever.enable_global_rate_limit,
+            final_turn_do_search = getattr(self.config, 'final_turn_do_search', False),  
         )
 
         generation_manager = LLMGenerationManager(
@@ -1199,8 +1226,12 @@ class RayPPOTrainer:
                     if not self.config.do_search:
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
-                        batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
-                                                                dtype=object)
+                        # Assign unique IDs per original prompt; also set traj_uid for compatibility
+                        batch.non_tensor_batch['uid'] = np.array(
+                            [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                        )
+                        # For single-turn scenarios, treat each prompt as its own trajectory
+                        batch.non_tensor_batch['traj_uid'] = batch.non_tensor_batch['uid'].copy()
                         # repeat to align with repeated responses in rollout
                         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                         batch = batch.union(gen_batch_output)                    
@@ -1220,7 +1251,9 @@ class RayPPOTrainer:
                             with torch.no_grad():
                                 output = self.actor_rollout_wg.compute_log_prob(final_gen_batch_output)
                                 final_gen_batch_output = final_gen_batch_output.union(output)
+                            # Use provided per-sample index as group id; mirror to traj_uid
                             batch.non_tensor_batch['uid'] = batch.non_tensor_batch['index'].copy()
+                            batch.non_tensor_batch['traj_uid'] = batch.non_tensor_batch['uid'].copy()
                                                 
                             # repeat to align with repeated responses in rollout
                             batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
@@ -1380,11 +1413,17 @@ class RayPPOTrainer:
                         reward_tensor = self.reward_fn(batch)
                         batch.batch['token_level_scores'] = reward_tensor                        
 
-                        # compute rewards. apply_kl_penalty if available
-                        if not self.config.algorithm.use_kl_in_reward:
-                            batch, kl_metrics = apply_kl_penalty(batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty)
+                        # compute rewards. apply_kl_penalty if enabled
+                        # When using in-reward KL, the controller is initialized in __init__.
+                        if self.config.algorithm.use_kl_in_reward:
+                            batch, kl_metrics = apply_kl_penalty(
+                                batch,
+                                kl_ctrl=self.kl_ctrl_in_reward,
+                                kl_penalty=self.config.algorithm.kl_penalty,
+                            )
                             metrics.update(kl_metrics)
                         else:
+                            # No KL in reward: rewards equal scores
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
                         # compute advantages, executed on the driver process

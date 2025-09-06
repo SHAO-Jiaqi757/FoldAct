@@ -429,38 +429,74 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
     return loss
 
 
-def compute_policy_loss(old_log_prob, log_prob, advantages, eos_mask, cliprange):
-    """Adapted from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1122
+def compute_policy_loss(
+    old_log_prob,
+    log_prob,
+    advantages,
+    response_mask=None,
+    eos_mask=None,
+    cliprange: float = 0.2,
+    cliprange_low: float | None = None,
+    cliprange_high: float | None = None,
+    clip_ratio_c: float | None = None,
+    loss_agg_mode: str = "token-mean",
+):
+    """Compute PPO policy loss with optional asymmetric clipping and dual-clip.
 
     Args:
-        old_log_prob: `(torch.Tensor)`
-            shape: (bs, response_length)
-        log_prob: `(torch.Tensor)`
-            shape: (bs, response_length)
-        advantages: `(torch.Tensor)`
-            shape: (bs, response_length)
-        eos_mask: `(torch.Tensor)`
-            shape: (bs, response_length)
-        cliprange: (float)
-            The clip range used in PPO. See https://arxiv.org/abs/1707.06347
+        old_log_prob (torch.Tensor): (bs, response_length)
+        log_prob (torch.Tensor): (bs, response_length)
+        advantages (torch.Tensor): (bs, response_length)
+        response_mask (torch.Tensor, optional): mask over response tokens.
+        eos_mask (torch.Tensor, optional): backward-compat mask name.
+        cliprange (float): default clip range when low/high not set.
+        cliprange_low (float, optional): lower epsilon for asymmetric clipping.
+        cliprange_high (float, optional): upper epsilon for asymmetric clipping.
+        clip_ratio_c (float, optional): dual-clip lower-bound constant (c) for A<0.
+        loss_agg_mode (str): aggregation mode for token losses.
 
     Returns:
-        pg_loss: `a scalar torch.Tensor`
-            policy gradient loss computed via PPO
-        pg_clipfrac: (float)
-            a float number indicating the fraction of policy gradient loss being clipped
-
+        pg_loss (torch.Tensor): aggregated policy loss (scalar).
+        pg_clipfrac (torch.Tensor): fraction of tokens where clipping applied.
+        ppo_kl (torch.Tensor): masked mean KL estimator.
+        pg_clipfrac_lower (torch.Tensor): fraction where dual-clip lower bound applied.
     """
+    # Choose mask (backward compatible)
+    mask = response_mask if response_mask is not None else eos_mask
+    assert mask is not None, "Either response_mask or eos_mask must be provided"
+
+    # Ratios and approximate KL
     negative_approx_kl = log_prob - old_log_prob
     ratio = torch.exp(negative_approx_kl)
-    ppo_kl = verl_F.masked_mean(-negative_approx_kl, eos_mask)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, mask)
 
-    pg_losses = -advantages * ratio
-    pg_losses2 = -advantages * torch.clamp(ratio, 1.0 - cliprange, 1.0 + cliprange)
+    # Clipping ranges (asymmetric if provided)
+    low = 1.0 - (cliprange_low if cliprange_low is not None else cliprange)
+    high = 1.0 + (cliprange_high if cliprange_high is not None else cliprange)
 
-    pg_loss = (torch.max(pg_losses, pg_losses2), eos_mask)
-    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses).float(), eos_mask)
-    return pg_loss, pg_clipfrac, ppo_kl
+    # Base PPO clipped objective (loss form)
+    loss1 = -advantages * ratio
+    loss2 = -advantages * torch.clamp(ratio, low, high)
+    base_loss = torch.max(loss1, loss2)
+
+    # Dual-clip: apply lower bound when advantages < 0
+    pg_clipfrac_lower = torch.tensor(0.0, device=base_loss.device)
+    if clip_ratio_c is not None and clip_ratio_c > 0:
+        adv_neg_mask = (advantages < 0).to(base_loss.dtype)
+        lower_bound_loss = -clip_ratio_c * advantages  # equals c * (-A) when A<0
+        combined_loss = torch.where(advantages < 0, torch.max(base_loss, lower_bound_loss), base_loss)
+        # Indicator for where lower bound actually activated
+        lower_activated = (combined_loss > base_loss).to(base_loss.dtype)
+        pg_clipfrac_lower = verl_F.masked_mean(lower_activated, mask)
+        final_loss_mat = combined_loss
+    else:
+        final_loss_mat = base_loss
+
+    # Aggregations
+    pg_loss = agg_loss(loss_mat=final_loss_mat, loss_mask=mask, loss_agg_mode=loss_agg_mode)
+    pg_clipfrac = verl_F.masked_mean((loss2 > loss1).to(base_loss.dtype), mask)
+
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 def compute_entropy_loss(logits, response_mask, loss_agg_mode: str = "token-mean"):
     """Compute categorical entropy loss (For backward compatibility)

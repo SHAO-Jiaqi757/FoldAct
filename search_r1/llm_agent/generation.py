@@ -54,6 +54,8 @@ class GenerationConfig:
     retriever_rate_limit:int = 120 
     retriever_timeout:int = 30 
     retriever_enable_global_rate_limit:bool = True 
+    # Whether to allow do_search during the final rollout and append <information>
+    final_turn_do_search: bool = False
 
 class LLMGenerationManager:
     def __init__(
@@ -329,9 +331,11 @@ class LLMGenerationManager:
             responses_ids, responses_str = self._postprocess_responses(gen_output.batch['responses'])
             responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
 
-            # # Execute in environment and process observations
-            _, dones, valid_action, is_search = self.execute_predictions(
-                responses_str, self.tokenizer.pad_token, active_mask, do_search=False
+            # Execute in environment and process observations
+            # Optionally allow search on the final turn to include <information>
+            do_search_final = getattr(self.config, "final_turn_do_search", False)
+            next_obs, dones, valid_action, is_search = self.execute_predictions(
+                responses_str, self.tokenizer.pad_token, active_mask, do_search=do_search_final
             )
 
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
@@ -341,10 +345,18 @@ class LLMGenerationManager:
             valid_search_stats += torch.tensor(is_search, dtype=torch.int)
             
 
-            original_right_side = self._update_right_side(
-                original_right_side,
-                responses_ids,
-            )
+            if do_search_final:
+                next_obs_ids = self._process_next_obs(next_obs)
+                original_right_side = self._update_right_side(
+                    original_right_side,
+                    responses_ids,
+                    next_obs_ids,
+                )
+            else:
+                original_right_side = self._update_right_side(
+                    original_right_side,
+                    responses_ids,
+                )
         
         meta_info['turns_stats'] = turns_stats.tolist()
         meta_info['active_mask'] = active_mask.tolist()
