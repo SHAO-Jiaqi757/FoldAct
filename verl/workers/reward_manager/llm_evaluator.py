@@ -291,13 +291,13 @@ Return a single JSON object:
 
 
 # Convenience functions for synchronous usage
-def create_evaluator(model: str = "gpt-4o-mini", api_key: Optional[str] = None) -> LLMEvaluator:
+def create_evaluator(model: str = "gpt-4.1-mini", api_key: Optional[str] = None) -> LLMEvaluator:
     """Create an LLM evaluator instance"""
     return LLMEvaluator(model=model, api_key=api_key)
 
 
 async def evaluate_single_information_quality(query: str, documents: List[Dict], 
-                                           model: str = "gpt-4o-mini", 
+                                           model: str = "gpt-4.1-mini", 
                                            api_key: Optional[str] = None) -> Dict[str, Any]:
     """Evaluate information quality for a single search result"""
     evaluator = LLMEvaluator(model=model, api_key=api_key)
@@ -306,7 +306,7 @@ async def evaluate_single_information_quality(query: str, documents: List[Dict],
 
 async def evaluate_single_reasoning_grounding(reasoning_text: str, search_evidence: List[Dict], 
                                             question: str, 
-                                            model: str = "gpt-4o-mini", 
+                                            model: str = "gpt-4.1-mini", 
                                             api_key: Optional[str] = None) -> Dict[str, Any]:
     """Evaluate reasoning grounding for a single reasoning step"""
     evaluator = LLMEvaluator(model=model, api_key=api_key)
