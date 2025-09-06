@@ -42,8 +42,8 @@ class BatchRewardManager:
             response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
             responses_str.append(response_str)
 
-        ground_truths = [item.non_tensor_batch["reward_model"].get("ground_truth", None) for item in data]
-        data_sources = data.non_tensor_batch[self.reward_fn_key]
+        ground_truths = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in data]
+        data_sources = data.non_tensor_batch.get(self.reward_fn_key, ["unknown"] * len(data))
         extras = data.non_tensor_batch.get("extra_info", [None] * len(data))
 
         scores = self.compute_score(
@@ -70,7 +70,7 @@ class BatchRewardManager:
         prompt_len = prompt_ids.shape[-1]
         attention_mask = data.batch["attention_mask"]
         valid_response_lengths = attention_mask[:, prompt_len:].sum(dim=-1)
-        data_sources = data.non_tensor_batch[self.reward_fn_key]
+        data_sources = data.non_tensor_batch.get(self.reward_fn_key, ["unknown"] * len(data))
 
         scores = self.verify(data)
         rewards = []
@@ -94,7 +94,7 @@ class BatchRewardManager:
             if already_printed.get(data_source, 0) < self.num_examine:
                 response_str = self.tokenizer.decode(data.batch["responses"][i][:length], skip_special_tokens=True)
                 prompt_str = self.tokenizer.decode(data.batch["prompts"][i], skip_special_tokens=True)
-                ground_truth = data[i].non_tensor_batch["reward_model"].get("ground_truth", None)
+                ground_truth = data[i].non_tensor_batch.get("reward_model", {}).get("ground_truth", None)
                 print("[prompt]", prompt_str)
                 print("[response]", response_str)
                 print("[ground_truth]", ground_truth)

@@ -72,10 +72,10 @@ class EpisodeRewardManager:
             sequences_str = self.tokenizer.decode(sequences)
 
 
-            ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
+            ground_truth = data_item.non_tensor_batch.get('reward_model', {}).get('ground_truth', '')
             # select rm_score
 
-            data_source = data_item.non_tensor_batch['data_source']
+            data_source = data_item.non_tensor_batch.get('data_source', 'unknown')
             compute_score_fn=_select_rm_score_fn(data_source)
 
             # Convert ground_truth to the expected format if it's not already a dictionary

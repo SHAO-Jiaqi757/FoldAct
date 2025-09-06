@@ -120,8 +120,8 @@ class PrimeRewardManager:
 
         response_ids = data.batch["responses"]
         sequences_str = self.tokenizer.batch_decode(response_ids, skip_special_tokens=True)
-        ground_truth = [data_item.non_tensor_batch["reward_model"]["ground_truth"] for data_item in data]
-        data_sources = data.non_tensor_batch[self.reward_fn_key]
+        ground_truth = [data_item.non_tensor_batch.get("reward_model", {}).get("ground_truth", "") for data_item in data]
+        data_sources = data.non_tensor_batch.get(self.reward_fn_key, ["unknown"] * len(data))
         extra_info = data.non_tensor_batch.get("extra_info", None)
 
         assert len(sequences_str) == len(ground_truth) == len(data_sources)
@@ -161,7 +161,7 @@ class PrimeRewardManager:
         response_ids = data.batch["responses"]
         valid_response_length = data.batch["attention_mask"][:, prompt_length:].sum(dim=-1)
         sequences_str = self.tokenizer.batch_decode(response_ids, skip_special_tokens=True)
-        data_sources = data.non_tensor_batch["data_source"]
+        data_sources = data.non_tensor_batch.get("data_source", ["unknown"] * len(data))
 
         scores = self.verify(data)
 

@@ -60,7 +60,7 @@ class TrajectoryCollector:
         """
 
         raw_prompt = gen_batch.non_tensor_batch['raw_prompt'][item]
-        data_source = gen_batch.non_tensor_batch['data_source'][item]
+        data_source = gen_batch.non_tensor_batch.get('data_source', ['unknown'])[item] if 'data_source' in gen_batch.non_tensor_batch else 'unknown'
         
         # Get observation components
         obs_texts = obs.get('text', None)

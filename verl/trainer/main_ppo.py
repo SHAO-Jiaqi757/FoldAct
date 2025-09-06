@@ -151,17 +151,20 @@ class TaskRunner:
         # Initialize reward manager with appropriate parameters
         if reward_manager_name == "simple_dense_feedback":
             print(f"\n🎯 Initializing SimpleDenseFeedbackRewardManager...")
+            reward_kwargs = dict(config.reward_model.get("reward_kwargs", {}))
             reward_fn = reward_manager_cls(
-                tokenizer=tokenizer, 
-                num_examine=0, 
+                tokenizer=tokenizer,
+                num_examine=0,
                 compute_score=None,  # Will use default
-                reward_fn_key=config.data.get("reward_fn_key", "data_source")
+                reward_fn_key=config.data.get("reward_fn_key", "data_source"),
+                **reward_kwargs,
             )
             val_reward_fn = reward_manager_cls(
-                tokenizer=tokenizer, 
-                num_examine=1, 
+                tokenizer=tokenizer,
+                num_examine=1,
                 compute_score=None,  # Will use default
-                reward_fn_key=config.data.get("reward_fn_key", "data_source")
+                reward_fn_key=config.data.get("reward_fn_key", "data_source"),
+                **reward_kwargs,
             )
             print(f"✅ SimpleDenseFeedbackRewardManager initialized successfully!")
         else:
