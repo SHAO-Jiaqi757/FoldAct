@@ -24,7 +24,11 @@ import threading
 from verl import DataProto
 from verl.tools.schemas import TrajectoryComponent, TrajectoryFeedback
 from verl.utils.reward_score import default_compute_score
-from .llm_evaluator import LLMEvaluator
+# Optional import: allow running in environments without OpenAI deps
+try:
+    from .llm_evaluator import LLMEvaluator  # type: ignore
+except Exception:  # pragma: no cover - import fallback for test envs
+    LLMEvaluator = None  # type: ignore
 
 # 基本 logger（控制台）
 logging.basicConfig(level=logging.INFO)
@@ -960,7 +964,15 @@ class SimpleDenseFeedbackRewardManager:
         )
         
         # 2. Reasoning grounding analysis (using LLM evaluation)
-        grounding_analysis = self._analyze_reasoning_grounding(sorted_components, question, search_components)
+        # Evaluate grounding for both search and think components, using information components as evidence
+        reasoning_components = [c for c in sorted_components if c.component_type in ["search", "think"]]
+        grounding_analysis = self._analyze_reasoning_grounding(
+            sorted_components,
+            question,
+            search_components,
+            information_components,
+            reasoning_components,
+        )
         
         # 3. Improved analysis (from insufficient to sufficient)
         refinement_analysis = self._analyze_information_refinement_llm(
@@ -1003,30 +1015,49 @@ class SimpleDenseFeedbackRewardManager:
         }
 
     def _analyze_reasoning_grounding(self, sorted_components: List[TrajectoryComponent], 
-                                    question: str, search_components: List[TrajectoryComponent]) -> Dict:
-        """Analyze reasoning grounding (Synchronous wrapper, internal using asyncio.run to call LLM)"""
+                                    question: str,
+                                    search_components: List[TrajectoryComponent],
+                                    information_components: List[TrajectoryComponent],
+                                    reasoning_components: List[TrajectoryComponent]) -> Dict:
+        """Analyze reasoning grounding for search/think steps using information evidence.
+
+        - Evidence: use information components (search results/snippets), not search queries.
+        - Targets: evaluate grounding for search and think components (reasoning text and queries).
+        """
         if not self.llm_evaluator:
             raise RuntimeError("LLM evaluator not available")
-        search_evidence = []
-        for search_comp in search_components:
-            search_evidence.append({
-                "content": search_comp.content,
-                "type": "search_query",
-                "step": search_comp.step_number
-            })
+
+        # Build evidence corpus from information components
+        info_evidence = [
+            {"content": info_comp.content, "type": "search_result", "step": info_comp.step_number}
+            for info_comp in information_components
+        ]
+
         grounding_results = []
-        for search_comp in search_components:
+        # Evaluate grounding for each search/think step using only the most recent information step (<= current step)
+        for comp in reasoning_components:
             if question:
-                result = self._evaluate_reasoning_grounding(search_comp.content, search_evidence, question)
+                # Candidate evidence up to current think step
+                candidates = [e for e in info_evidence if e.get("step", 0) <= comp.step_number]
+                if candidates:
+                    last_step = max(e.get("step", 0) for e in candidates)
+                    step_evidence = [e for e in candidates if e.get("step", 0) == last_step]
+                else:
+                    step_evidence = []
+                result = self._evaluate_reasoning_grounding(comp.content, step_evidence, question)
             else:
                 result = {"premise_grounding": "Directly Grounded", "evaluation_success": True, "fallback": True}
+            # Attach some trace for debugging
+            result["_analyzed_component_type"] = comp.component_type
+            result["_step"] = comp.step_number
             grounding_results.append(result)
+
         grounded_count = sum(1 for r in grounding_results if r.get("premise_grounding") == "Directly Grounded")
         total_count = len(grounding_results)
         reasoning_grounded = grounded_count > 0 and (grounded_count / max(1, total_count)) >= 0.5
         return {
             "reasoning_grounded": reasoning_grounded,
-            "grounding_details": f"LLM evaluation: {grounded_count}/{total_count} grounded",
+            "grounding_details": f"LLM evaluation (search/think): {grounded_count}/{total_count} grounded",
             "grounding_results": grounding_results
         }
 
@@ -1262,7 +1293,25 @@ class SimpleDenseFeedbackRewardManager:
             # Decode response
             response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
             ground_truth = data_item.non_tensor_batch.get("reward_model", {}).get("ground_truth", "")
-            data_source = data_item.non_tensor_batch.get(self.reward_fn_key, "unknown")
+
+            # Robustly resolve data source with fallbacks
+            data_source = data_item.non_tensor_batch.get(self.reward_fn_key, None)
+            try:
+                import numpy as _np  # local alias to avoid top-level import assumptions
+                if isinstance(data_source, (_np.ndarray, list)) and len(data_source) > 0:
+                    data_source = data_source[0]
+            except Exception:
+                pass
+            if not data_source or data_source == "unknown":
+                # Common fallbacks
+                data_source = (
+                    data_item.non_tensor_batch.get("data_source")
+                    or (data_item.non_tensor_batch.get("extra_info", {}) or {}).get("split")
+                    or data_item.non_tensor_batch.get("ability")
+                    or data_item.non_tensor_batch.get("split")
+                    or data_item.non_tensor_batch.get("id")
+                    or "unknown"
+                )
             
             # Try to get question (if exists)
             question = None
