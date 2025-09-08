@@ -24,11 +24,7 @@ import threading
 from verl import DataProto
 from verl.tools.schemas import TrajectoryComponent, TrajectoryFeedback
 from verl.utils.reward_score import default_compute_score
-# Optional import: allow running in environments without OpenAI deps
-try:
-    from .llm_evaluator import LLMEvaluator  # type: ignore
-except Exception:  # pragma: no cover - import fallback for test envs
-    LLMEvaluator = None  # type: ignore
+from .llm_evaluator import LLMEvaluator
 
 # 基本 logger（控制台）
 logging.basicConfig(level=logging.INFO)
@@ -118,7 +114,6 @@ class SimpleDenseFeedbackRewardManager:
             "information": r"<information>(.*?)</information>",
             "answer": r"<answer>(.*?)</answer>",
             # "think": r"<think>(.*?)</think>", # 不在这里解析think标签，而是在_extract_think_components中解析
-            "complete": r"<complete>(.*?)</complete>",  # 添加complete标签支持
         }
     
         logger.info(f"SimpleDenseFeedbackRewardManager initialized. LLM evaluation enabled: {self.enable_llm_evaluation}")
@@ -145,6 +140,12 @@ class SimpleDenseFeedbackRewardManager:
             "min_reward_value": -1.0,
             "max_reward_value": 2.0,
             "smooth_reward_transition": True,
+            # Repetition penalties (apply to think components)
+            "enable_repetition_penalty": True,
+            "trigram_repeat_penalty_weight": 0.5,     # scales trigram repetition rate [0,1]
+            "self_bleu_penalty_weight": 0.3,          # scales self-BLEU vs previous reasoning [0,1]
+            "span_repeat_penalty_weight": 0.4,         # scales span repetition rate [0,1]
+            "repetition_penalty_max": 1.0,            # cap total repetition penalty per component
         }
     
     def _setup_logging(self):
@@ -420,6 +421,24 @@ class SimpleDenseFeedbackRewardManager:
                     self.file_logger.info(f"  Token range: {start_token_idx}-{end_token_idx}")
                     self.file_logger.info(f"  Step number: {step_number}")
         
+        # Merge consecutive identical think components (to reduce artificial duplication)
+        if think_components:
+            merged = []
+            def _norm_text(txt: str) -> str:
+                return re.sub(r"\s+", " ", txt.strip())
+            for comp in sorted(think_components, key=lambda c: c.start_token_idx):
+                if merged and merged[-1].component_type == "think":
+                    prev = merged[-1]
+                    if _norm_text(prev.content) == _norm_text(comp.content) and prev.end_token_idx <= comp.start_token_idx:
+                        # Extend previous component's token span
+                        prev.end_token_idx = max(prev.end_token_idx, comp.end_token_idx)
+                        # Keep content as single copy
+                        self.file_logger.info(
+                            f"Merging consecutive identical think components at tokens {prev.start_token_idx}-{prev.end_token_idx}")
+                        continue
+                merged.append(comp)
+            think_components = merged
+
         return think_components
     
     def _token_to_char_position(self, text: str, tokens: List[int], token_pos: int) -> Optional[int]:
@@ -725,6 +744,12 @@ class SimpleDenseFeedbackRewardManager:
             final_score = self._apply_core_reward_adjustments(
                 base_score, feedback, component, sorted_components, i, temporal_meta
             )
+
+            # Apply repetition penalties for think components
+            if self.config.get("enable_repetition_penalty", True) and component.component_type == "think":
+                rep_penalty = self._compute_repetition_penalty(component, sorted_components, i)
+                temporal_meta["repetition_penalty"] = temporal_meta.get("repetition_penalty", 0.0) + rep_penalty
+                final_score -= rep_penalty
             
             # Allocate reward
             start_idx = min(component.start_token_idx, response_length - 1)
@@ -804,6 +829,90 @@ class SimpleDenseFeedbackRewardManager:
                                        f"mean {component_rewards.mean().item():.3f}")
         
         self.file_logger.info("=" * 50)
+
+    def _compute_repetition_penalty(self, component: TrajectoryComponent, 
+                                    sorted_components: List[TrajectoryComponent], idx: int) -> float:
+        """Compute repetition penalty for a think component based on:
+        - trigram repetition rate within the component
+        - simple self-BLEU against previous reasoning (search+think) text
+        - span repetition rate (4-gram)
+        Returns a scalar penalty (capped) to subtract from the component score.
+        """
+        text = component.content or ""
+        if not text.strip():
+            return 0.0
+
+        # Tokenize to words (basic)
+        tokens = re.findall(r"\w+|[^\w\s]", text.lower())
+
+        def ngrams(seq, n):
+            return [tuple(seq[i:i+n]) for i in range(0, max(0, len(seq)-n+1))]
+
+        # Trigram repetition rate
+        tri = ngrams(tokens, 3)
+        tri_count = {}
+        for g in tri:
+            tri_count[g] = tri_count.get(g, 0) + 1
+        repeated_tris = sum(1 for g,c in tri_count.items() if c > 1)
+        tri_rate = (repeated_tris / max(1, len(tri_count))) if tri_count else 0.0
+
+        # Span repetition (4-gram repetition rate)
+        four = ngrams(tokens, 4)
+        four_count = {}
+        for g in four:
+            four_count[g] = four_count.get(g, 0) + 1
+        repeated_four = sum(1 for g,c in four_count.items() if c > 1)
+        span_rate = (repeated_four / max(1, len(four_count))) if four_count else 0.0
+
+        # Build reference reasoning text from previous search/think components
+        prev_reasoning_texts = []
+        for j in range(0, idx):
+            c = sorted_components[j]
+            if c.component_type in ("search", "think") and getattr(c, 'content', None):
+                prev_reasoning_texts.append(c.content)
+        ref_text = "\n".join(prev_reasoning_texts).lower()
+
+        def simple_self_bleu(hyp_tokens, ref_text: str) -> float:
+            if not ref_text.strip():
+                return 0.0
+            ref_tokens = re.findall(r"\w+|[^\w\s]", ref_text)
+            def prec(n):
+                hyp_ngrams = ngrams(hyp_tokens, n)
+                ref_ngrams = ngrams(ref_tokens, n)
+                if not hyp_ngrams or not ref_ngrams:
+                    return 0.0
+                from collections import Counter
+                h = Counter(hyp_ngrams)
+                r = Counter(ref_ngrams)
+                overlap = sum(min(h[k], r.get(k, 0)) for k in h)
+                total = sum(h.values())
+                return overlap / max(1, total)
+            # Geometric mean of p1..p3
+            p1, p2, p3 = prec(1), prec(2), prec(3)
+            gm = (p1 * p2 * p3) ** (1/3) if p1>0 and p2>0 and p3>0 else 0.0
+            # Simple brevity penalty (optional)
+            bp = 1.0
+            return gm * bp
+
+        self_bleu = simple_self_bleu(tokens, ref_text)
+
+        # Weighted penalty
+        w_tri = float(self.config.get("trigram_repeat_penalty_weight", 0.5))
+        w_bleu = float(self.config.get("self_bleu_penalty_weight", 0.3))
+        w_span = float(self.config.get("span_repeat_penalty_weight", 0.4))
+        penalty = w_tri * tri_rate + w_bleu * self_bleu + w_span * span_rate
+        penalty = min(float(self.config.get("repetition_penalty_max", 1.0)), penalty)
+
+        # Log details
+        try:
+            self.file_logger.info(
+                f"Repetition metrics for think (step {component.step_number}): "
+                f"tri_rate={tri_rate:.3f}, self_bleu={self_bleu:.3f}, span_rate={span_rate:.3f}, "
+                f"penalty={penalty:.3f}")
+        except Exception:
+            pass
+
+        return float(penalty)
     
     
     def _score_answer_quality_simplified(self, answer_components: List[TrajectoryComponent], 
@@ -903,11 +1012,17 @@ class SimpleDenseFeedbackRewardManager:
     def _evaluate_information_quality_batch(self, information_components: List[TrajectoryComponent], 
                                            search_components: List[TrajectoryComponent], 
                                            ground_truth: str) -> List[Dict[str, Any]]:
-        """Synchronous wrapper: pass batch requests to LLM evaluator (internal safe running coroutine)"""
+        """Synchronous wrapper: pass batch requests to LLM evaluator (internal safe running coroutine).
+        If evaluator is unavailable or fails, return an empty list (neutral) and log the issue.
+        """
         if not self.llm_evaluator:
-            raise RuntimeError("LLM evaluator not available")
+            logger.warning("LLM evaluator not available; skipping information quality evaluation and returning neutral results")
+            return []
         evaluation_requests = []
         for i, info_comp in enumerate(information_components):
+            # Skip empty evidence
+            if getattr(info_comp, 'content', None) is None or str(info_comp.content).strip() == "":
+                continue
             search_query = self._find_corresponding_search_query(info_comp, search_components)
             documents = [{"content": info_comp.content}]
             evaluation_requests.append({
@@ -916,12 +1031,15 @@ class SimpleDenseFeedbackRewardManager:
                 "documents": documents,
                 "component_index": i
             })
+        # If there is no evidence, do not call the LLM evaluator
+        if not evaluation_requests:
+            logger.info("No information quality requests to evaluate (empty evidence); skipping LLM call")
+            return []
         try:
             return self._run_async(self.llm_evaluator.batch_evaluate(evaluation_requests))
         except Exception as e:
-            logger.error(f"Error in batch information quality evaluation: {e}")
-            # Maintain original behavior: throw exception to upper layer
-            raise RuntimeError(f"Batch information quality evaluation failed: {e}")
+            logger.error(f"Error in batch information quality evaluation: {e}; returning neutral results")
+            return []
     
     def _find_corresponding_search_query(self, info_component: TrajectoryComponent, 
                                        search_components: List[TrajectoryComponent]) -> str:
@@ -997,11 +1115,16 @@ class SimpleDenseFeedbackRewardManager:
         """Use LLM to batch evaluate information quality flow (Synchronous, internal using asyncio.run)"""
         has_insufficient_info = False
         llm_evaluation_results = []
-        if information_components:
+        # If there is no usable evidence (no non-empty information components), do not call LLM evaluator
+        non_empty_information_components = [
+            c for c in information_components
+            if getattr(c, 'content', None) is not None and str(c.content).strip() != ""
+        ]
+        if non_empty_information_components:
             llm_evaluation_results = self._evaluate_information_quality_batch(
-                information_components, search_components, ground_truth
+                non_empty_information_components, search_components, ground_truth
             )
-            for i, (component, eval_result) in enumerate(zip(information_components, llm_evaluation_results)):
+            for i, (component, eval_result) in enumerate(zip(non_empty_information_components, llm_evaluation_results)):
                 is_sufficient = self._is_information_sufficient_llm(eval_result)
                 if not is_sufficient:
                     has_insufficient_info = True
@@ -1009,6 +1132,8 @@ class SimpleDenseFeedbackRewardManager:
                     self.file_logger.info(f"LLM evaluation result for {component.component_type} component {i+1}:")
                     self.file_logger.info(f"  Content: {component.content[:100]}...")
                     self.file_logger.info(f"  Quality: {eval_result.get('information_quality', 'Unknown')}")
+        else:
+            logger.info("Skipping information quality LLM evaluation: empty evidence (no non-empty information components)")
         return {
             "has_insufficient_info": has_insufficient_info,
             "llm_evaluation_results": llm_evaluation_results
@@ -1025,12 +1150,29 @@ class SimpleDenseFeedbackRewardManager:
         - Targets: evaluate grounding for search and think components (reasoning text and queries).
         """
         if not self.llm_evaluator:
-            raise RuntimeError("LLM evaluator not available")
+            logger.warning("LLM evaluator not available; treating grounding as neutral/ungrounded and logging only")
+            grounding_results = []
+            for comp in reasoning_components:
+                grounding_results.append({
+                    "premise_grounding": "Unspecified",
+                    "evaluation_success": False,
+                    "fallback": True,
+                    "_analyzed_component_type": comp.component_type,
+                    "_step": comp.step_number,
+                })
+            grounded_count = 0
+            total_count = len(grounding_results)
+            return {
+                "reasoning_grounded": False,
+                "grounding_details": f"LLM unavailable: {grounded_count}/{total_count} grounded",
+                "grounding_results": grounding_results,
+            }
 
         # Build evidence corpus from information components
         info_evidence = [
             {"content": info_comp.content, "type": "search_result", "step": info_comp.step_number}
             for info_comp in information_components
+            if getattr(info_comp, 'content', None) is not None and str(info_comp.content).strip() != ""
         ]
 
         grounding_results = []
@@ -1044,9 +1186,20 @@ class SimpleDenseFeedbackRewardManager:
                     step_evidence = [e for e in candidates if e.get("step", 0) == last_step]
                 else:
                     step_evidence = []
-                result = self._evaluate_reasoning_grounding(comp.content, step_evidence, question)
+                # If evidence is empty, do NOT call LLM evaluator
+                if not step_evidence:
+                    logger.info("Skipping grounding LLM evaluation: empty evidence for current step")
+                    result = {
+                        "premise_grounding": "Unspecified",
+                        "evaluation_success": False,
+                        "fallback": True,
+                    }
+                else:
+                    result = self._evaluate_reasoning_grounding(comp.content, step_evidence, question)
             else:
-                result = {"premise_grounding": "Directly Grounded", "evaluation_success": True, "fallback": True}
+                # No question context: do not default to grounded; treat as neutral
+                logger.info("No question context; treating grounding as neutral (no bonus)")
+                result = {"premise_grounding": "Unspecified", "evaluation_success": False, "fallback": True}
             # Attach some trace for debugging
             result["_analyzed_component_type"] = comp.component_type
             result["_step"] = comp.step_number

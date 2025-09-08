@@ -140,9 +140,20 @@ def compute_grpo_outcome_advantage(
         Returns: `(torch.Tensor)`
             shape is (bs, response_length)
     """
-    response_length=token_level_rewards.shape[-1]
-    non_zero_mask=(token_level_rewards !=0)
-    scores = token_level_rewards.sum(dim=-1)
+    # Length-robust outcome score: use masked mean (DrGRPO-friendly) instead of sum.
+    # Compute the scalar outcome per sample using the overlapping portion, then
+    # broadcast that scalar back over the ORIGINAL response_mask length to keep
+    # shapes consistent with log-probs during policy loss.
+    orig_mask = response_mask
+    work_rewards = token_level_rewards
+    work_mask = response_mask
+    if token_level_rewards.shape[-1] != response_mask.shape[-1]:
+        min_len = min(token_level_rewards.shape[-1], response_mask.shape[-1])
+        work_rewards = token_level_rewards[..., :min_len]
+        work_mask = response_mask[..., :min_len]
+    masked_rewards = work_rewards * work_mask
+    token_counts = torch.clamp(work_mask.sum(dim=-1), min=1.0)
+    scores = masked_rewards.sum(dim=-1) / token_counts
 
     id2score = defaultdict(list)
     id2mean = {}
@@ -170,7 +181,7 @@ def compute_grpo_outcome_advantage(
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
-        scores = scores.unsqueeze(-1) * response_mask
+        scores = scores.unsqueeze(-1) * orig_mask
 
     return scores, scores
 
