@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
-from typing import Any, Literal
+from typing import Any, Literal, List
 
 from pydantic import BaseModel
 
@@ -64,7 +64,7 @@ class OpenAIFunctionCallSchema(BaseModel):
     arguments: dict[str, Any]
 
     @staticmethod
-    def from_openai_function_parsed_schema(parsed_schema: OpenAIFunctionParsedSchema) -> tuple["OpenAIFunctionCallSchema", bool]:
+    def from_openai_function_parsed_schema(parsed_schema: "OpenAIFunctionParsedSchema") -> tuple["OpenAIFunctionCallSchema", bool]:
         has_decode_error = False
         try:
             arguments = json.loads(parsed_schema.arguments)
@@ -85,3 +85,28 @@ class OpenAIFunctionToolCall(BaseModel):
     id: str
     type: Literal["function"] = "function"
     function: OpenAIFunctionCallSchema
+
+
+# Trajectory analysis schemas for dense feedback
+class TrajectoryComponent(BaseModel):
+    """A component in a trajectory (e.g., search, information, answer)."""
+    
+    component_type: str  # e.g., "search", "information", "answer"
+    content: str  # The actual content of the component
+    start_token_idx: int  # Start position in the response
+    end_token_idx: int  # End position in the response
+    step_number: int  # Order in the trajectory
+
+
+class TrajectoryFeedback(BaseModel):
+    """Feedback analysis for an entire trajectory."""
+    
+    trajectory_id: str
+    components: List[TrajectoryComponent]
+    final_answer: str
+    ground_truth: Any  # 改为Any类型，接受各种格式（dict, list, str等）
+    think_score: float
+    answer_quality_score: float
+    has_insufficient_info: bool
+    has_repeated_tools: bool
+    exceeds_max_steps: bool
