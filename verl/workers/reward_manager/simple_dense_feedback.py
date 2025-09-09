@@ -345,62 +345,15 @@ class SimpleDenseFeedbackRewardManager:
     def _extract_think_components(self, response_str: str, response_tokens: List[int], 
                                  known_components: List[TrajectoryComponent], 
                                  start_step_number: int) -> List[TrajectoryComponent]:
-        """Extract remaining content as think components and also explicitly parse <think> tags"""
+        """Extract remaining unmarked content as think components.
+        Do not explicitly parse <think>...</think> tags; only handle content not covered by known components.
+        """
         think_components = []
         step_number = start_step_number
-        
-        # 1. 首先，显式查找<think>标签 (这是新增的部分)
-        think_pattern = r"<think>(.*?)</think>"
-        think_matches = list(re.finditer(think_pattern, response_str, re.DOTALL))
-        logger.debug(f"Found {len(think_matches)} explicit <think> tags")
-        
-        for i, match in enumerate(think_matches):
-            content = match.group(1).strip()
-            if len(content) < self.config.get("min_component_length", 5):
-                logger.debug(f"Skipping explicit think component {i+1} (too short: {len(content)})")
-                continue
-            
-            # Calculate accurate token positions
-            start_char = match.start()
-            end_char = match.end()
-            
-            # Log the match details for debugging
-            logger.debug(f"Explicit think match: start={start_char}, end={end_char}, content={content[:30]}...")
-            
-            # Convert character positions to token positions
-            start_token_idx = self._char_to_token_position(response_str, response_tokens, start_char)
-            end_token_idx = self._char_to_token_position(response_str, response_tokens, end_char)
-            
-            if start_token_idx is None or end_token_idx is None:
-                logger.warning(f"Could not determine token positions for explicit think component")
-                continue
-            
-            component = TrajectoryComponent(
-                component_type="think",
-                content=content,
-                start_token_idx=start_token_idx,
-                end_token_idx=end_token_idx,
-                step_number=step_number
-            )
-            think_components.append(component)
-            step_number += 1
-            
-            logger.debug(f"Found explicit think component at tokens {start_token_idx}-{end_token_idx}: {content[:50]}...")
-            
-            # Log to file
-            self.file_logger.info(f"Component {step_number-1}: think (explicit tag)")
-            self.file_logger.info(f"  Content: {content}")
-            self.file_logger.info(f"  Token range: {start_token_idx}-{end_token_idx}")
-            self.file_logger.info(f"  Step number: {step_number-1}")
-        
-        # 2. 然后，处理未被标记的内容 (原有的逻辑)
-        # Get all known components' character position ranges
+
+        # Get all known components' character position ranges (ignore <think> tags entirely)
         covered_ranges = []
-        
-        # 添加显式think标签的范围
-        for match in think_matches:
-            covered_ranges.append((match.start(), match.end()))
-        
+
         # 添加其他已知组件的范围
         for comp in known_components:
             start_char = self._token_to_char_position(response_str, response_tokens, comp.start_token_idx)
