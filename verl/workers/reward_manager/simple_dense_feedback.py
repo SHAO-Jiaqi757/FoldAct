@@ -124,7 +124,7 @@ class SimpleDenseFeedbackRewardManager:
         """Get simplified configuration"""
         return {
             "max_tool_steps": 5,
-            "insufficient_info_penalty": -0.3,        # Penalty for answering directly with insufficient information
+            "insufficient_info_penalty": -0.15,        # Penalty for answering directly with insufficient information
             "refinement_bonus": 0.5,                  # Reward for improving from insufficient to sufficient
             "grounding_bonus": 0.3,                   # Reward for correct grounding
             "ungrounded_penalty": 0,                  # Penalty for ungrounded responses
@@ -133,7 +133,8 @@ class SimpleDenseFeedbackRewardManager:
             "grounding_bonus_max_steps": 2,           # Maximum number of steps to apply grounding bonus (e.g., only reward first 2 times)
             "grounding_bonus_decay": 0.6,             # Decay coefficient for grounding bonus, decreasing by step
             "max_grounding_bonus_total": 1.0,         # Total upper limit for grounding bonus in a trajectory
-            "min_component_length": 5,
+            # Relaxed thresholds: allow concise but meaningful content
+            "min_component_length": 3,
             "max_log_length": 200,
             "enable_debug_logs": True,
             "reward_allocation_strategy": "component_based",
@@ -142,13 +143,15 @@ class SimpleDenseFeedbackRewardManager:
             "smooth_reward_transition": True,
             # Parsing filters for meaningless components
             "skip_empty_information": True,
-            "min_semantic_words_search": 2,
+            "min_semantic_words_search": 1,
             # Repetition penalties (apply to think components)
             "enable_repetition_penalty": True,
             "trigram_repeat_penalty_weight": 0.5,     # scales trigram repetition rate [0,1]
             "self_bleu_penalty_weight": 0.3,          # scales self-BLEU vs previous reasoning [0,1]
             "span_repeat_penalty_weight": 0.4,         # scales span repetition rate [0,1]
             "repetition_penalty_max": 1.0,            # cap total repetition penalty per component
+            # Productive search bonus (simplified)
+            "productive_search_bonus": 0.15,          # bonus for search immediately followed by non-empty information
         }
     
     def _setup_logging(self):
@@ -197,7 +200,7 @@ class SimpleDenseFeedbackRewardManager:
                 return True
             # trivial stopword-only queries
             stopwords = {"and", "or", "the", "a", "an"}
-            if word_count <= 3 and all(w.lower().strip(string.punctuation) in stopwords for w in words):
+            if word_count <= 1 and all(w.lower().strip(string.punctuation) in stopwords for w in words):
                 return True
         elif component_type == "information":
             if self.config.get("skip_empty_information", True) and alnum_chars == 0:
@@ -727,6 +730,20 @@ class SimpleDenseFeedbackRewardManager:
             else:
                 score += self.config.get("ungrounded_penalty", -0.3)
                 logger.debug(f"Penalizing ungrounded reasoning: {score:.3f}")
+
+            # Productive search bonus (simplified): reward searches immediately followed by non-empty information
+            if component.component_type == "search":
+                try:
+                    bonus = float(self.config.get("productive_search_bonus", 0.15))
+                    # Check the immediate next component only
+                    next_idx = component_idx + 1
+                    if next_idx < len(sorted_components):
+                        cand = sorted_components[next_idx]
+                        if cand.component_type == "information" and isinstance(getattr(cand, 'content', None), str) and cand.content.strip() != "":
+                            score += bonus
+                            logger.debug(f"Productive search bonus applied: +{bonus:.3f}")
+                except Exception:
+                    pass
         
         # 3. Information improvement reward (from insufficient to sufficient)
         if component.component_type == "information":
@@ -780,7 +797,21 @@ class SimpleDenseFeedbackRewardManager:
         sorted_components = sorted(feedback.components, key=lambda x: x.start_token_idx)
         
         for i, component in enumerate(sorted_components):
-            if component.start_token_idx >= response_length or component.end_token_idx > response_length:
+            # Relax boundary checks: clamp to valid range instead of skipping
+            # Compute clamped token span within [0, response_length]
+            try:
+                raw_start = int(component.start_token_idx)
+                raw_end = int(component.end_token_idx)
+            except Exception:
+                # If indices are not valid integers, skip this component
+                continue
+            if raw_end <= 0:
+                # Entire span lies before the start of the response
+                continue
+            start_idx = max(0, min(raw_start, max(0, response_length - 1)))
+            end_idx = max(start_idx + 1, min(raw_end, response_length))
+            if start_idx >= response_length or end_idx <= 0 or end_idx <= start_idx:
+                # Nothing to allocate within bounds
                 continue
             
             # Base score: only based on final answer quality
@@ -798,8 +829,6 @@ class SimpleDenseFeedbackRewardManager:
                 final_score -= rep_penalty
             
             # Allocate reward
-            start_idx = min(component.start_token_idx, response_length - 1)
-            end_idx = min(component.end_token_idx, response_length)
             reward_tensor[start_idx:end_idx] = final_score
             
             # Log to file
@@ -1367,23 +1396,25 @@ class SimpleDenseFeedbackRewardManager:
                 else:
                     return torch.tensor([])
             
-            # Ensure all reward tensor lengths are consistent
-            target_length = 500
-            normalized_rewards = []
-            for reward_tensor in dense_reward_tensors:
-                if len(reward_tensor) != target_length:
-                    # Adjust length
-                    if len(reward_tensor) > target_length:
-                        normalized_reward = reward_tensor[:target_length]
-                    else:
-                        normalized_reward = torch.zeros(target_length, dtype=torch.float32)
-                        normalized_reward[:len(reward_tensor)] = reward_tensor
-                    normalized_rewards.append(normalized_reward)
+            # Align each sample's reward length to its response length (no fixed cap)
+            if not isinstance(data.batch.get("responses", None), torch.Tensor):
+                raise ValueError("Batch is missing 'responses' tensor for shaping reward output")
+            batch_size, resp_len = data.batch["responses"].shape[0], data.batch["responses"].shape[1]
+
+            # If some items were skipped, keep alignment by truncating to available size
+            if len(dense_reward_tensors) != batch_size:
+                logger.warning(
+                    f"dense_reward_tensors count {len(dense_reward_tensors)} != batch_size {batch_size}; "
+                    "will align by trimming to the smaller size"
+                )
+            out_bs = min(batch_size, len(dense_reward_tensors))
+            stacked_rewards = torch.zeros((out_bs, resp_len), dtype=torch.float32)
+            for idx in range(out_bs):
+                rt = dense_reward_tensors[idx]
+                if rt.numel() >= resp_len:
+                    stacked_rewards[idx, :] = rt[:resp_len]
                 else:
-                    normalized_rewards.append(reward_tensor)
-            
-            # Direct stack, to avoid padding problems
-            stacked_rewards = torch.stack(normalized_rewards, dim=0)
+                    stacked_rewards[idx, : rt.numel()] = rt
             logger.info(f"Final stacked rewards shape: {stacked_rewards.shape}")
             
             # Return result
@@ -1561,8 +1592,13 @@ class SimpleDenseFeedbackRewardManager:
             # Analyze entire trajectory (Synchronous call)
             feedback = self.analyze_trajectory_sync(components, ground_truth, question)
             
-            # Create dense reward tensor
-            target_length = 500
+            # Create dense reward tensor with no hard cap on length
+            # Align reward length to the actually used response token count
+            try:
+                target_length = int(valid_response_ids.shape[0])
+            except Exception:
+                # Fallback: use computed valid_response_length if available; otherwise default to 0 (handled downstream)
+                target_length = int(valid_response_length) if 'valid_response_length' in locals() else 0
             dense_reward = self.create_dense_reward_tensor(feedback, target_length)
             
             # Print analysis summary
