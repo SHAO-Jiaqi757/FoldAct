@@ -2,8 +2,9 @@ import torch
 import re
 from collections import defaultdict
 import os
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass
+from enum import Enum
 from .tensor_helper import TensorHelper, TensorConfig
 from verl import DataProto
 from verl.utils.tracking import Tracking
@@ -37,6 +38,11 @@ TOOL_SCHEMA = OpenAIFunctionToolSchema(
 )
 
 
+class ResponseType(Enum):
+    think = 0
+    search = 1
+    answer = 2
+    information = 3
 
 
 @dataclass
@@ -81,16 +87,18 @@ class LLMGenerationManager:
 
         self.search_tool=SearchTool(config=config,tool_schema=TOOL_SCHEMA)
 
-    def _batch_tokenize(self, responses: List[str]) -> torch.Tensor:
+    def _batch_tokenize(self, responses: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Tokenize a batch of responses."""
-        return self.tokenizer(
+        result = self.tokenizer(
             responses, 
             add_special_tokens=False, 
             return_tensors='pt', 
-            padding="longest"
-        )['input_ids']
+            padding="longest",
+            return_offsets_mapping=True
+        )
+        return result['input_ids'], result['offset_mapping'][:, :, 0]
 
-    def _postprocess_responses(self, responses: torch.Tensor) -> torch.Tensor:
+    def _postprocess_responses(self, responses: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, str]:
         """Process responses to stop at search operation or answer operation."""
         responses_str = self.tokenizer.batch_decode(
             responses, 
@@ -110,24 +118,28 @@ class LLMGenerationManager:
             actions, _ = self.env.postprocess_predictions(responses_str)
             responses_str=[f"<answer>{envs[idx].ACTION_LOOKUP[action]}</answer>" for idx, action in enumerate(actions)]
             print("RESPONSES:", responses_str)
-        responses = self._batch_tokenize(responses_str)
-        return responses, responses_str
+        responses, responses_offsets = self._batch_tokenize(responses_str)
+        return responses, responses_offsets, responses_str
 
     def _process_next_obs(self, next_obs: List[str]) -> torch.Tensor:
         """Process next observations from environment."""
         
-        next_obs_ids = self.tokenizer(
+        result = self.tokenizer(
             next_obs, 
             padding='longest',
+            return_attention_mask=True,
             return_tensors='pt',
             add_special_tokens=False,  # Prevents adding special tokens
-        )['input_ids']
+        )
+
+        next_obs_ids = result['input_ids']
+        information_types = result['attention_mask'] * ResponseType.information.value
 
         if next_obs_ids.shape[1] > self.config.max_obs_length:
             print(f"[WARNING] OBSERVATION TOO LONG, CONSIDER CHANGING YOUR CONFIG, {next_obs_ids.shape[1]} & {self.config.max_obs_length}")            
             next_obs_ids = next_obs_ids[:, :self.config.max_obs_length]
 
-        return next_obs_ids
+        return next_obs_ids, information_types
 
     def _update_rolling_state(self, rollings: DataProto, cur_responses: torch.Tensor, 
                             next_obs_ids: torch.Tensor) -> Dict:
@@ -158,8 +170,12 @@ class LLMGenerationManager:
 
     def _info_masked_concatenate_with_padding(self, 
                 prompt: torch.Tensor, 
-                prompt_with_mask: torch.Tensor, 
+                prompt_with_mask: torch.Tensor,
+                prompt_step_ids: torch.Tensor,
+                prompt_types: torch.Tensor,
                 response: torch.Tensor, 
+                step: int,
+                response_types: torch.Tensor,
                 info: torch.Tensor = None,
                 pad_to_left: bool = True
             ) -> torch.Tensor:
@@ -167,43 +183,65 @@ class LLMGenerationManager:
         pad_id = self.tokenizer.pad_token_id
         tensors = [prompt, response]
         tensors_with_mask = [prompt_with_mask, response]
+        id_tensors = [prompt_step_ids, torch.full(response.size(), step, dtype=prompt_step_ids.dtype, device=prompt_step_ids.device)]
+        type_tensors = [prompt_types, response_types]
         if info is not None:
             tensors.append(info)
             info_mask = torch.full(info.size(), pad_id, dtype=info.dtype, device=info.device) # information mask
             tensors_with_mask.append(info_mask)
+            id_tensors.append(torch.full(info.size(), step, dtype=prompt_step_ids.dtype, device=prompt_step_ids.device))
         
         concatenated = torch.cat(tensors, dim=1)
         concatenated_with_info = torch.cat(tensors_with_mask, dim=1)
+        id_concatenated = torch.cat(id_tensors, dim=1)
+        type_concatenated = torch.cat(type_tensors, dim=1)
         mask = concatenated != pad_id if pad_to_left else concatenated == pad_id
         sorted_indices = mask.to(torch.int64).argsort(dim=1, stable=True)
         padded_tensor = concatenated.gather(1, sorted_indices)
         padded_tensor_with_info = concatenated_with_info.gather(1, sorted_indices)
+        padded_id = id_concatenated.gather(1, sorted_indices)
+        padded_type = type_concatenated.gather(1, sorted_indices)
 
-        return padded_tensor, padded_tensor_with_info
+        return padded_tensor, padded_tensor_with_info, padded_id, padded_type
 
     def _update_right_side(self, right_side: Dict, 
                           cur_responses: torch.Tensor,
+                          step: int,
+                          cur_types: torch.Tensor,
                           next_obs_ids: torch.Tensor = None) -> Dict:
         """Update right side state."""
         if next_obs_ids != None:
-            responses, responses_with_info_mask = self._info_masked_concatenate_with_padding(
+            responses, responses_with_info_mask, step_ids, responses_types = self._info_masked_concatenate_with_padding(
                     right_side['responses'],
                     right_side['responses_with_info_mask'],
+                    right_side['step_ids'],
+                    right_side['responses_types'],
                     cur_responses,
+                    step,
+                    cur_types,
                     next_obs_ids, 
                     pad_to_left=False
                 )
         else:
-            responses, responses_with_info_mask = self._info_masked_concatenate_with_padding(
+            responses, responses_with_info_mask, step_ids, responses_types = self._info_masked_concatenate_with_padding(
                     right_side['responses'],
                     right_side['responses_with_info_mask'],
+                    right_side['step_ids'],
+                    right_side['responses_types'],
                     cur_responses,
+                    step,
+                    cur_types,
                     pad_to_left=False
                 )
         effective_len = self.tensor_fn.create_attention_mask(responses).sum(dim=1).max()
         max_len = min(self.config.max_prompt_length, effective_len)
-        
-        return {'responses': responses[:, :max_len], 'responses_with_info_mask': responses_with_info_mask[:, :max_len]}
+
+        return {
+            'responses': responses[:, :max_len],
+            'responses_with_info_mask': responses_with_info_mask[:, :max_len],
+            'step_ids': step_ids[:, :max_len],
+            'responses_types': responses_types[:, :max_len]
+        }
 
     def _generate_with_gpu_padding(self, active_batch: DataProto) -> DataProto:
         """
@@ -260,7 +298,14 @@ class LLMGenerationManager:
         """Run main LLM generation loop."""
         
         original_left_side = {'input_ids': initial_input_ids[:, -self.config.max_start_length:]}
-        original_right_side = {'responses': initial_input_ids[:, []], 'responses_with_info_mask': initial_input_ids[:, []]}
+        original_right_side = {
+            'responses': initial_input_ids[:, []],
+            'responses_with_info_mask': initial_input_ids[:, []],
+            # Response token generated at step i will have i at its position
+            "step_ids": initial_input_ids[:, []],
+            # Response token belonging to type i (according to ResponseType enum) witll have i at its position
+            "responses_types": initial_input_ids[:, []],
+        }
         
         active_mask = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.bool)
         turns_stats = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
@@ -285,13 +330,21 @@ class LLMGenerationManager:
             gen_output = self._generate_with_gpu_padding(rollings_active)
 
             meta_info = gen_output.meta_info            
-            responses_ids, responses_str = self._postprocess_responses(gen_output.batch['responses'])
+            # Responses after </search> or </answer> are discarded
+            responses_ids, active_offsets, responses_str = self._postprocess_responses(gen_output.batch['responses'])
             responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
+            responses_offsets = torch.zeros(
+                (active_mask.shape[0], active_offsets.shape[1]),
+                dtype=active_offsets.dtype, device=active_offsets.device
+            )
+            responses_offsets[active_mask] = active_offsets
 
             # Execute in environment and process observations
-            next_obs, dones, valid_action, is_search = self.execute_predictions(
+            next_obs, dones, valid_action, is_search, action_ranges = self.execute_predictions(
                 responses_str, self.tokenizer.pad_token, active_mask
             )
+            print(f"action ranges: {action_ranges}")
+            action_types = self._build_action_types(responses_ids, responses_offsets, action_ranges, is_search, responses_str)
             
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
             active_mask = active_mask * curr_active_mask
@@ -300,8 +353,9 @@ class LLMGenerationManager:
             valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
             valid_search_stats += torch.tensor(is_search, dtype=torch.int)
 
-            next_obs_ids = self._process_next_obs(next_obs)
-            
+            next_obs_ids, information_types = self._process_next_obs(next_obs)
+            responses_types = torch.cat([action_types, information_types], dim=1)
+
             # Update states
             rollings = self._update_rolling_state(
                 rollings,
@@ -311,6 +365,8 @@ class LLMGenerationManager:
             original_right_side = self._update_right_side(
                 original_right_side,
                 responses_ids,
+                step,
+                responses_types,
                 next_obs_ids
             )
             
@@ -328,15 +384,22 @@ class LLMGenerationManager:
             gen_output = self._generate_with_gpu_padding(rollings_active)
 
             meta_info = gen_output.meta_info            
-            responses_ids, responses_str = self._postprocess_responses(gen_output.batch['responses'])
+            responses_ids, active_offsets, responses_str = self._postprocess_responses(gen_output.batch['responses'])
             responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
+            responses_offsets = torch.zeros(
+                (active_mask.shape[0], active_offsets.shape[1]),
+                dtype=active_offsets.dtype, device=active_offsets.device
+            )
+            responses_offsets[active_mask] = active_offsets
 
             # Execute in environment and process observations
             # Optionally allow search on the final turn to include <information>
             do_search_final = getattr(self.config, "final_turn_do_search", False)
-            next_obs, dones, valid_action, is_search = self.execute_predictions(
+            next_obs, dones, valid_action, is_search, action_ranges = self.execute_predictions(
                 responses_str, self.tokenizer.pad_token, active_mask, do_search=do_search_final
             )
+            print(f"action ranges: {action_ranges}")
+            responses_types = self._build_action_types(responses_ids, responses_offsets, action_ranges, is_search, responses_str)
 
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
             active_mask = active_mask * curr_active_mask
@@ -350,13 +413,17 @@ class LLMGenerationManager:
                 original_right_side = self._update_right_side(
                     original_right_side,
                     responses_ids,
+                    self.config.max_turns,
+                    responses_types,
                     next_obs_ids,
                 )
             else:
                 original_right_side = self._update_right_side(
                     original_right_side,
                     responses_ids,
-                )
+                    self.config.max_turns,
+                    responses_types
+            )
         
         meta_info['turns_stats'] = turns_stats.tolist()
         meta_info['active_mask'] = active_mask.tolist()
@@ -366,6 +433,32 @@ class LLMGenerationManager:
         print("ACTIVE_TRAJ_NUM:", active_num_list)
         
         return self._compose_final_output(original_left_side, original_right_side, meta_info)
+
+    def _build_action_types(self,
+                            responses_ids: torch.Tensor,
+                            responses_offsets: torch.Tensor,
+                            action_ranges: List[Optional[Tuple[int, int]]],
+                            is_search: List[int], responses_str) -> torch.Tensor:
+
+        # The type is think by default
+        types = torch.zeros_like(responses_ids)
+        for i in range(len(responses_ids)):
+            if action_ranges[i]:
+                # Keep only until the last non-zero index for searchsorted() to work
+                last_nonzero_idx = (responses_offsets[i] != 0).nonzero(as_tuple=True)[0][-1]
+                valid_offsets = responses_offsets[i][:last_nonzero_idx+1]
+
+                # Select the smallest range of tokens to FULLY contain the action substring
+                # If s is in the middle of token i, then include token i
+                # If e is in the middle of token i, then use token i + 1 as the right bound instead
+                s, e = action_ranges[i]
+                s_idx = torch.searchsorted(valid_offsets, s, right=True) - 1
+                e_idx = torch.searchsorted(valid_offsets, e)
+
+                types[i, s_idx:e_idx] = ResponseType.search.value if is_search[i] \
+                    else ResponseType.answer.value
+
+        return types
 
     def _compose_final_output(self, left_side: Dict,
                             right_side: Dict,
@@ -399,7 +492,8 @@ class LLMGenerationManager:
         
         return final_output
 
-    def execute_predictions(self,predictions:List[str],pad_token:str,active_mask=None,do_search=True)->List[str]:
+    def execute_predictions(self,predictions:List[str],pad_token:str,active_mask=None,do_search=True) \
+        -> Tuple[List[str], List[int], List[int], List[int], List[Optional[Tuple[int, int]]]]:
         """
         Execute predictions across multiple environments.
         NOTE: the function is the actual `step` function in the environment
@@ -414,7 +508,7 @@ class LLMGenerationManager:
             List of observation strings
         """
 
-        cur_actions,contents=self.postprocess_predictions(predictions)
+        cur_actions,contents,action_ranges=self.postprocess_predictions(predictions)
         next_obs,dones,valid_action,is_search=[],[],[],[]
 
         search_queries=[content for action,content in zip(cur_actions,contents) if action=='search']
@@ -460,9 +554,9 @@ If I want to give the final answer, I should put the answer between <answer> and
             
         assert len(search_results) == 0
             
-        return next_obs, dones, valid_action, is_search
+        return next_obs, dones, valid_action, is_search, action_ranges
 
-    def postprocess_predictions(self, predictions: List[Any]) -> Tuple[List[int], List[bool]]:
+    def postprocess_predictions(self, predictions: List[Any]) -> Tuple[List[int], List[bool], List[Optional[Tuple[int, int]]]]:
         """
         Process (text-based) predictions from llm into actions and validity flags.
         
@@ -474,6 +568,7 @@ If I want to give the final answer, I should put the answer between <answer> and
         """
         actions = []
         contents = []
+        action_ranges = []
                 
         for prediction in predictions:
             if isinstance(prediction, str): # for llm output
@@ -482,13 +577,16 @@ If I want to give the final answer, I should put the answer between <answer> and
                 if match:
                     content = match.group(2).strip()  # Return only the content inside the tags
                     action = match.group(1)
+                    action_range = (match.start(), match.end())
                 else:
                     content = ''
                     action = None
+                    action_range = None
             else:
                 raise ValueError(f"Invalid prediction type: {type(prediction)}")
             
             actions.append(action)
             contents.append(content)
+            action_ranges.append(action_range)
             
-        return actions, contents
+        return actions, contents, action_ranges
