@@ -23,6 +23,7 @@ import threading
 
 from verl import DataProto
 from verl.tools.schemas import TrajectoryComponent, TrajectoryFeedback
+from verl.utils.trajectory import get_components
 from verl.utils.reward_score import default_compute_score
 from .llm_evaluator import LLMEvaluator
 
@@ -1586,8 +1587,14 @@ class SimpleDenseFeedbackRewardManager:
             self.file_logger.info(f"Question: {question}")
             self.file_logger.info(f"Response: {response_str}")
             
-            # Parse trajectory components (using improved token position calculation)
-            components = self.parse_trajectory_components(response_str, valid_response_ids.tolist())
+            # Parse trajectory components
+            components = get_components(
+                data_item.batch["responses"],
+                data_item.batch["step_ids"],
+                data_item.batch["responses_types"],
+                data_item.batch["attention_mask"],
+                self.tokenizer,
+            )
             
             # Analyze entire trajectory (Synchronous call)
             feedback = self.analyze_trajectory_sync(components, ground_truth, question)
