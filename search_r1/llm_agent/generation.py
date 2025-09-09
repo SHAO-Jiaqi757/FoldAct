@@ -417,20 +417,58 @@ class LLMGenerationManager:
         cur_actions,contents=self.postprocess_predictions(predictions)
         next_obs,dones,valid_action,is_search=[],[],[],[]
 
-        search_queries=[content for action,content in zip(cur_actions,contents) if action=='search']
+        # Build search queries only for active slots requesting search
+        active_search_indices = [i for i, (action, active) in enumerate(zip(cur_actions, active_mask)) if active and action == 'search']
+        search_queries = [contents[i] for i in active_search_indices]
+        expected_results = len(search_queries)
+
         if do_search and search_queries:
             parameters={"query_list":search_queries,"topk":self.config.topk}
             import asyncio
             import json
 
-            #execute returns search_result, 0.0, metrics. We do not require metrics 
-            instance= asyncio.run(self.search_tool.create())
-            search_results_json,*_=asyncio.run(self.search_tool.execute(instance_id=instance, parameters=parameters))
-            search_results=json.loads(search_results_json)['result']
-            print(len(search_results),sum([1 for action in cur_actions if action=="search"]))
-            assert len(search_results) ==sum([1 for action in cur_actions if action=="search"])
+            # Execute search; capture metrics to detect skip conditions
+            instance = asyncio.run(self.search_tool.create())
+            exec_result = asyncio.run(self.search_tool.execute(instance_id=instance, parameters=parameters))
+            # exec_result: (result_text, tool_reward, metrics)
+            if isinstance(exec_result, tuple) and len(exec_result) >= 1:
+                search_results_json = exec_result[0]
+                metrics = exec_result[2] if len(exec_result) > 2 else {}
+            else:
+                search_results_json = exec_result
+                metrics = {}
+            # Robustly parse results and coerce to a list
+            try:
+                parsed = json.loads(search_results_json)
+            except Exception:
+                parsed = search_results_json
+
+            if isinstance(parsed, dict):
+                result_obj = parsed.get('result', parsed.get('results', parsed))
+            else:
+                result_obj = parsed
+
+            if isinstance(result_obj, list):
+                search_results = result_obj
+            elif isinstance(result_obj, str):
+                search_results = [result_obj]
+            elif isinstance(result_obj, dict):
+                # Fallback: stringify dict as a single result item
+                search_results = [json.dumps(result_obj, ensure_ascii=False)]
+            else:
+                # Unknown type -> single empty string placeholder
+                search_results = ["[Unknow Type]"]
+            # If SearchTool signaled skip, treat as no evidence
+            if isinstance(metrics, dict) and metrics.get('skipped', False):
+                search_results = [''] * expected_results
+            else:
+                # Normalize result length to expected active search count
+                if len(search_results) < expected_results:
+                    search_results += [''] * (expected_results - len(search_results))
+                elif len(search_results) > expected_results:
+                    search_results = search_results[:expected_results]
         else:
-            search_results = [''] * sum([1 for action in cur_actions if action == 'search'])
+            search_results = [''] * expected_results
 
         for i, (action,active) in enumerate(zip(cur_actions,active_mask)):
             if not active:
@@ -446,6 +484,7 @@ class LLMGenerationManager:
                     valid_action.append(1)
                     is_search.append(0)
                 elif action == 'search':
+                    # Only consume search result for active entries
                     next_obs.append(f'\n\n<information>{search_results.pop(0).strip()}</information>\n\n')
                     dones.append(0)
                     valid_action.append(1)
