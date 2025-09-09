@@ -153,6 +153,8 @@ class SimpleDenseFeedbackRewardManager:
             "repetition_penalty_max": 1.0,            # cap total repetition penalty per component
             # Productive search bonus (simplified)
             "productive_search_bonus": 0.15,          # bonus for search immediately followed by non-empty information
+            # Limits for LLM evaluation cost
+            "max_reasoning_eval_chars": 1200,         # if reasoning text exceeds this length, skip grounding evaluation
         }
     
     def _setup_logging(self):
@@ -1023,6 +1025,23 @@ class SimpleDenseFeedbackRewardManager:
         """Synchronous wrapper: call LLM evaluator (internal safe running coroutine)."""
         if not self.llm_evaluator:
             raise RuntimeError("LLM evaluator not available")
+        # Skip evaluation if reasoning text is too long (cost control / latency)
+        try:
+            max_chars = int(self.config.get("max_reasoning_eval_chars", 1200))
+        except Exception:
+            max_chars = 1200
+        text = (reasoning_text or "").strip()
+        if max_chars > 0 and len(text) > max_chars:
+            logger.info(f"Skipping grounding LLM evaluation: reasoning too long ({len(text)} > {max_chars} chars)")
+            return {
+                "premise_grounding": "Unspecified",
+                "anchor_type": "NONE",
+                "evidence_citations": [],
+                "unmatched_premises": [],
+                "premise_justification": f"Skipped: reasoning too long ({len(text)} > {max_chars})",
+                "evaluation_success": False,
+                "fallback": True,
+            }
         try:
             return self._run_async(self.llm_evaluator.evaluate_reasoning_grounding(
                 reasoning_text, search_evidence, question
