@@ -343,7 +343,6 @@ class LLMGenerationManager:
             next_obs, dones, valid_action, is_search, action_ranges = self.execute_predictions(
                 responses_str, self.tokenizer.pad_token, active_mask
             )
-            print(f"action ranges: {action_ranges}")
             action_types = self._build_action_types(responses_ids, responses_offsets, action_ranges, is_search, responses_str)
             
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
@@ -398,7 +397,6 @@ class LLMGenerationManager:
             next_obs, dones, valid_action, is_search, action_ranges = self.execute_predictions(
                 responses_str, self.tokenizer.pad_token, active_mask, do_search=do_search_final
             )
-            print(f"action ranges: {action_ranges}")
             responses_types = self._build_action_types(responses_ids, responses_offsets, action_ranges, is_search, responses_str)
 
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
