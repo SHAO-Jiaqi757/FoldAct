@@ -167,6 +167,10 @@ class SearchTool(BaseTool):
         if self.retrieval_service_url == "":
             raise ValueError("retrieval_service_url is not set")
 
+        # Safety/validation thresholds (with sane defaults)
+        # Skip triggering searches when queries are clearly malformed or too long
+        self.max_query_words = getattr(config, "retriever_max_query_words", 48)
+
         logger.info(f"Initialized SearchTool with config: {config}")
 
     def get_openai_tool_schema(self) -> OpenAIFunctionToolSchema:
@@ -232,6 +236,21 @@ class SearchTool(BaseTool):
             error_msg = "Error: 'query_list' is missing, empty, or not a list in parameters."
             logger.error(f"[SearchTool] {error_msg} Received parameters: {parameters}")
             return json.dumps({"result": error_msg}), 0.0, {}
+
+        # Validation: do not trigger search if queries are too long or too many
+        def _too_long(q: str) -> bool:
+            if not isinstance(q, str):
+                return True
+            if len(q.split()) > self.max_query_words:
+                return True
+            return False
+
+        if any(_too_long(q) for q in query_list_from_params):
+            reason = {
+                "any_query_too_long": any(_too_long(q) for q in query_list_from_params),
+            }
+            logger.info(f"[SearchTool] Skip triggering search due to length/quantity validation: {reason}")
+            return json.dumps({"result": "search_skipped_due_to_query_length"}), 0.0, {"skipped": True, "reason": reason}
 
         # Execute search using Ray execution pool
         try:

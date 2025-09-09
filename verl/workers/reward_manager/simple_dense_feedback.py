@@ -140,6 +140,9 @@ class SimpleDenseFeedbackRewardManager:
             "min_reward_value": -1.0,
             "max_reward_value": 2.0,
             "smooth_reward_transition": True,
+            # Parsing filters for meaningless components
+            "skip_empty_information": True,
+            "min_semantic_words_search": 2,
             # Repetition penalties (apply to think components)
             "enable_repetition_penalty": True,
             "trigram_repeat_penalty_weight": 0.5,     # scales trigram repetition rate [0,1]
@@ -167,6 +170,39 @@ class SimpleDenseFeedbackRewardManager:
             handler = logging.StreamHandler()
             handler.setFormatter(formatter)
             logger.addHandler(handler)
+
+    def _is_meaningless_component(self, component_type: str, content: str) -> bool:
+        """Heuristic filter for meaningless components like 'and' or very short noise.
+        Applies stricter thresholds for search/answer; skips empty information.
+        """
+        if not isinstance(content, str):
+            return True
+        text = content.strip()
+        if text == "":
+            return True
+        # Global minimal length
+        min_len = int(self.config.get("min_component_length", 5))
+        if len(text) < min_len:
+            return True
+
+        # Only alnum count and word count heuristics
+        import string
+        alnum_chars = sum(ch.isalnum() for ch in text)
+        words = [w for w in re.split(r"\s+", text) if w]
+        word_count = len(words)
+
+        if component_type == "search":
+            min_words = int(self.config.get("min_semantic_words_search", 2))
+            if word_count < min_words:
+                return True
+            # trivial stopword-only queries
+            stopwords = {"and", "or", "the", "a", "an"}
+            if word_count <= 3 and all(w.lower().strip(string.punctuation) in stopwords for w in words):
+                return True
+        elif component_type == "information":
+            if self.config.get("skip_empty_information", True) and alnum_chars == 0:
+                return True
+        return False
     
     def _run_async(self, coro):
         """Run coroutine in a safe manner in a synchronous environment.
@@ -234,9 +270,16 @@ class SimpleDenseFeedbackRewardManager:
             
             for i, match in enumerate(matches):
                 content = match.group(1).strip()
-                if len(content) < self.config.get("min_component_length", 5):
-                    logger.debug(f"Skipping {component_type} component {i+1} (too short: {len(content)})")
-                    continue
+                # Filter meaningless/too-short components (e.g., 'and')
+                try:
+                    if self._is_meaningless_component(component_type, content):
+                        logger.debug(f"Skipping {component_type} component {i+1} (meaningless/too short): {content[:30]}")
+                        continue
+                except Exception:
+                    # Fallback to legacy minimal length check if helper missing
+                    if len(content) < self.config.get("min_component_length", 5):
+                        logger.debug(f"Skipping {component_type} component {i+1} (too short: {len(content)})")
+                        continue
                 
                 # Calculate accurate token positions
                 start_char = match.start()
@@ -698,6 +741,7 @@ class SimpleDenseFeedbackRewardManager:
         # 4. Format reward: if sequence ends with answer, give format reward
         if component.component_type == "answer":
             temporal_sequence = temporal_meta.get("temporal_sequence", [])
+            format_bonus = 0.0
             if temporal_sequence and temporal_sequence[-1] == "answer":
                 # Check if this is the last answer component
                 is_last_answer = True
@@ -707,10 +751,12 @@ class SimpleDenseFeedbackRewardManager:
                         break
                 
                 if is_last_answer:
-                    format_bonus = self.config.get("format_bonus", 0.3)
+                    format_bonus = float(self.config.get("format_bonus", 0.3))
                     score += format_bonus
                     logger.debug(f"Rewarding proper format (sequence ends with answer): {score:.3f}")
-            self.file_logger.info(f"Applied format bonus {format_bonus:.3f} for sequence ending with answer")
+            # Log only if any format bonus applied
+            if format_bonus != 0.0:
+                self.file_logger.info(f"Applied format bonus {format_bonus:.3f} for sequence ending with answer")
         
         # 5. Final answer quality (already considered in base_score)
         
@@ -1537,30 +1583,29 @@ class SimpleDenseFeedbackRewardManager:
     
     def _print_analysis_summary(self, data_source, item_index, response_str, ground_truth, components, feedback, dense_reward):
         """Print analysis summary"""
-        print(f"\n{'='*80}")
-        print(f"[{data_source}] Trajectory Analysis for Item {item_index+1}:")
-        print(f"{'='*80}")
-        print(f"Response: {response_str[:300]}...")
-        print(f"Ground Truth: {ground_truth}")
-        print(f"Components Found: {len(components)}")
+        logger.info(f"\n{'='*80}")
+        logger.info(f"[{data_source}] Trajectory Analysis for Item {item_index+1}:")
+        logger.info(f"{'='*80}")
+        logger.info(f"Response: {response_str[:300]}...")
+        logger.info(f"Ground Truth: {ground_truth}")
+        logger.info(f"Components Found: {len(components)}")
         for j, comp in enumerate(components):
-            print(f"  {j+1}. {comp.component_type}: {comp.content[:100]}...")
-        print(f"\nScores:")
-        print(f"  Answer Quality: {feedback.answer_quality_score:.3f}")
-        print(f"\nTemporal Analysis:")
+            logger.info(f"  {j+1}. {comp.component_type}: {comp.content[:100]}...")
+        logger.info(f"\nScores:")
+        logger.info(f"  Answer Quality: {feedback.answer_quality_score:.3f}")
+        logger.info(f"\nTemporal Analysis:")
         temporal_meta = getattr(feedback, '_temporal_analysis', {})
-        print(f"  Recovery Steps: {temporal_meta.get('recovery_steps', 0)}")
-        print(f"  Recovery Success: {temporal_meta.get('recovery_success', False)}")
-        print(f"  Repetition Penalty: {temporal_meta.get('repetition_penalty', 0.0):.3f}")
-        print(f"  Temporal Sequence: {' -> '.join(temporal_meta.get('temporal_sequence', []))}")
-        print(f"\nPenalties:")
-        print(f"  Insufficient Info: {feedback.has_insufficient_info}")
-        print(f"  Repeated Searches: {feedback.has_repeated_tools}")
-        print(f"  Exceeds Max Steps: {feedback.exceeds_max_steps}")
-        print(f"\nReward Tensor Shape: {dense_reward.shape}")
-        print(f"Non-zero rewards: {(dense_reward != 0).sum().item()}")
-        print(f"Reward range: [{dense_reward.min().item():.3f}, {dense_reward.max().item():.3f}]")
-        print(f"{'='*80}") 
+        logger.info(f"  Recovery Steps: {temporal_meta.get('recovery_steps', 0)}")
+        logger.info(f"  Recovery Success: {temporal_meta.get('recovery_success', False)}")
+        logger.info(f"  Temporal Sequence: {' -> '.join(temporal_meta.get('temporal_sequence', []))}")
+        logger.info(f"\nPenalties:")
+        logger.info(f"  Repetition Penalty: {temporal_meta.get('repetition_penalty', 0.0):.3f}")
+        logger.info(f"  Insufficient Info: {feedback.has_insufficient_info}")
+        logger.info(f"  Repeated Searches: {feedback.has_repeated_tools}")
+        logger.info(f"\nReward Tensor Shape: {dense_reward.shape}")
+        logger.info(f"Non-zero rewards: {(dense_reward != 0).sum().item()}")
+        logger.info(f"Reward range: [{dense_reward.min().item():.3f}, {dense_reward.max().item():.3f}]")
+        logger.info(f"{'='*80}") 
 
     def _allocate_rewards_uniform(self, feedback: TrajectoryFeedback, response_length: int) -> torch.Tensor:
         """Uniformly allocate reward to the entire response (backup strategy)"""
