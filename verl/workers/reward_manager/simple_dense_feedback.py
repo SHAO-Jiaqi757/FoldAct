@@ -977,6 +977,14 @@ class SimpleDenseFeedbackRewardManager:
             return 0.0
         
         final_answer = answer_components[-1].content.strip()
+        # If the decoded answer block still contains tags (because types were
+        # assigned over the whole <answer>...</answer> span), extract inner text
+        try:
+            m = re.search(r"<answer>(.*?)</answer>", final_answer, re.DOTALL)
+            if m:
+                final_answer = m.group(1).strip()
+        except Exception:
+            pass
         logger.debug(f"Scoring final answer: {final_answer[:100]}...")
         
         # Process ground truth format
