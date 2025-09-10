@@ -197,18 +197,28 @@ def perform_single_search_batch(retrieval_service_url: str, query_list: List[str
                 metadata["formatted_result"] = "\n--\n".join(final_result)
                 logger.info(f"Batch search: Successful, got {total_results} total results")
             else:
-                result_text = json.dumps({"result": ["No search results found." for i in len(total_results)]})
+                # No results returned by API. Produce one empty string per query
+                # to preserve alignment with active searches.
+                result_list = [""] * len(query_list)
+                result_text = json.dumps({"result": result_list})
                 metadata["status"] = "no_results"
                 metadata["total_results"] = 0
+                metadata["formatted_result"] = ""
                 logger.info("Batch search: No results found")
         except Exception as e:
+            # Be robust to any processing error: return an aligned list of error strings
             error_msg = f"Error processing search results: {e}"
-            result_text = json.dumps({"result": [error_msg for i in len(total_results)]})
+            result_list = [error_msg] * len(query_list)
+            result_text = json.dumps({"result": result_list})
             metadata["status"] = "processing_error"
+            metadata["formatted_result"] = "\n--\n".join(result_list)
             logger.error(f"Batch search: {error_msg}")
     else:
+        # Neither response nor explicit error captured: return aligned placeholders
         metadata["status"] = "unknown_api_state"
-        result_text = json.dumps({"result": ["Unknown API state (no response and no error message)." for i in len(total_results)]})
+        result_list = ["Unknown API state (no response and no error message)."] * len(query_list)
+        result_text = json.dumps({"result": result_list})
+        metadata["formatted_result"] = "\n--\n".join(result_list)
         logger.error("Batch search: Unknown API state.")
 
     return result_text, metadata

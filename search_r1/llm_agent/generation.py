@@ -407,7 +407,10 @@ class LLMGenerationManager:
             
 
             if do_search_final:
-                next_obs_ids = self._process_next_obs(next_obs)
+                # Process observations: get token ids and corresponding information types
+                next_obs_ids, information_types = self._process_next_obs(next_obs)
+                # Extend response types to include information types so lengths match
+                responses_types = torch.cat([responses_types, information_types], dim=1)
                 original_right_side = self._update_right_side(
                     original_right_side,
                     responses_ids,

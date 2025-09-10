@@ -74,7 +74,7 @@ file_logger, log_filename = _ensure_file_logger()
 class SimpleDenseFeedbackRewardManager:
     """Simplified reward manager focused on grounding, information sufficiency, and refinement."""
     
-    def __init__(self, tokenizer, num_examine=2, compute_score=None, reward_fn_key="data_source", 
+    def __init__(self, tokenizer, num_examine=100, compute_score=None, reward_fn_key="data_source", 
                  enable_llm_evaluation=True, llm_model="gpt-4.1-mini", log_dir: Optional[str] = None):
         self.tokenizer = tokenizer
         self.num_examine = num_examine
@@ -128,8 +128,8 @@ class SimpleDenseFeedbackRewardManager:
             "insufficient_info_penalty": -0.15,        # Penalty for answering directly with insufficient information
             "refinement_bonus": 0.5,                  # Reward for improving from insufficient to sufficient
             "grounding_bonus": 0.3,                   # Reward for correct grounding
-            "ungrounded_penalty": 0,                  # Penalty for ungrounded responses
-            "format_bonus": 0.3,                      # Format reward: bonus when sequence ends with answer
+            "ungrounded_penalty": -0.15,                  # Penalty for ungrounded responses
+            "format_bonus": 0.0,                      # Format reward: bonus when sequence ends with answer
             # Prevent reward hacking: limits and decay
             "grounding_bonus_max_steps": 2,           # Maximum number of steps to apply grounding bonus (e.g., only reward first 2 times)
             "grounding_bonus_decay": 0.6,             # Decay coefficient for grounding bonus, decreasing by step
@@ -147,12 +147,10 @@ class SimpleDenseFeedbackRewardManager:
             "min_semantic_words_search": 1,
             # Repetition penalties (apply to think components)
             "enable_repetition_penalty": True,
-            "trigram_repeat_penalty_weight": 0.5,     # scales trigram repetition rate [0,1]
+            "trigram_repeat_penalty_weight": 0.7,     # scales trigram repetition rate [0,1]
             "self_bleu_penalty_weight": 0.3,          # scales self-BLEU vs previous reasoning [0,1]
             "span_repeat_penalty_weight": 0.4,         # scales span repetition rate [0,1]
             "repetition_penalty_max": 1.0,            # cap total repetition penalty per component
-            # Productive search bonus (simplified)
-            "productive_search_bonus": 0.15,          # bonus for search immediately followed by non-empty information
             # Limits for LLM evaluation cost
             "max_reasoning_eval_chars": 1200,         # if reasoning text exceeds this length, skip grounding evaluation
         }
@@ -687,19 +685,19 @@ class SimpleDenseFeedbackRewardManager:
                 score += self.config.get("ungrounded_penalty", -0.3)
                 logger.debug(f"Penalizing ungrounded reasoning: {score:.3f}")
 
-            # Productive search bonus (simplified): reward searches immediately followed by non-empty information
-            if component.component_type == "search":
-                try:
-                    bonus = float(self.config.get("productive_search_bonus", 0.15))
-                    # Check the immediate next component only
-                    next_idx = component_idx + 1
-                    if next_idx < len(sorted_components):
-                        cand = sorted_components[next_idx]
-                        if cand.component_type == "information" and isinstance(getattr(cand, 'content', None), str) and cand.content.strip() != "":
-                            score += bonus
-                            logger.debug(f"Productive search bonus applied: +{bonus:.3f}")
-                except Exception:
-                    pass
+            # # Productive search bonus (simplified): reward searches immediately followed by non-empty information
+            # if component.component_type == "search":
+            #     try:
+            #         bonus = float(self.config.get("productive_search_bonus", 0.15))
+            #         # Check the immediate next component only
+            #         next_idx = component_idx + 1
+            #         if next_idx < len(sorted_components):
+            #             cand = sorted_components[next_idx]
+            #             if cand.component_type == "information" and isinstance(getattr(cand, 'content', None), str) and cand.content.strip() != "":
+            #                 score += bonus
+            #                 logger.debug(f"Productive search bonus applied: +{bonus:.3f}")
+            #     except Exception:
+            #         pass
         
         # 3. Information improvement reward (from insufficient to sufficient)
         if component.component_type == "information":
@@ -751,24 +749,33 @@ class SimpleDenseFeedbackRewardManager:
         
         # Sort
         sorted_components = sorted(feedback.components, key=lambda x: x.start_token_idx)
+
+        def _clamp_span(start: int, end: int) -> Optional[tuple[int, int]]:
+            """Clamp a token span to [0, response_length). Return None if empty after clamp."""
+            try:
+                if end <= 0:
+                    return None
+                s = max(0, min(int(start), max(0, response_length - 1)))
+                e = max(s + 1, min(int(end), response_length))
+                if s >= response_length or e <= 0 or e <= s:
+                    return None
+                return s, e
+            except Exception:
+                return None
+
+        def _find_prev_component_idx(of_type: str, before_idx: int) -> Optional[int]:
+            for j in range(before_idx - 1, -1, -1):
+                if sorted_components[j].component_type == of_type:
+                    return j
+            return None
         
         for i, component in enumerate(sorted_components):
             # Relax boundary checks: clamp to valid range instead of skipping
             # Compute clamped token span within [0, response_length]
-            try:
-                raw_start = int(component.start_token_idx)
-                raw_end = int(component.end_token_idx)
-            except Exception:
-                # If indices are not valid integers, skip this component
+            span = _clamp_span(component.start_token_idx, component.end_token_idx)
+            if span is None:
                 continue
-            if raw_end <= 0:
-                # Entire span lies before the start of the response
-                continue
-            start_idx = max(0, min(raw_start, max(0, response_length - 1)))
-            end_idx = max(start_idx + 1, min(raw_end, response_length))
-            if start_idx >= response_length or end_idx <= 0 or end_idx <= start_idx:
-                # Nothing to allocate within bounds
-                continue
+            start_idx, end_idx = span
             
             # Base score: only based on final answer quality
             base_score = feedback.answer_quality_score if component.component_type == "answer" else 0.0
@@ -785,10 +792,27 @@ class SimpleDenseFeedbackRewardManager:
                 final_score -= rep_penalty
             
             # Allocate reward
-            reward_tensor[start_idx:end_idx] = final_score
-            
-            # Log to file
-            file_logger.info(f"Component {i+1} ({component.component_type}): base_score={base_score:.3f}, final_score={final_score:.3f}, tokens={start_idx}-{end_idx}")
+            if component.component_type == "information":
+                # Route information score to the nearest preceding search span
+                prev_search_idx = _find_prev_component_idx("search", i)
+                if prev_search_idx is not None:
+                    search_comp = sorted_components[prev_search_idx]
+                    search_span = _clamp_span(search_comp.start_token_idx, search_comp.end_token_idx)
+                    if search_span is not None:
+                        s_start, s_end = search_span
+                        reward_tensor[s_start:s_end] += final_score
+                        file_logger.info(
+                            f"Component {i+1} (information): base_score={base_score:.3f}, final_score={final_score:.3f}, tokens={start_idx}-{end_idx} -> routed to search tokens={s_start}-{s_end}"
+                        )
+                        continue
+                # If no valid preceding search, skip allocation but log intent
+                file_logger.info(
+                    f"Component {i+1} (information): base_score={base_score:.3f}, final_score={final_score:.3f}, tokens={start_idx}-{end_idx} -> no preceding search found, skipped allocation"
+                )
+            else:
+                reward_tensor[start_idx:end_idx] = final_score
+                # Log to file
+                file_logger.info(f"Component {i+1} ({component.component_type}): base_score={base_score:.3f}, final_score={final_score:.3f}, tokens={start_idx}-{end_idx}")
         
         # Log grounding reward statistics
         grounding_applied = temporal_meta.get("grounding_applied", 0)
@@ -1025,20 +1049,48 @@ class SimpleDenseFeedbackRewardManager:
         """Synchronous wrapper: call LLM evaluator (internal safe running coroutine)."""
         if not self.llm_evaluator:
             raise RuntimeError("LLM evaluator not available")
+        # Guard: evidence must start with "<information>Doc 1" pattern; otherwise skip evaluation
+        try:
+            def _valid_ev_item(ev: Dict) -> bool:
+                txt = str(ev.get("content", ""))
+                # Accept either inner content starting with "Doc 1" or a full tag prefix
+                return re.match(r"^\s*(?:<information>)?\s*Doc\s*1", txt, flags=re.IGNORECASE) is not None
+            if not search_evidence or not any(_valid_ev_item(ev) for ev in search_evidence):
+                logger.info("Skipping grounding LLM evaluation: evidence not starting with '<information>Doc 1'")
+                return {
+                    "premise_grounding": "Unspecified",
+                    "anchor_type": "NONE",
+                    "evidence_citations": [],
+                    "unmatched_premises": [],
+                    "premise_justification": "Skipped: evidence not in expected '<information>Doc 1' format",
+                    "evaluation_success": False,
+                    "fallback": True,
+                }
+        except Exception:
+            # On any unexpected error in checking, fall back to skipping to be safe
+            return {
+                "premise_grounding": "Unspecified",
+                "anchor_type": "NONE",
+                "evidence_citations": [],
+                "unmatched_premises": [],
+                "premise_justification": "Skipped: evidence format check error",
+                "evaluation_success": False,
+                "fallback": True,
+            }
         # Skip evaluation if reasoning text is too long (cost control / latency)
         try:
             max_chars = int(self.config.get("max_reasoning_eval_chars", 1200))
         except Exception:
             max_chars = 1200
         text = (reasoning_text or "").strip()
-        if max_chars > 0 and len(text) > max_chars:
+        if max_chars > 0 and len(text) > max_chars or len(text.split()) < self.config.get("min_component_length", 3):
             logger.info(f"Skipping grounding LLM evaluation: reasoning too long ({len(text)} > {max_chars} chars)")
             return {
                 "premise_grounding": "Unspecified",
                 "anchor_type": "NONE",
                 "evidence_citations": [],
                 "unmatched_premises": [],
-                "premise_justification": f"Skipped: reasoning too long ({len(text)} > {max_chars})",
+                "premise_justification": f"Skipped: reasoning too long ({len(text)} > {max_chars}) or too short ({len(text.split()) < self.config.get('min_component_length', 3)})",
                 "evaluation_success": False,
                 "fallback": True,
             }
@@ -1168,11 +1220,16 @@ class SimpleDenseFeedbackRewardManager:
             c for c in information_components
             if getattr(c, 'content', None) is not None and str(c.content).strip() != ""
         ]
-        if non_empty_information_components:
+        # Further filter: evidence content should start with 'Doc 1' (or optional '<information>Doc 1' prefix)
+        def _valid_info_content(txt: str) -> bool:
+            return re.match(r"^\s*(?:<information>)?\s*Doc\s*1", str(txt), flags=re.IGNORECASE) is not None
+        valid_information_components = [c for c in non_empty_information_components if _valid_info_content(c.content)]
+
+        if valid_information_components:
             llm_evaluation_results = self._evaluate_information_quality_batch(
-                non_empty_information_components, search_components, ground_truth
+                valid_information_components, search_components, ground_truth
             )
-            for i, (component, eval_result) in enumerate(zip(non_empty_information_components, llm_evaluation_results)):
+            for i, (component, eval_result) in enumerate(zip(valid_information_components, llm_evaluation_results)):
                 is_sufficient = self._is_information_sufficient_llm(eval_result)
                 if not is_sufficient:
                     has_insufficient_info = True
@@ -1181,7 +1238,10 @@ class SimpleDenseFeedbackRewardManager:
                     self.file_logger.info(f"  Content: {component.content[:100]}...")
                     self.file_logger.info(f"  Quality: {eval_result.get('information_quality', 'Unknown')}")
         else:
-            logger.info("Skipping information quality LLM evaluation: empty evidence (no non-empty information components)")
+            if not non_empty_information_components:
+                logger.info("Skipping information quality LLM evaluation: empty evidence (no non-empty information components)")
+            else:
+                logger.info("Skipping information quality LLM evaluation: evidence not starting with 'Doc 1'")
         return {
             "has_insufficient_info": has_insufficient_info,
             "llm_evaluation_results": llm_evaluation_results
