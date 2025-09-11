@@ -36,23 +36,19 @@ export VLLM_USE_MODELSCOPE=false
 # max_prompt_length = (config['training']['max_start_length'] + config['training']['max_response_length'] * (config['training']['max_turns'] - 1) + config['training']['max_obs_length'] * config['training']['max_turns'])
 
 # Store checkpoints on /datapool via symlink so path remains stable
-TARGET_CKPT_ROOT="/datapool/verl_checkpoints"
+# Allow override via $TARGET_CKPT_ROOT for testing.
+TARGET_CKPT_ROOT="${TARGET_CKPT_ROOT:-/datapool/verl_checkpoints}"
 SRC_CKPT_ROOT="verl_checkpoints"
-mkdir -p "$TARGET_CKPT_ROOT" "$SRC_CKPT_ROOT"
 
-if [ -n "$EXPERIMENT_NAME" ]; then
-  SRC_DIR="$SRC_CKPT_ROOT/$EXPERIMENT_NAME"
-  DST_DIR="$TARGET_CKPT_ROOT/$EXPERIMENT_NAME"
-  # If a real directory exists at source, move its content to /datapool once
-  if [ -d "$SRC_DIR" ] && [ ! -L "$SRC_DIR" ]; then
-    mkdir -p "$DST_DIR"
-    echo "Relocating existing checkpoints to $DST_DIR ..."
-    mv "$SRC_DIR"/* "$DST_DIR" 2>/dev/null || true
-    rmdir "$SRC_DIR" 2>/dev/null || true
-  fi
-  # Point source path to /datapool
-  ln -sfn "$DST_DIR" "$SRC_DIR"
+# 确保目标目录存在
+mkdir -p "$TARGET_CKPT_ROOT"
+
+# 如果源目录是符号链接就跳过，否则删除再建符号链接
+if [ ! -L "$SRC_CKPT_ROOT" ]; then
+    rm -rf "$SRC_CKPT_ROOT"
+    ln -s "$TARGET_CKPT_ROOT" "$SRC_CKPT_ROOT"
 fi
+
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.train_files=$TRAIN_DATA_DIR/train_transformed.parquet \
@@ -82,7 +78,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.name=vllm \
     env.rollout.n=5 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
-    actor_rollout_ref.ref.log_prob_micro_batch_size=16 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size=32 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -94,7 +90,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.default_hdfs_dir=null \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
-    trainer.save_freq=40 \
+    trainer.save_freq=50 \
     trainer.test_freq=50 \
     trainer.project_name=$WAND_PROJECT \
     trainer.experiment_name=$EXPERIMENT_NAME \

@@ -183,27 +183,52 @@ def perform_single_search_batch(retrieval_service_url: str, query_list: List[str
             raw_results = api_response.get("result", [])
             if raw_results:
                 pretty_results = []
+                per_query_status = []
                 total_results = 0
 
-                for retrieval in raw_results:
+                for i, retrieval in enumerate(raw_results):
+                    # When the API returns an empty list for a query, return a
+                    # helpful placeholder rather than an empty string.
+                    if not retrieval:
+                        placeholder = (
+                            f"[No results] Query: '{query_list[i] if i < len(query_list) else ''}' | "
+                            f"status=no_results | topk={topk}"
+                        )
+                        pretty_results.append(placeholder)
+                        per_query_status.append("no_results")
+                        continue
+
                     formatted = _passages2string(retrieval)
-                    pretty_results.append(formatted)
-                    total_results += len(retrieval) if isinstance(retrieval, list) else 1
+                    if not formatted.strip():
+                        placeholder = (
+                            f"[No results] Query: '{query_list[i] if i < len(query_list) else ''}' | "
+                            f"status=no_results | topk={topk}"
+                        )
+                        pretty_results.append(placeholder)
+                        per_query_status.append("no_results")
+                    else:
+                        pretty_results.append(formatted)
+                        per_query_status.append("ok")
+                        total_results += len(retrieval) if isinstance(retrieval, list) else 1
 
                 final_result = pretty_results
                 result_text = json.dumps({"result": final_result})
                 metadata["status"] = "success"
                 metadata["total_results"] = total_results
                 metadata["formatted_result"] = "\n--\n".join(final_result)
+                metadata["per_query_status"] = per_query_status
                 logger.info(f"Batch search: Successful, got {total_results} total results")
             else:
-                # No results returned by API. Produce one empty string per query
-                # to preserve alignment with active searches.
-                result_list = [""] * len(query_list)
+                # API returned no per-query lists; emit placeholders per input query.
+                result_list = [
+                    f"[No results] Query: '{q}' | status=no_results | topk={topk}"
+                    for q in query_list
+                ]
                 result_text = json.dumps({"result": result_list})
                 metadata["status"] = "no_results"
                 metadata["total_results"] = 0
-                metadata["formatted_result"] = ""
+                metadata["formatted_result"] = "\n--\n".join(result_list)
+                metadata["per_query_status"] = ["no_results"] * len(query_list)
                 logger.info("Batch search: No results found")
         except Exception as e:
             # Be robust to any processing error: return an aligned list of error strings
