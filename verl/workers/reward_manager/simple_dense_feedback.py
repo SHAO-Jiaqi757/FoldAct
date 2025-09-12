@@ -141,18 +141,22 @@ class SimpleDenseFeedbackRewardManager:
             "reward_allocation_strategy": "component_based",
             "min_reward_value": -1.0,
             "max_reward_value": 2.0,
-            "smooth_reward_transition": True,
+            # To avoid distorting per-step totals, default to no smoothing for step-level rewards
+            "smooth_reward_transition": False,
             # Parsing filters for meaningless components
             "skip_empty_information": True,
             "min_semantic_words_search": 1,
             # Repetition penalties (apply to think components)
-            "enable_repetition_penalty": True,
+            "enable_repetition_penalty": False,
             "trigram_repeat_penalty_weight": 0.6,     # scales trigram repetition rate [0,1]
             "self_bleu_penalty_weight": 0.3,          # scales self-BLEU vs previous reasoning [0,1]
             "span_repeat_penalty_weight": 0.4,         # scales span repetition rate [0,1]
             "repetition_penalty_max": 1.0,            # cap total repetition penalty per component
             # Limits for LLM evaluation cost
             "max_reasoning_eval_chars": 1200,         # if reasoning text exceeds this length, skip grounding evaluation
+            # Step-level allocation (avoid length bias)
+            "step_level_allocation": True,            # distribute step score within its span to avoid length bias
+            "per_step_distribution": "even",         # even | last_token
         }
     
     def _setup_logging(self):
@@ -646,6 +650,12 @@ class SimpleDenseFeedbackRewardManager:
                                      component_idx: int, temporal_meta: Dict) -> float:
         """Apply reward adjustments for four core aspects (grounding only for search/think, with decay and upper limit)"""
         score = base_score
+        # Collect a human-readable breakdown for debugging
+        debug_parts: List[str] = []
+        try:
+            debug_parts.append(f"base={base_score:.3f}")
+        except Exception:
+            pass
         
         # 1. Information insufficient penalty
         if temporal_meta.get("has_insufficient_info", False):
@@ -656,6 +666,10 @@ class SimpleDenseFeedbackRewardManager:
                     if prev_component.component_type == "information":
                         # Apply information insufficient penalty
                         score += self.config["insufficient_info_penalty"]
+                        try:
+                            debug_parts.append(f"insufficient_info_penalty={self.config['insufficient_info_penalty']:.3f}")
+                        except Exception:
+                            pass
                         logger.debug(f"Penalizing answer after insufficient info: {score:.3f}")
                         break
                     elif prev_component.component_type == "search":
@@ -680,9 +694,17 @@ class SimpleDenseFeedbackRewardManager:
                     score += allowed_bonus
                     temporal_meta["grounding_applied"] = applied_steps + 1
                     temporal_meta["grounding_bonus_total"] = total_bonus + allowed_bonus
+                    try:
+                        debug_parts.append(f"grounding_bonus=+{allowed_bonus:.3f} (decay={step_decay:.2f})")
+                    except Exception:
+                        pass
                     logger.debug(f"Rewarding grounded reasoning (step {applied_steps+1}, bonus {allowed_bonus:.3f}): {score:.3f}")
             else:
                 score += self.config.get("ungrounded_penalty", -0.3)
+                try:
+                    debug_parts.append(f"ungrounded_penalty={self.config.get('ungrounded_penalty', -0.3):.3f}")
+                except Exception:
+                    pass
                 logger.debug(f"Penalizing ungrounded reasoning: {score:.3f}")
 
             # # Productive search bonus (simplified): reward searches immediately followed by non-empty information
@@ -710,6 +732,10 @@ class SimpleDenseFeedbackRewardManager:
                 # Stash it to be applied on the next answer span (encourages finishing with improved info).
                 pending = float(temporal_meta.get("refinement_bonus_pending", 0.0))
                 temporal_meta["refinement_bonus_pending"] = pending + float(refinement_bonus)
+                try:
+                    debug_parts.append(f"refinement_bonus_stashed=+{refinement_bonus:.3f}")
+                except Exception:
+                    pass
                 logger.debug(
                     f"Stashing refinement bonus {refinement_bonus:.3f} to apply on next answer; pending total="
                     f"{temporal_meta['refinement_bonus_pending']:.3f}")
@@ -729,6 +755,10 @@ class SimpleDenseFeedbackRewardManager:
                 if is_last_answer:
                     format_bonus = float(self.config.get("format_bonus", 0.3))
                     score += format_bonus
+                    try:
+                        debug_parts.append(f"format_bonus=+{format_bonus:.3f}")
+                    except Exception:
+                        pass
                     logger.debug(f"Rewarding proper format (sequence ends with answer): {score:.3f}")
             # Log only if any format bonus applied
             if format_bonus != 0.0:
@@ -737,7 +767,17 @@ class SimpleDenseFeedbackRewardManager:
         # 5. Final answer quality (already considered in base_score)
         
         # Ensure score is in a reasonable range
-        return max(self.config["min_reward_value"], score)
+        final = max(self.config["min_reward_value"], score)
+        # Emit a compact score breakdown line for this component
+        try:
+            self.file_logger.info(
+                f"Score breakdown for component {component_idx+1} ({component.component_type}): "
+                + "; ".join(debug_parts)
+                + f"; final={final:.3f}"
+            )
+        except Exception:
+            pass
+        return final
     
     def _allocate_rewards_component_based(self, feedback: TrajectoryFeedback, response_length: int) -> torch.Tensor:
         """Allocate rewards based on four core aspects: 1. grounding, 2. insufficient info penalty, 3. refinement, 4. final answer"""
@@ -805,8 +845,26 @@ class SimpleDenseFeedbackRewardManager:
                 rep_penalty = self._compute_repetition_penalty(component, sorted_components, i)
                 temporal_meta["repetition_penalty"] = temporal_meta.get("repetition_penalty", 0.0) + rep_penalty
                 final_score -= rep_penalty
+                try:
+                    self.file_logger.info(
+                        f"Applied repetition penalty -{rep_penalty:.3f} to think component {i+1}; interim_score={final_score:.3f}"
+                    )
+                except Exception:
+                    pass
             
             # Allocate reward
+            # Helper to distribute a step-level score within a token span without length bias
+            def _distribute_within_span(s: int, e: int, score: float):
+                length = max(0, e - s)
+                if length <= 0:
+                    return
+                mode = str(self.config.get("per_step_distribution", "even")).lower()
+                if mode == "last_token":
+                    reward_tensor[e - 1] += float(score)
+                else:  # even
+                    per = float(score) / float(length)
+                    reward_tensor[s:e] += per
+
             if component.component_type == "information":
                 # Route information score to the nearest preceding search span
                 prev_search_idx = _find_prev_component_idx("search", i)
@@ -815,7 +873,10 @@ class SimpleDenseFeedbackRewardManager:
                     search_span = _clamp_span(search_comp.start_token_idx, search_comp.end_token_idx)
                     if search_span is not None:
                         s_start, s_end = search_span
-                        reward_tensor[s_start:s_end] += final_score
+                        if bool(self.config.get("step_level_allocation", True)):
+                            _distribute_within_span(s_start, s_end, final_score)
+                        else:
+                            reward_tensor[s_start:s_end] = final_score
                         file_logger.info(
                             f"Component {i+1} (information): base_score={base_score:.3f}, final_score={final_score:.3f}, tokens={start_idx}-{end_idx} -> routed to search tokens={s_start}-{s_end}"
                         )
@@ -825,7 +886,10 @@ class SimpleDenseFeedbackRewardManager:
                     f"Component {i+1} (information): base_score={base_score:.3f}, final_score={final_score:.3f}, tokens={start_idx}-{end_idx} -> no preceding search found, skipped allocation"
                 )
             else:
-                reward_tensor[start_idx:end_idx] = final_score
+                if bool(self.config.get("step_level_allocation", True)):
+                    _distribute_within_span(start_idx, end_idx, final_score)
+                else:
+                    reward_tensor[start_idx:end_idx] = final_score
                 # Log to file
                 file_logger.info(f"Component {i+1} ({component.component_type}): base_score={base_score:.3f}, final_score={final_score:.3f}, tokens={start_idx}-{end_idx}")
         

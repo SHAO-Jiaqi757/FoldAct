@@ -1,6 +1,7 @@
 # Use A800s only by physical index and align CUDA order to PCIe bus IDs.
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=4,5
+
 export DATA_DIR='/datapool/data/deepresearcher'
 # Avoid NCCL peer access attempts between non-P2P GPU pairs
 export NCCL_P2P_DISABLE=1
@@ -50,6 +51,30 @@ if [ ! -L "$SRC_CKPT_ROOT" ]; then
 fi
 
 
+
+# ========= NCCL & 环境变量 =========
+export NCCL_DEBUG=INFO
+export NCCL_SOCKET_IFNAME=bond0       
+export NCCL_SOCKET_DISABLE_IPV6=1
+export NCCL_IB_DISABLE=0              
+
+NCCL_DEBUG=INFO NCCL_SOCKET_IFNAME=bond0 NCCL_SOCKET_DISABLE_IPV6=1 \
+python - <<'PYCODE'
+import torch.distributed as dist
+
+# 单机: world_size=1, rank=0, 用 tcp://127.0.0.1 rendezvous
+dist.init_process_group(
+    backend="nccl",
+    init_method="tcp://127.0.0.1:29500",
+    world_size=1,
+    rank=0
+)
+print(">>> NCCL single-process init OK")
+dist.destroy_process_group()
+PYCODE
+
+nvidia-smi -i 4,5 -c EXCLUSIVE_PROCESS
+
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.train_files=$TRAIN_DATA_DIR/train_transformed.parquet \
     data.val_files=$TEST_DATA_DIR/test_transformed.parquet \
@@ -58,7 +83,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.train_batch_size=128 \
     data.val_batch_size=8 \
     data.max_prompt_length=2048 \
-    data.max_response_length=256 \
+    data.max_response_length=512 \
     algorithm.adv_estimator=grpo \
     actor_rollout_ref.model.path=$BASE_MODEL \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
@@ -68,17 +93,17 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.285 \
     actor_rollout_ref.actor.use_kl_loss=true \
     actor_rollout_ref.actor.ppo_mini_batch_size=128 \
-    actor_rollout_ref.actor.ppo_micro_batch_size=32 \
+    actor_rollout_ref.actor.ppo_micro_batch_size=64 \
     actor_rollout_ref.actor.use_dynamic_bsz=true \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=12000 \
     actor_rollout_ref.actor.fsdp_config.param_offload=true \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size=32 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size=64 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
     env.rollout.n=5 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
-    actor_rollout_ref.ref.log_prob_micro_batch_size=32 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size=64 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -90,11 +115,11 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.default_hdfs_dir=null \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
-    trainer.save_freq=50 \
+    trainer.save_freq=10 \
     trainer.test_freq=50 \
     trainer.project_name=$WAND_PROJECT \
     trainer.experiment_name=$EXPERIMENT_NAME \
-    trainer.resume_mode=disable \
+    trainer.resume_mode=enable \
     trainer.total_epochs=15 \
     trainer.total_training_steps=402 \
     trainer.default_hdfs_dir=null \
