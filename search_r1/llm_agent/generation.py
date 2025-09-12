@@ -3,6 +3,13 @@ import re
 from collections import defaultdict
 import os
 from typing import List, Dict, Any, Tuple, Optional
+import logging
+
+# Configure the logging level and format
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(levelname)s]: %(message)s')
+
+# Create a logger for this module
+logger = logging.getLogger(__name__)
 from dataclasses import dataclass
 from enum import Enum
 from .tensor_helper import TensorHelper, TensorConfig
@@ -559,7 +566,11 @@ class LLMGenerationManager:
             else:
                 # Normalize result length to expected active search count
                 if len(search_results) < expected_results:
-                    search_results += [''] * (expected_results - len(search_results))
+                    logger.warning(f"Got fewer results ({len(search_results)}) than expected ({expected_results}), padding with placeholders")
+                    # Pad with explicit placeholders to avoid empty information blocks
+                    missing = expected_results - len(search_results)
+                    pad_items = [f"[No results] Query: '{q[:128]}' | status=no_results" for q in search_queries[-missing:]] if search_queries else ["[No results] | status=no_results"] * missing
+                    search_results += pad_items
                 elif len(search_results) > expected_results:
                     search_results = search_results[:expected_results]
         else:
@@ -580,8 +591,7 @@ class LLMGenerationManager:
                     is_search.append(0)
                 elif action == 'search':
                     # Only consume search result for active entries
-                    next_obs.append(f'\n\n<information>{search_results.pop(0).strip()}</information>\n\n')
-                    next_obs.append('If you find the information is not enough, you should reflect and care about following actions')
+                    next_obs.append(f'\n\n<information>{search_results.pop(0).strip()}</information>\n\n If you find the information is not enough, you should reflect and care about following actions')
                     dones.append(0)
                     valid_action.append(1)
                     is_search.append(1)
