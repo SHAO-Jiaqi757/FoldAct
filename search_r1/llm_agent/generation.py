@@ -581,6 +581,7 @@ class LLMGenerationManager:
                 elif action == 'search':
                     # Only consume search result for active entries
                     next_obs.append(f'\n\n<information>{search_results.pop(0).strip()}</information>\n\n')
+                    next_obs.append('If you find the information is not enough, you should reflect and care about following actions')
                     dones.append(0)
                     valid_action.append(1)
                     is_search.append(1)
