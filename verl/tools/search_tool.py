@@ -245,24 +245,74 @@ class SearchTool(BaseTool):
                 return True
             return False
 
-        if any(_too_long(q) for q in query_list_from_params):
-            reason = {
-                "any_query_too_long": any(_too_long(q) for q in query_list_from_params),
-            }
-            logger.info(f"[SearchTool] Skip triggering search due to length/quantity validation: {reason}")
-            return json.dumps({"result": "search_skipped_due_to_query_length"}), 0.0, {"skipped": True, "reason": reason}
+        # Validate per-query instead of skipping the whole batch.
+        valid_mask = [not _too_long(q) for q in query_list_from_params]
+        any_valid = any(valid_mask)
+        all_valid = all(valid_mask) if query_list_from_params else False
+
+        if not any_valid:
+            # All queries invalid: preserve previous behavior but be explicit and aligned
+            placeholders = [f"[Search skipped] Query too long: '{str(q)[:128]}'" for q in query_list_from_params]
+            logger.info("[SearchTool] All queries skipped due to validation")
+            return json.dumps({"result": placeholders}), 0.0, {"skipped": True, "reason": {"all_queries_too_long": True}}
 
         # Execute search using Ray execution pool
         try:
-            result_text, metadata = await self.execution_pool.execute.remote(self.execute_search, instance_id, query_list_from_params, self.retrieval_service_url, self.topk, timeout)
-            
-            # Store results in instance dictionary
-            self._instance_dict[instance_id]["reward"].append(result_text.strip())
+            # If some queries are invalid, execute the search only for valid ones
+            if all_valid:
+                # Fast path: execute with full list
+                result_text, metadata = await self.execution_pool.execute.remote(
+                    self.execute_search, instance_id, query_list_from_params, self.retrieval_service_url, self.topk, timeout
+                )
+                # Store results in instance dictionary
+                self._instance_dict[instance_id]["reward"].append(result_text.strip())
+                # Convert metadata to metrics
+                metrics = {
+                    "query_count": metadata.get("query_count", 0),
+                    "status": metadata.get("status", "unknown"),
+                    "total_results": metadata.get("total_results", 0),
+                    "api_request_error": metadata.get("api_request_error"),
+                    "partially_skipped": False,
+                }
+                return result_text, 0.0, metrics
 
-            # Convert metadata to metrics
-            metrics = {"query_count": metadata.get("query_count", 0), "status": metadata.get("status", "unknown"), "total_results": metadata.get("total_results", 0), "api_request_error": metadata.get("api_request_error")}
+            # Partial valid: run on the subset, then merge back with placeholders
+            valid_queries = [q for q, ok in zip(query_list_from_params, valid_mask) if ok]
+            result_text_valid, metadata = await self.execution_pool.execute.remote(
+                self.execute_search, instance_id, valid_queries, self.retrieval_service_url, self.topk, timeout
+            )
+            # Store subset results
+            self._instance_dict[instance_id]["reward"].append(result_text_valid.strip())
 
-            return result_text, 0.0, metrics
+            # Parse valid results into a list
+            try:
+                parsed = json.loads(result_text_valid)
+                result_obj = parsed.get("result", parsed)
+                if isinstance(result_obj, list):
+                    valid_results = result_obj
+                else:
+                    valid_results = [str(result_obj)]
+            except Exception:
+                valid_results = [result_text_valid]
+
+            # Reconstruct full results aligned with the original input order
+            full_results = []
+            it = iter(valid_results)
+            for q, ok in zip(query_list_from_params, valid_mask):
+                if ok:
+                    full_results.append(next(it, "[No results returned]"))
+                else:
+                    full_results.append(f"[Search skipped] Query too long: '{str(q)[:128]}'")
+
+            metrics = {
+                "query_count": len(query_list_from_params),
+                "status": metadata.get("status", "unknown"),
+                "total_results": metadata.get("total_results", 0),
+                "api_request_error": metadata.get("api_request_error"),
+                "partially_skipped": True,
+                "skipped_indices": [i for i, ok in enumerate(valid_mask) if not ok],
+            }
+            return json.dumps({"result": full_results}), 0.0, metrics
 
         except Exception as e:
             error_result = json.dumps({"result": f"Search execution failed: {e}"})
