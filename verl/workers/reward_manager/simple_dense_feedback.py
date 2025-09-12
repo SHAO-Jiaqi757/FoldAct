@@ -1561,16 +1561,21 @@ class SimpleDenseFeedbackRewardManager:
             self.file_logger.info(f"Final valid response length: {valid_response_length}")
             
             # Get valid response IDs
+            # Use the computed valid_response_length when it is within bounds (<= total length).
+            # Avoid arbitrary truncation to 100 which caused severe misalignment with component spans.
             if len(response_ids_shape) >= 2:
-                if valid_response_length > 0 and valid_response_length < response_ids.shape[1]:
+                total_len = int(response_ids.shape[1])
+                if valid_response_length > 0 and valid_response_length <= total_len:
                     valid_response_ids = response_ids[0, :valid_response_length]
                 else:
-                    valid_response_ids = response_ids[0, :100]
+                    # Fallback to the maximum available length
+                    valid_response_ids = response_ids[0, :total_len]
             else:
-                if valid_response_length > 0 and valid_response_length < len(response_ids):
+                total_len = int(len(response_ids))
+                if valid_response_length > 0 and valid_response_length <= total_len:
                     valid_response_ids = response_ids[:valid_response_length]
                 else:
-                    valid_response_ids = response_ids[:100]
+                    valid_response_ids = response_ids[:total_len]
             
             # Ensure valid_response_ids is 1D tensor
             if valid_response_ids.dim() > 1:
@@ -1655,17 +1660,21 @@ class SimpleDenseFeedbackRewardManager:
             feedback = self.analyze_trajectory_sync(components, ground_truth, question)
             
             # Create dense reward tensor with no hard cap on length
-            # Align reward length to the actually used response token count
+            # Align reward length to the actual component spans to prevent clamping
             try:
-                target_length = int(valid_response_ids.shape[0])
+                max_span = max((c.end_token_idx for c in components), default=0)
+                target_length = int(max_span)
+                # As a safety net, ensure at least the visible decoded length
+                visible_len = int(getattr(valid_response_ids, 'shape', [0])[0]) if hasattr(valid_response_ids, 'shape') else int(valid_response_length)
+                if visible_len > 0:
+                    target_length = max(target_length, visible_len)
             except Exception:
                 # Fallback: use computed valid_response_length if available; otherwise default to 0 (handled downstream)
                 target_length = int(valid_response_length) if 'valid_response_length' in locals() else 0
             dense_reward = self.create_dense_reward_tensor(feedback, target_length)
             
             # Print analysis summary
-            if item_index < self.num_examine:
-                self._print_analysis_summary(data_source, item_index, response_str, ground_truth, components, feedback, dense_reward)
+            self._print_analysis_summary(data_source, item_index, response_str, ground_truth, components, feedback, dense_reward)
             
             self.file_logger.info(f"Item {item_index+1} processing completed successfully")
             
