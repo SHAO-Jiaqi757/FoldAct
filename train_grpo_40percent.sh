@@ -29,7 +29,9 @@ export EXPERIMENT_NAME=nq-search-r1-grpo-qwen2.5-3b-it-40percent
 export TRAIN_DATA_DIR='/datapool/data/deepresearcher'
 export TEST_DATA_DIR='/datapool/data/deepresearcher'
 # set -x
-export VLLM_ATTENTION_BACKEND=XFORMERS
+# Use vLLM V1 engine for AsyncLLM; ensure no legacy attention backend is enforced
+export VLLM_USE_V1=1
+unset VLLM_ATTENTION_BACKEND
 # export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True  # Not compatible with vLLM memory pool
 export CUDA_LAUNCH_BLOCKING=1
 export VLLM_USE_MODELSCOPE=false
@@ -58,23 +60,10 @@ export NCCL_SOCKET_IFNAME=bond0
 export NCCL_SOCKET_DISABLE_IPV6=1
 export NCCL_IB_DISABLE=0              
 
-NCCL_DEBUG=INFO NCCL_SOCKET_IFNAME=bond0 NCCL_SOCKET_DISABLE_IPV6=1 \
-python - <<'PYCODE'
-import torch.distributed as dist
-
-# 单机: world_size=1, rank=0, 用 tcp://127.0.0.1 rendezvous
-dist.init_process_group(
-    backend="nccl",
-    init_method="tcp://127.0.0.1:29500",
-    world_size=1,
-    rank=0
-)
-print(">>> NCCL single-process init OK")
-dist.destroy_process_group()
-PYCODE
+NCCL_DEBUG=INFO NCCL_SOCKET_IFNAME=bond0 NCCL_SOCKET_DISABLE_IPV6=1 
 
 nvidia-smi -i 4,5 -c EXCLUSIVE_PROCESS
-
+export HYDRA_FULL_ERROR=1
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.train_files=$TRAIN_DATA_DIR/train_transformed.parquet \
     data.val_files=$TEST_DATA_DIR/test_transformed.parquet \
@@ -82,8 +71,8 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.reward_fn_key=data_source \
     data.train_batch_size=128 \
     data.val_batch_size=8 \
-    data.max_prompt_length=2048 \
-    data.max_response_length=512 \
+    data.max_prompt_length=16384 \
+    data.max_response_length=1024 \
     algorithm.adv_estimator=grpo \
     actor_rollout_ref.model.path=$BASE_MODEL \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
@@ -101,8 +90,12 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size=64 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.mode=async \
+    actor_rollout_ref.rollout.chat_scheduler=search_r1.async_runtime.naive_chat_scheduler.NaiveChatCompletionScheduler \
+    actor_rollout_ref.rollout.max_num_batched_tokens=24000 \
+    actor_rollout_ref.rollout.enable_chunked_prefill=True \
     env.rollout.n=5 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.75 \
     actor_rollout_ref.ref.log_prob_micro_batch_size=64 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
@@ -141,5 +134,5 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +data.shuffle_train_dataloader=True \
     +actor_rollout_ref.actor.fsdp_config.grad_offload=true \
     +algorithm.no_think_rl=false \
-    +actor_rollout_ref.rollout.n_agent=1 \
+    +actor_rollout_ref.rollout.n_agent=8 \
     2>&1 | tee $EXPERIMENT_NAME.log

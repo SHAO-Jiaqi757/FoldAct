@@ -77,11 +77,15 @@ class LLMGenerationManager:
         actor_rollout_wg,
         config: GenerationConfig,
         is_validation: bool = False,
+        async_rollout_manager=None,
+        use_async: bool = False,
     ):
         self.tokenizer = tokenizer
         self.actor_rollout_wg = actor_rollout_wg
         self.config = config
         self.is_validation = is_validation
+        self.async_rollout_manager = async_rollout_manager
+        self.use_async = use_async
 
 
         self.tensor_fn = TensorHelper(TensorConfig(
@@ -259,6 +263,8 @@ class LLMGenerationManager:
         """
         num_gpus = self.config.num_gpus
         if num_gpus <= 1:
+            if self.use_async and self.async_rollout_manager is not None:
+                return self.async_rollout_manager.generate_sequences(active_batch)
             return self.actor_rollout_wg.generate_sequences(active_batch)
             
         batch_size = active_batch.batch['input_ids'].shape[0]
@@ -267,6 +273,8 @@ class LLMGenerationManager:
         for key in active_batch.batch.keys():
             active_batch.batch[key] = active_batch.batch[key].long()
         if remainder == 0:
+            if self.use_async and self.async_rollout_manager is not None:
+                return self.async_rollout_manager.generate_sequences(active_batch)
             return self.actor_rollout_wg.generate_sequences(active_batch)
         
         # Add padding sequences
@@ -283,7 +291,10 @@ class LLMGenerationManager:
             padded_active_batch.batch[key] = padded_active_batch.batch[key].long()
 
         # Generate with padded batch
-        padded_output = self.actor_rollout_wg.generate_sequences(padded_active_batch)
+        if self.use_async and self.async_rollout_manager is not None:
+            padded_output = self.async_rollout_manager.generate_sequences(padded_active_batch)
+        else:
+            padded_output = self.actor_rollout_wg.generate_sequences(padded_active_batch)
 
         # Remove padding from output
         trimmed_batch = {k: v[:-padding_size] for k, v in padded_output.batch.items()}

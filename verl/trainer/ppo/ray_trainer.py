@@ -996,6 +996,10 @@ class RayPPOTrainer:
         self.async_rollout_mode = False
         if self.config.actor_rollout_ref.rollout.mode == "async":
             self.async_rollout_mode = True
+            # Provide a default scheduler if not specified
+            if OmegaConf.select(self.config.actor_rollout_ref.rollout, "chat_scheduler") in [None, "null", "None", ""]:
+                # Use minimal scheduler that decodes tokenized prompts into a single user message
+                self.config.actor_rollout_ref.rollout.chat_scheduler = "search_r1.async_runtime.naive_chat_scheduler.NaiveChatCompletionScheduler"
             self.async_rollout_manager = AsyncLLMServerManager(
                 config=self.config.actor_rollout_ref,
                 worker_group=self.actor_rollout_wg,
@@ -1192,6 +1196,8 @@ class RayPPOTrainer:
             tokenizer=self.tokenizer,
             actor_rollout_wg=self.actor_rollout_wg,
             config=gen_config,
+            async_rollout_manager=self.async_rollout_manager if getattr(self, "async_rollout_mode", False) else None,
+            use_async=getattr(self, "async_rollout_mode", False),
         )        
         # Start training Loop
         for epoch in range(self.config.trainer.total_epochs):
@@ -1224,7 +1230,13 @@ class RayPPOTrainer:
                 with _timer("step", timing_raw):
                     # generate a batch
                     if not self.config.do_search:
-                        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                        if not self.async_rollout_mode:
+                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                        else:
+                            # Ensure engine is active for latest weights/cache
+                            self.async_rollout_manager.wake_up()
+                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                            self.async_rollout_manager.sleep()
 
                         # Assign unique IDs per original prompt; also set traj_uid for compatibility
                         batch.non_tensor_batch['uid'] = np.array(
