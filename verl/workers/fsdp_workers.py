@@ -783,7 +783,15 @@ class ActorRolloutRefWorker(Worker):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
-        self.checkpoint_manager.load_checkpoint(local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load)
+        import os
+        import torch
+        ws = torch.distributed.get_world_size()
+        rk = torch.distributed.get_rank()
+        expected = os.path.join(local_path, f"model_world_size_{ws}_rank_{rk}.pt")
+        if not os.path.exists(expected):
+            print(f"[FSDP Actor rank={rk}] Expected checkpoint shard not found: {expected}. Skipping resume for this worker.")
+        else:
+            self.checkpoint_manager.load_checkpoint(local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load)
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
@@ -1115,7 +1123,14 @@ class CriticWorker(Worker):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.critic_module)
 
-        self.checkpoint_manager.load_checkpoint(local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load)
+        import os
+        ws = torch.distributed.get_world_size()
+        rk = torch.distributed.get_rank()
+        expected = os.path.join(local_path, f"model_world_size_{ws}_rank_{rk}.pt")
+        if not os.path.exists(expected):
+            print(f"[FSDP Critic rank={rk}] Expected checkpoint shard not found: {expected}. Skipping resume for this worker.")
+        else:
+            self.checkpoint_manager.load_checkpoint(local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load)
 
         torch.distributed.barrier()
         if self._is_offload_param:

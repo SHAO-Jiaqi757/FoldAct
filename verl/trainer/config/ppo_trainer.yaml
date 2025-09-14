@@ -7,6 +7,9 @@ data:
   reward_fn_key: data_source
   max_prompt_length: 512
   max_response_length: 512
+  # Optional fields used by Search-R1 generation manager
+  max_start_length: 512
+  max_obs_length: 640
   train_batch_size: 1024
   val_batch_size: null
   return_raw_input_ids: False  # This should be set to true when the tokenizer between policy and rm differs
@@ -59,6 +62,8 @@ actor_rollout_ref:
     invalid_action_penalty_coef: 0.1
     use_kl_loss: False # True for GRPO
     use_torch_compile: True # False to disable torch compile
+    # Whether to apply state-masking logic in Search-R1 training loop
+    state_masking: False
     kl_loss_coef: 0.001 # for grpo
     kl_loss_type: low_var_kl # for grpo
     ppo_epochs: 1
@@ -101,6 +106,10 @@ actor_rollout_ref:
   rollout:
     name: vllm
     mode: sync # sync: LLM, async: AsyncLLM
+    # Optional: if false, use internal executor to avoid attaching to FSDP workers
+    external_executor: True
+    # Optional: pin async rollout engine to a specific physical GPU (e.g., 1 for RTX 3090)
+    cuda_visible_devices: null
     chat_scheduler: null # async chat scheduler, e.g examples.ppo_trainer.naive_chat_scheduler.NaiveChatCompletionScheduler
     temperature: 1.0
     top_k: -1 # 0 for hf rollout, -1 for vllm rollout
@@ -128,6 +137,8 @@ actor_rollout_ref:
     log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
     disable_log_stats: True
     enable_chunked_prefill: True # may get higher throughput when set to True. When activated, Please increase max_num_batched_tokens or decrease max_model_len.
+    # Number of agents per sample for Search-R1 GRPO
+    n_agent: 1
     # for hf rollout
     do_sample: True
     # number of responses (i.e. num sample times)
@@ -251,6 +262,8 @@ algorithm:
   gigpo:
     step_advantage_w: 1.0
     mode: "mean_norm" # "mean_norm" or "mean_std_norm"
+  # Search-R1 specific flag to strip think tokens when computing reward
+  no_think_rl: False
   filter_groups: # DAPO from https://arxiv.org/abs/2503.14476
     enable: False
     max_num_gen_batches: 10
@@ -308,4 +321,19 @@ env:
     human_goals: False
 
 do_search: true
+
+# Search-R1 generation parameters expected at the top-level
+# Max multi-turn steps for the agent (required by GenerationConfig)
+max_turns: 2
+# Whether to run a final retrieval/search operation before producing the final answer
+final_turn_do_search: false
+
+# Retriever settings used by SearchTool; can be overridden via CLI
+retriever:
+  url: null
+  topk: 3
+  num_workers: 5
+  rate_limit: 120
+  timeout: 30
+  enable_global_rate_limit: true
   

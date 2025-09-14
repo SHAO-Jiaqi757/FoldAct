@@ -169,3 +169,23 @@ def get_checkpoint_tracker_filename(root_path: str):
     Tracker file rescords the latest chckpoint during training to restart from.
     """
     return os.path.join(root_path, "latest_checkpointed_iteration.txt")
+
+
+def is_fsdp_ckpt_compatible(ckpt_dir: str, expected_world_size: int) -> bool:
+    """
+    Check whether an FSDP checkpoint directory contains per-rank shards for the
+    expected world size. This is a lightweight filesystem check to avoid runtime
+    errors when resuming with a different number of GPUs.
+
+    It returns True if files like
+      model_world_size_{expected_world_size}_rank_0.pt
+    exist (rank_0 is a good proxy for the whole set), otherwise False.
+    """
+    if ckpt_dir is None:
+        return False
+    try:
+        fname = f"model_world_size_{expected_world_size}_rank_0.pt"
+        path = os.path.join(ckpt_dir, fname)
+        return os.path.exists(path)
+    except Exception:
+        return False

@@ -13,6 +13,7 @@
 # limitations under the License.
 import logging
 from collections.abc import AsyncGenerator
+import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import cloudpickle
@@ -161,12 +162,32 @@ class AsyncvLLMServer(AsyncServerBase):
                 kwargs[k] = config.get(k)
         print(f"override_generation_config: {kwargs}")
 
-        engine_args = AsyncEngineArgs(
+        # Optional isolation: use internal executor and pin to dedicated GPUs
+        use_external_exec = config.get("external_executor", True)
+        cuda_visible = config.get("cuda_visible_devices", None)
+        if cuda_visible is not None:
+            # Accept int/str/list, normalize, then select per-DP-rank when multiple provided
+            if isinstance(cuda_visible, (list, tuple)):
+                dev_list = [str(x).strip() for x in cuda_visible]
+            else:
+                raw = str(cuda_visible).strip()
+                if raw.startswith("[") and raw.endswith("]"):
+                    raw = raw[1:-1]
+                dev_list = [x.strip() for x in raw.split(",") if x.strip()]
+            # Select device(s) for this DP rank
+            if len(dev_list) == 0:
+                pass
+            elif len(dev_list) == 1:
+                os.environ["CUDA_VISIBLE_DEVICES"] = dev_list[0]
+            else:
+                sel = dev_list[self.vllm_dp_rank % len(dev_list)]
+                os.environ["CUDA_VISIBLE_DEVICES"] = sel
+
+        engine_args_kwargs = dict(
             model=local_path,
             enable_sleep_mode=True,
             override_generation_config=kwargs,
             tensor_parallel_size=tensor_parallel_size,
-            distributed_executor_backend=ExternalRayDistributedExecutor,
             dtype=config.dtype,
             enforce_eager=config.enforce_eager,
             gpu_memory_utilization=config.gpu_memory_utilization,
@@ -182,11 +203,19 @@ class AsyncvLLMServer(AsyncServerBase):
             trust_remote_code=trust_remote_code,
             seed=self.vllm_dp_rank,
         )
+        if use_external_exec:
+            engine_args = AsyncEngineArgs(
+                distributed_executor_backend=ExternalRayDistributedExecutor,
+                **engine_args_kwargs,
+            )
+        else:
+            engine_args = AsyncEngineArgs(**engine_args_kwargs)
 
         # init async llm engine
         vllm_config = engine_args.create_engine_config()
-        namespace = ray.get_runtime_context().namespace
-        vllm_config.instance_id = f"{namespace}:{self.wg_prefix}:{self.vllm_dp_size}:{self.vllm_dp_rank}"
+        if use_external_exec:
+            namespace = ray.get_runtime_context().namespace
+            vllm_config.instance_id = f"{namespace}:{self.wg_prefix}:{self.vllm_dp_size}:{self.vllm_dp_rank}"
         self.engine = AsyncLLM.from_vllm_config(vllm_config)
 
         # build serving chat
@@ -213,7 +242,9 @@ class AsyncvLLMServer(AsyncServerBase):
         generator = await self.openai_serving_chat.create_chat_completion(request, raw_request)
 
         if isinstance(generator, ErrorResponse):
-            return JSONResponse(content=generator.model_dump(), status_code=generator.code)
+            # Some versions expose `code`, others may not. Fall back to 400.
+            status = getattr(generator, "code", 400)
+            return JSONResponse(content=generator.model_dump(), status_code=status)
         if request.stream:
             return StreamingResponse(content=generator, media_type="text/event-stream")
         else:

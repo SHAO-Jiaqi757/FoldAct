@@ -89,6 +89,20 @@ class vLLMRollout(BaseRollout):
         self.config = config
         assert not (not config.enforce_eager and config.free_cache_engine), "disable CUDA graph (enforce_eager = False) if free cache engine"
 
+        # Optional: pin vLLM engine to specific physical GPUs for isolation
+        cuda_visible = self.config.get("cuda_visible_devices", None)
+        if cuda_visible is not None:
+            # Accept int/str/list, normalize to 'id,id,...' without brackets/spaces
+            if isinstance(cuda_visible, (list, tuple)):
+                devs = ",".join(str(x) for x in cuda_visible)
+            else:
+                devs = str(cuda_visible).strip()
+                if devs.startswith("[") and devs.endswith("]"):
+                    devs = devs[1:-1]
+                devs = devs.replace(" ", "")
+            os.environ["CUDA_VISIBLE_DEVICES"] = devs
+            logger.info(f"Set CUDA_VISIBLE_DEVICES to {devs}")
+
         tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
         assert tensor_parallel_size <= torch.distributed.get_world_size(), "tensor parallel size should be less than or equal to the world size"
         max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)

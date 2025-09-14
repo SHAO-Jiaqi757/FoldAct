@@ -67,16 +67,53 @@ class NaiveChatCompletionScheduler(ChatCompletionScheduler):
                 content = ""
             responses[idx] = content
 
+        # Helper to estimate prompt tokens and clamp max tokens to fit max_model_len
+        def _estimate_prompt_tokens(msgs: List[Dict[str, str]]) -> int:
+            # Simple heuristic: concatenate role/content and tokenize with HF tokenizer.
+            # This underestimates vLLM chat-template tokens, so add a small margin below.
+            text = "\n".join([f"{m.get('role', 'user')}: {m.get('content', '')}" for m in msgs])
+            tok = self.tokenizer([text], add_special_tokens=False, return_tensors='pt', padding='longest')
+            return int(tok['input_ids'].shape[1])
+
+        max_model_len = int(self.config.max_model_len) if getattr(self.config, 'max_model_len', None) else int(self.config.prompt_length + self.config.response_length)
+        # Leave generous headroom for chat template/system tokens
+        safety_margin = 192
+        # Ensure at least this many tokens are available for generation
+        min_gen_reserve = min(256, int(self.config.response_length))
+
+        # Proactively truncate overlong prompts by token budget to avoid vLLM input overflow.
+        # Keep the most recent tokens (right-side) to preserve latest context.
+        truncated_messages_list: List[List[Dict[str, str]]] = []
+        for msgs in messages_list:
+            text = "\n".join([f"{m.get('role', 'user')}: {m.get('content', '')}" for m in msgs])
+            tok = self.tokenizer([text], add_special_tokens=False, return_tensors='pt', padding='longest')
+            ids = tok['input_ids'][0]
+            allowed_prompt_tokens = max(1, max_model_len - safety_margin - min_gen_reserve)
+            if ids.shape[0] > allowed_prompt_tokens:
+                trimmed_ids = ids[-allowed_prompt_tokens:]
+                trimmed_text = self.tokenizer.decode(trimmed_ids, skip_special_tokens=True)
+                truncated_messages_list.append([{ 'role': 'user', 'content': trimmed_text }])
+            else:
+                truncated_messages_list.append(msgs)
+        messages_list = truncated_messages_list
+
         # Fire off all requests concurrently
         tasks = []
         for i, messages in enumerate(messages_list):
+            est_prompt = _estimate_prompt_tokens(messages) + safety_margin
+            avail = max(1, max_model_len - est_prompt)
+            max_tok = max(1, min(int(kwargs.get('max_completion_tokens', self.config.response_length)), avail))
+            req_kwargs = dict(kwargs)
+            # Set both fields for compatibility
+            req_kwargs['max_completion_tokens'] = max_tok
+            req_kwargs['max_tokens'] = max_tok
             tasks.append(
                 self.submit_chat_completions(
                     callback=_callback,
                     callback_additional_info={"idx": i},
                     model=self.model_name,
                     messages=messages,
-                    **kwargs,
+                    **req_kwargs,
                 )
             )
 
@@ -92,4 +129,3 @@ class NaiveChatCompletionScheduler(ChatCompletionScheduler):
         resp_ids: torch.Tensor = tok["input_ids"]
 
         return DataProto.from_dict({"responses": resp_ids})
-

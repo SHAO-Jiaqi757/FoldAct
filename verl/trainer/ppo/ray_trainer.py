@@ -1087,11 +1087,27 @@ class RayPPOTrainer:
 
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, "critic")
+
+        # Guard against world_size mismatch by checking shard file presence.
+        from verl.utils.checkpoint.checkpoint_manager import is_fsdp_ckpt_compatible
+        expected_ws = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
+        if not is_fsdp_ckpt_compatible(actor_path, expected_ws):
+            print(f"[CHECKPOINT] Incompatible FSDP checkpoint shards for world_size={expected_ws} under {actor_path}.\n"
+                  f"- Expected file: model_world_size_{expected_ws}_rank_0.pt not found.\n"
+                  f"- Likely saved with a different world_size. Starting from scratch.")
+            self.global_steps = 0
+            return 0
+
         # load actor
         self.actor_rollout_wg.load_checkpoint(actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
         # load critic
         if self.use_critic:
-            self.critic_wg.load_checkpoint(critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
+            if not is_fsdp_ckpt_compatible(critic_path, expected_ws):
+                print(f"[CHECKPOINT] Incompatible FSDP checkpoint shards for world_size={expected_ws} under {critic_path}.\n"
+                      f"- Expected file: model_world_size_{expected_ws}_rank_0.pt not found.\n"
+                      f"- Skipping critic resume.")
+            else:
+                self.critic_wg.load_checkpoint(critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
 
         # load dataloader,
         # TODO: from remote not implemented yet
