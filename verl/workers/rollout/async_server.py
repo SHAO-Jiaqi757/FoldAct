@@ -298,12 +298,31 @@ class AsyncLLMServerManager:
         self.chat_scheduler_loop.run_forever()
 
     def wake_up(self):
-        """Wake up all vllm instances."""
+        """Wake up rollout: sync latest actor weights then warm the engines.
+
+        Two-phase:
+        1) Ask actor_rollout workers to wake_up -> triggers sharding_manager.__enter__
+           which pulls latest FSDP actor weights into the rollout engines.
+        2) Wake up HTTP engines to (re)build KV cache.
+        """
+        try:
+            # Phase 1: sync latest weights via rollout sharding manager on workers
+            # This calls vLLMAsyncRollout.wake_up(), which enters FSDPVLLMShardingManager
+            self.worker_group.execute_all_sync("execute_method", "wake_up")
+        except Exception as e:
+            print(f"[AsyncLLMServerManager] Warning: worker wake_up failed: {e}")
+        # Phase 2: wake up HTTP engines (cache build)
         ray.get([server.wake_up.remote() for server in self.async_llm_servers])
 
     def sleep(self):
-        """Sleep all vllm instances."""
+        """Sleep rollout: offload engines then release worker-side caches."""
+        # Phase 1: offload HTTP engines
         ray.get([server.sleep.remote() for server in self.async_llm_servers])
+        # Phase 2: ask workers to exit sharding context (offload weights)
+        try:
+            self.worker_group.execute_all_sync("execute_method", "sleep")
+        except Exception as e:
+            print(f"[AsyncLLMServerManager] Warning: worker sleep failed: {e}")
 
     def submit_chat_completions(
         self,
