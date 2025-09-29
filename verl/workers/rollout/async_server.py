@@ -239,6 +239,11 @@ class AsyncLLMServerManager:
 
         self.async_llm_servers = [None] * self.rollout_dp_size
         self.server_addresses = [None] * self.rollout_dp_size
+        self._is_awake = False
+        # For isolation mode hot-reload
+        # Accept either 'ckpt_dir' or 'checkpoint_root' via scheduler_kwargs
+        self.ckpt_dir = self.scheduler_kwargs.get("ckpt_dir") or self.scheduler_kwargs.get("checkpoint_root")
+        self._last_hf_dir: str | None = None
 
         server_class = async_server_class(
             rollout_backend=self.config.rollout.name,
@@ -287,32 +292,43 @@ class AsyncLLMServerManager:
         module_path, class_name = self.config.rollout.chat_scheduler.rsplit(".", 1)
         module = importlib.import_module(module_path)
         scheduler_cls = getattr(module, class_name)
+        # Filter out manager-only kwargs (e.g., ckpt_dir/checkpoint_root) not expected by schedulers
+        filtered_kwargs = dict(self.scheduler_kwargs)
+        filtered_kwargs.pop("ckpt_dir", None)
+        filtered_kwargs.pop("checkpoint_root", None)
         self.chat_scheduler = scheduler_cls(
             config=self.config.rollout,
             model_path=self.config.model.path,
             server_addresses=self.server_addresses,
-            **self.scheduler_kwargs,
+            **filtered_kwargs,
         )
 
         self.chat_scheduler_ready.set()
         self.chat_scheduler_loop.run_forever()
 
     def wake_up(self):
-        """Wake up rollout: sync latest actor weights then warm the engines.
+        """Wake up rollout: ensure latest weights and warm HTTP engines.
 
-        Two-phase:
-        1) Ask actor_rollout workers to wake_up -> triggers sharding_manager.__enter__
-           which pulls latest FSDP actor weights into the rollout engines.
-        2) Wake up HTTP engines to (re)build KV cache.
+        - external_executor=True: delegate weight sync to workers via sharding manager.
+        - external_executor=False: if ckpt_dir provided, reload engine when
+          latest HF checkpoint path changes; then warm engines.
         """
-        try:
-            # Phase 1: sync latest weights via rollout sharding manager on workers
-            # This calls vLLMAsyncRollout.wake_up(), which enters FSDPVLLMShardingManager
-            self.worker_group.execute_all_sync("execute_method", "wake_up")
-        except Exception as e:
-            print(f"[AsyncLLMServerManager] Warning: worker wake_up failed: {e}")
-        # Phase 2: wake up HTTP engines (cache build)
+        if self.config.rollout.get("external_executor", True):
+            try:
+                self.worker_group.execute_all_sync("execute_method", "wake_up")
+            except Exception as e:
+                print(f"[AsyncLLMServerManager] Warning: worker wake_up failed: {e}")
+        else:
+            # Isolation mode: reload to latest HF export if present
+            if self.ckpt_dir:
+                from search_r1.utils.ckpt_utils import find_latest_hf_checkpoint
+                hf_dir = find_latest_hf_checkpoint(self.ckpt_dir)
+                if hf_dir and hf_dir != self._last_hf_dir:
+                    print(f"[AsyncLLMServerManager] Reloading servers to HF checkpoint: {hf_dir}")
+                    ray.get([server.reload_model_from_hf_dir.remote(hf_dir) for server in self.async_llm_servers])
+                    self._last_hf_dir = hf_dir
         ray.get([server.wake_up.remote() for server in self.async_llm_servers])
+        self._is_awake = True
 
     def sleep(self):
         """Sleep rollout: offload engines then release worker-side caches."""
@@ -323,6 +339,40 @@ class AsyncLLMServerManager:
             self.worker_group.execute_all_sync("execute_method", "sleep")
         except Exception as e:
             print(f"[AsyncLLMServerManager] Warning: worker sleep failed: {e}")
+        self._is_awake = False
+
+    def ensure_ready(self):
+        """Ensure servers are ready with the latest weights without redundant wake/sleep."""
+        if self.config.rollout.get("external_executor", True):
+            self.wake_up()
+            return
+
+        # Isolation mode: reload only when HF path changes
+        if self.ckpt_dir:
+            from search_r1.utils.ckpt_utils import find_latest_hf_checkpoint, delete_last_checkpoint, find_latest_actor_checkpoint
+            hf_dir = find_latest_hf_checkpoint(self.ckpt_dir)
+            if hf_dir and hf_dir != self._last_hf_dir:
+                print(f"[AsyncLLMServerManager] Reloading servers to HF checkpoint: {hf_dir}")
+                try:
+                    ray.get([server.reload_model_from_hf_dir.remote(hf_dir) for server in self.async_llm_servers])
+                    self._last_hf_dir = hf_dir
+                except Exception as e:
+                    print(f"[AsyncLLMServerManager] Reload failed for {hf_dir}: {e}. Attempting rollback...")
+                    # Attempt rollback: delete last checkpoint and retry latest
+                    try:
+                        delete_last_checkpoint(self.ckpt_dir)
+                    except Exception:
+                        pass
+                    # Retry
+                    hf_dir2 = find_latest_hf_checkpoint(self.ckpt_dir) or _get_vllm_loadable_dir(find_latest_actor_checkpoint(self.ckpt_dir))
+                    if hf_dir2 and hf_dir2 != hf_dir:
+                        print(f"[AsyncLLMServerManager] Retrying reload with {hf_dir2}")
+                        ray.get([server.reload_model_from_hf_dir.remote(hf_dir2) for server in self.async_llm_servers])
+                        self._last_hf_dir = hf_dir2
+
+        if not self._is_awake:
+            ray.get([server.wake_up.remote() for server in self.async_llm_servers])
+            self._is_awake = True
 
     def submit_chat_completions(
         self,
@@ -365,7 +415,6 @@ def async_server_class(rollout_backend: str) -> Type[AsyncServerBase]:
     """
     if rollout_backend == "vllm":
         from verl.workers.rollout.vllm_rollout.vllm_async_server import AsyncvLLMServer
-
         return AsyncvLLMServer
     elif rollout_backend == "sglang":
         from verl.workers.rollout.sglang_rollout.async_sglang_server import AsyncSglangServer
@@ -373,3 +422,24 @@ def async_server_class(rollout_backend: str) -> Type[AsyncServerBase]:
         return AsyncSglangServer
     else:
         raise NotImplementedError
+
+def _get_vllm_loadable_dir(maybe_actor_dir: str) -> str | None:
+    """Return a path that vLLM can load as `model`.
+
+    Preference order:
+    - <actor_dir>/huggingface (expected HF export)
+    - <actor_dir> itself if it looks like HF (contains config.json)
+    Else return None.
+    """
+    try:
+        if not maybe_actor_dir:
+            return None
+        hf_sub = os.path.join(maybe_actor_dir, "huggingface")
+        if os.path.isdir(hf_sub):
+            return hf_sub
+        cfg = os.path.join(maybe_actor_dir, "config.json")
+        if os.path.isfile(cfg):
+            return maybe_actor_dir
+    except Exception:
+        pass
+    return None

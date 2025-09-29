@@ -1334,16 +1334,64 @@ class SimpleDenseFeedbackRewardManager:
             "llm_evaluation_results": llm_evaluation_results
         }
 
+    async def _analyze_reasoning_grounding_async(self, sorted_components: List[TrajectoryComponent], 
+                                    question: str,
+                                    information_components: List[TrajectoryComponent],
+                                    reasoning_components: List[TrajectoryComponent]) -> Dict:
+        """Async reasoning grounding evaluation using concurrent LLM calls.
+
+        - Evidence: built from information components.
+        - Targets: search and think components.
+        """
+        # Build evidence corpus from information components
+        info_evidence = [
+            {"content": info_comp.content, "type": "search_result", "step": info_comp.step_number}
+            for info_comp in information_components
+            if getattr(info_comp, 'content', None) is not None and str(info_comp.content).strip() != ""
+        ]
+
+        async def eval_one(comp: TrajectoryComponent) -> Dict[str, Any]:
+            if not question:
+                logger.info("No question context; treating grounding as neutral (no bonus)")
+                return {"premise_grounding": "Unspecified", "evaluation_success": False, "fallback": True}
+            candidates = [e for e in info_evidence if e.get("step", 0) <= comp.step_number]
+            if candidates:
+                last_step = max(e.get("step", 0) for e in candidates)
+                step_evidence = [e for e in candidates if e.get("step", 0) == last_step]
+            else:
+                step_evidence = []
+            if not step_evidence:
+                logger.info("Skipping grounding LLM evaluation: empty evidence for current step")
+                return {"premise_grounding": "Unspecified", "evaluation_success": False, "fallback": True}
+            try:
+                return await self.llm_evaluator.evaluate_reasoning_grounding(comp.content, step_evidence, question)
+            except Exception as e:
+                logger.error(f"Async LLM grounding evaluation failed: {e}")
+                return {"premise_grounding": "Unspecified", "evaluation_success": False, "fallback": True}
+
+        # Launch all evaluations concurrently
+        tasks = [eval_one(comp) for comp in reasoning_components]
+        grounding_results: List[Dict[str, Any]] = await asyncio.gather(*tasks, return_exceptions=False)
+        # Attach trace fields
+        for res, comp in zip(grounding_results, reasoning_components):
+            res["_analyzed_component_type"] = comp.component_type
+            res["_step"] = comp.step_number
+
+        grounded_count = sum(1 for r in grounding_results if r.get("premise_grounding") == "Directly Grounded")
+        total_count = len(grounding_results)
+        reasoning_grounded = grounded_count > 0 and (grounded_count / max(1, total_count)) >= 0.5
+        return {
+            "reasoning_grounded": reasoning_grounded,
+            "grounding_details": f"LLM evaluation (search/think): {grounded_count}/{total_count} grounded",
+            "grounding_results": grounding_results
+        }
+
     def _analyze_reasoning_grounding(self, sorted_components: List[TrajectoryComponent], 
                                     question: str,
                                     search_components: List[TrajectoryComponent],
                                     information_components: List[TrajectoryComponent],
                                     reasoning_components: List[TrajectoryComponent]) -> Dict:
-        """Analyze reasoning grounding for search/think steps using information evidence.
-
-        - Evidence: use information components (search results/snippets), not search queries.
-        - Targets: evaluate grounding for search and think components (reasoning text and queries).
-        """
+        """Analyze reasoning grounding. If LLM is available, run async concurrent LLM calls via thread-safe runner."""
         if not self.llm_evaluator:
             logger.warning("LLM evaluator not available; treating grounding as neutral/ungrounded and logging only")
             grounding_results = []
@@ -1362,52 +1410,13 @@ class SimpleDenseFeedbackRewardManager:
                 "grounding_details": f"LLM unavailable: {grounded_count}/{total_count} grounded",
                 "grounding_results": grounding_results,
             }
-
-        # Build evidence corpus from information components
-        info_evidence = [
-            {"content": info_comp.content, "type": "search_result", "step": info_comp.step_number}
-            for info_comp in information_components
-            if getattr(info_comp, 'content', None) is not None and str(info_comp.content).strip() != ""
-        ]
-
-        grounding_results = []
-        # Evaluate grounding for each search/think step using only the most recent information step (<= current step)
-        for comp in reasoning_components:
-            if question:
-                # Candidate evidence up to current think step
-                candidates = [e for e in info_evidence if e.get("step", 0) <= comp.step_number]
-                if candidates:
-                    last_step = max(e.get("step", 0) for e in candidates)
-                    step_evidence = [e for e in candidates if e.get("step", 0) == last_step]
-                else:
-                    step_evidence = []
-                # If evidence is empty, do NOT call LLM evaluator
-                if not step_evidence:
-                    logger.info("Skipping grounding LLM evaluation: empty evidence for current step")
-                    result = {
-                        "premise_grounding": "Unspecified",
-                        "evaluation_success": False,
-                        "fallback": True,
-                    }
-                else:
-                    result = self._evaluate_reasoning_grounding(comp.content, step_evidence, question)
-            else:
-                # No question context: do not default to grounded; treat as neutral
-                logger.info("No question context; treating grounding as neutral (no bonus)")
-                result = {"premise_grounding": "Unspecified", "evaluation_success": False, "fallback": True}
-            # Attach some trace for debugging
-            result["_analyzed_component_type"] = comp.component_type
-            result["_step"] = comp.step_number
-            grounding_results.append(result)
-
-        grounded_count = sum(1 for r in grounding_results if r.get("premise_grounding") == "Directly Grounded")
-        total_count = len(grounding_results)
-        reasoning_grounded = grounded_count > 0 and (grounded_count / max(1, total_count)) >= 0.5
-        return {
-            "reasoning_grounded": reasoning_grounded,
-            "grounding_details": f"LLM evaluation (search/think): {grounded_count}/{total_count} grounded",
-            "grounding_results": grounding_results
-        }
+        # Run async version concurrently
+        return self._run_async(self._analyze_reasoning_grounding_async(
+            sorted_components,
+            question,
+            information_components,
+            reasoning_components,
+        ))
 
 
     

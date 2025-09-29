@@ -1003,6 +1003,10 @@ class RayPPOTrainer:
             self.async_rollout_manager = AsyncLLMServerManager(
                 config=self.config.actor_rollout_ref,
                 worker_group=self.actor_rollout_wg,
+                scheduler_kwargs={
+                    # Pass the trainer checkpoint root so async servers can hot-reload HF exports
+                    "ckpt_dir": self.config.trainer.default_local_dir,
+                },
             )
 
     def _save_checkpoint(self):
@@ -1080,6 +1084,8 @@ class RayPPOTrainer:
                     global_step_folder = os.path.join(working_dir, global_step_folder)
         print(f"Load from checkpoint folder: {global_step_folder}")
         # set global step
+        if global_step_folder is None:
+            return 0
         self.global_steps = int(global_step_folder.split("global_step_")[-1])
 
         print(f"Setting global step to {self.global_steps}")
