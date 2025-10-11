@@ -107,7 +107,35 @@ class LLMGenerationManager:
             padding="longest",
             return_offsets_mapping=True
         )
-        return result['input_ids'], result['offset_mapping'][:, :, 0]
+        input_ids = result['input_ids']
+        # Be robust to tokenizer implementations that return 2-D or 3-D offset mappings.
+        # Expected: (batch, seq_len, 2) -> take start offsets [:, :, 0].
+        # Some tokenizers may already return (batch, seq_len) of start offsets.
+        offsets = result.get('offset_mapping', None)
+        if offsets is None:
+            # Fallback: no offsets available; return zeros with same shape as input_ids.
+            start_offsets = torch.zeros_like(input_ids)
+        else:
+            if isinstance(offsets, torch.Tensor):
+                if offsets.dim() == 3 and offsets.size(-1) >= 1:
+                    start_offsets = offsets[:, :, 0]
+                elif offsets.dim() == 2:
+                    start_offsets = offsets
+                else:
+                    start_offsets = torch.zeros_like(input_ids)
+            else:
+                # Convert to tensor if tokenizer returned a list
+                try:
+                    offsets_tensor = torch.tensor(offsets)
+                    if offsets_tensor.dim() == 3 and offsets_tensor.size(-1) >= 1:
+                        start_offsets = offsets_tensor[:, :, 0]
+                    elif offsets_tensor.dim() == 2:
+                        start_offsets = offsets_tensor
+                    else:
+                        start_offsets = torch.zeros_like(input_ids)
+                except Exception:
+                    start_offsets = torch.zeros_like(input_ids)
+        return input_ids, start_offsets
 
     def _postprocess_responses(self, responses: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, str]:
         """Process responses to stop at search operation or answer operation."""
@@ -464,7 +492,11 @@ class LLMGenerationManager:
         for i in range(len(responses_ids)):
             if action_ranges[i]:
                 # Keep only until the last non-zero index for searchsorted() to work
-                last_nonzero_idx = (responses_offsets[i] != 0).nonzero(as_tuple=True)[0][-1]
+                nonzero_idx = (responses_offsets[i] != 0).nonzero(as_tuple=True)[0]
+                if nonzero_idx.numel() == 0:
+                    # No valid offsets; skip labeling for this sample
+                    continue
+                last_nonzero_idx = nonzero_idx[-1]
                 valid_offsets = responses_offsets[i][:last_nonzero_idx+1]
 
                 # Select the smallest range of tokens to FULLY contain the action substring

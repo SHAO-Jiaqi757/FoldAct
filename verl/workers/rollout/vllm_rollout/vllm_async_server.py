@@ -221,6 +221,7 @@ class AsyncvLLMServer(AsyncServerBase):
         # build serving chat
         model_config = self.engine.model_config
         BASE_MODEL_PATHS = [BaseModelPath(name=model_name, model_path=model_path)]
+        logger.info(f"[AsyncvLLMServer] Serving model alias: '{model_name}' -> path: '{model_path}'")
         models = OpenAIServingModels(self.engine, model_config, BASE_MODEL_PATHS)
         self.openai_serving_chat = OpenAIServingChat(
             self.engine,
@@ -280,3 +281,43 @@ class AsyncvLLMServer(AsyncServerBase):
         # TODO: https://github.com/vllm-project/vllm/issues/17103
         await self.engine.reset_prefix_cache()
         await self.engine.sleep()
+        
+    async def reload_model_from_hf_dir(self, hf_dir: str):
+        """Reload model from HuggingFace directory.
+        
+        Args:
+            hf_dir: str, huggingface model directory.
+        """
+        logger.info(f"[AsyncvLLMServer] Reloading model from {hf_dir}")
+        # First sleep the engine to free resources
+        await self.sleep()
+        
+        # Get current engine config and update the model path
+        vllm_config = self.engine.vllm_config
+        vllm_config.model = hf_dir
+        
+        # Create a new engine with the updated config
+        old_engine = self.engine
+        self.engine = AsyncLLM.from_vllm_config(vllm_config)
+        
+        # Update serving chat with the new engine
+        model_config = self.engine.model_config
+        # Preserve 2-level model name (e.g., "actor/huggingface") to match scheduler
+        tokens = hf_dir.rstrip("/").split("/")
+        model_name = "/".join(tokens[-2:]) if len(tokens) >= 2 else tokens[-1]
+        BASE_MODEL_PATHS = [BaseModelPath(name=model_name, model_path=hf_dir)]
+        logger.info(f"[AsyncvLLMServer] Reload serving alias: '{model_name}' -> path: '{hf_dir}'")
+        models = OpenAIServingModels(self.engine, model_config, BASE_MODEL_PATHS)
+        self.openai_serving_chat = OpenAIServingChat(
+            self.engine,
+            model_config,
+            models,
+            "assistant",
+            request_logger=RequestLogger(max_log_len=4096),
+            chat_template=None,
+            chat_template_content_format="auto",
+        )
+        
+        # Make sure the engine is ready
+        await self.wake_up()
+        logger.info(f"[AsyncvLLMServer] Successfully reloaded model from {hf_dir}")

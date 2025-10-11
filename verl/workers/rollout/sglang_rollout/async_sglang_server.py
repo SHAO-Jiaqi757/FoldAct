@@ -70,3 +70,17 @@ class AsyncSglangServer(AsyncServerBase):
     async def sleep(self):
         for worker in self.workers:
             worker.offload.remote()
+            
+    async def reload_model_from_hf_dir(self, hf_dir: str):
+        """Reload model from HuggingFace directory.
+        
+        Args:
+            hf_dir: str, huggingface model directory.
+        """
+        logger.info(f"[AsyncSglangServer] Reloading model from {hf_dir}")
+        # SGLang implementation - delegate reload to workers
+        futures = []
+        for worker in self.workers:
+            futures.append(worker.execute_method.remote("reload_from_hf_dir", hf_dir))
+        await asyncio.gather(*futures)
+        logger.info(f"[AsyncSglangServer] Successfully reloaded model from {hf_dir}")

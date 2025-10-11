@@ -103,6 +103,15 @@ class AsyncServerBase(ABC):
     async def sleep(self):
         """Sleep engine to offload model weights and discard kv cache."""
         raise NotImplementedError
+        
+    @abstractmethod
+    async def reload_model_from_hf_dir(self, hf_dir: str):
+        """Reload model from HuggingFace directory.
+        
+        Args:
+            hf_dir: str, huggingface model directory.
+        """
+        raise NotImplementedError
 
 
 class ChatCompletionScheduler:
@@ -232,9 +241,18 @@ class AsyncLLMServerManager:
 
         self.rollout_tp_size = self.config.rollout.tensor_model_parallel_size
         self.rollout_dp_size = self.worker_group.world_size // self.rollout_tp_size
+        
+        # Allow overriding dp size to decouple async server count from worker_group size
+        dp_override = self.config.rollout.get("dp_size_override", None)
+        if isinstance(dp_override, int) and dp_override > 0:
+            logger.info(f"[AsyncLLMServerManager] Overriding DP size from {self.rollout_dp_size} to {dp_override}")
+            self.rollout_dp_size = dp_override
 
+        logger.info(f"[AsyncLLMServerManager] Initializing with TP size: {self.rollout_tp_size}, DP size: {self.rollout_dp_size}")
+        
         register_center = ray.get_actor(f"{self.worker_group.name_prefix}_register_center")
         workers_info = ray.get(register_center.get_worker_info.remote())
+        logger.info(f"[AsyncLLMServerManager] Workers info length: {len(workers_info)}, world_size: {self.worker_group.world_size}")
         assert len(workers_info) == self.worker_group.world_size
 
         self.async_llm_servers = [None] * self.rollout_dp_size
@@ -252,17 +270,19 @@ class AsyncLLMServerManager:
         # Start all server instances, restart if address already in use.
         unready_dp_ranks = set(range(self.rollout_dp_size))
         while len(unready_dp_ranks) > 0:
-            servers = {
-                rollout_dp_rank: server_class.options(
+            servers = {}
+            for rollout_dp_rank in unready_dp_ranks:
+                worker_index = (rollout_dp_rank * self.rollout_tp_size) % len(workers_info)
+                node_id = workers_info[worker_index]
+                logger.info(f"[AsyncLLMServerManager] Assigning rank {rollout_dp_rank} to node {node_id} (worker_index={worker_index})")
+                servers[rollout_dp_rank] = server_class.options(
                     # make sure AsyncvLLMServer colocates with its corresponding workers
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
-                        node_id=workers_info[rollout_dp_rank * self.rollout_tp_size],
+                        node_id=node_id,
                         soft=False,
                     ),
                     name=f"async_llm_server_{rollout_dp_rank}",
                 ).remote(config, self.rollout_dp_size, rollout_dp_rank, self.worker_group.name_prefix)
-                for rollout_dp_rank in unready_dp_ranks
-            }
 
             for rollout_dp_rank, server in servers.items():
                 try:
@@ -270,12 +290,15 @@ class AsyncLLMServerManager:
                     self.server_addresses[rollout_dp_rank] = address
                     self.async_llm_servers[rollout_dp_rank] = server
                     unready_dp_ranks.remove(rollout_dp_rank)
-                except Exception:
+                except Exception as e:
                     ray.kill(server)
-                    print(f"rollout server {rollout_dp_rank} failed, maybe address already in use, restarting...")
 
         # All server instances are ready, init AsyncLLM engine.
-        ray.get([server.init_engine.remote() for server in self.async_llm_servers])
+        try:
+            ray.get([server.init_engine.remote() for server in self.async_llm_servers])
+        except Exception as e:
+            logger.error(f"[AsyncLLMServerManager] Error initializing engines: {e}")
+            raise
 
         # Init user provided chat scheduler in sperate thread.
         self.chat_scheduler: ChatCompletionScheduler = None
@@ -284,6 +307,7 @@ class AsyncLLMServerManager:
         self.chat_scheduler_thread = threading.Thread(target=self._init_chat_scheduler, daemon=True)
         self.chat_scheduler_thread.start()
         self.chat_scheduler_ready.wait()
+        logger.info("[AsyncLLMServerManager] Chat scheduler initialization completed")
 
     def _init_chat_scheduler(self):
         self.chat_scheduler_loop = asyncio.new_event_loop()
@@ -317,28 +341,32 @@ class AsyncLLMServerManager:
             try:
                 self.worker_group.execute_all_sync("execute_method", "wake_up")
             except Exception as e:
-                print(f"[AsyncLLMServerManager] Warning: worker wake_up failed: {e}")
+                logger.error(f"[AsyncLLMServerManager] Warning: worker wake_up failed: {e}")
         else:
             # Isolation mode: reload to latest HF export if present
             if self.ckpt_dir:
                 from search_r1.utils.ckpt_utils import find_latest_hf_checkpoint
                 hf_dir = find_latest_hf_checkpoint(self.ckpt_dir)
+                logger.info(f"[AsyncLLMServerManager] Latest HF checkpoint: {hf_dir}, last used: {self._last_hf_dir}")
                 if hf_dir and hf_dir != self._last_hf_dir:
-                    print(f"[AsyncLLMServerManager] Reloading servers to HF checkpoint: {hf_dir}")
                     ray.get([server.reload_model_from_hf_dir.remote(hf_dir) for server in self.async_llm_servers])
                     self._last_hf_dir = hf_dir
+                    logger.info(f"[AsyncLLMServerManager] Reload completed successfully")
+        
         ray.get([server.wake_up.remote() for server in self.async_llm_servers])
         self._is_awake = True
 
     def sleep(self):
         """Sleep rollout: offload engines then release worker-side caches."""
+        logger.info("[AsyncLLMServerManager] sleep called")
         # Phase 1: offload HTTP engines
         ray.get([server.sleep.remote() for server in self.async_llm_servers])
+        
         # Phase 2: ask workers to exit sharding context (offload weights)
         try:
             self.worker_group.execute_all_sync("execute_method", "sleep")
         except Exception as e:
-            print(f"[AsyncLLMServerManager] Warning: worker sleep failed: {e}")
+            logger.error(f"[AsyncLLMServerManager] Warning: worker sleep failed: {e}")
         self._is_awake = False
 
     def ensure_ready(self):
@@ -349,31 +377,28 @@ class AsyncLLMServerManager:
 
         # Isolation mode: reload only when HF path changes
         if self.ckpt_dir:
-            from search_r1.utils.ckpt_utils import find_latest_hf_checkpoint, delete_last_checkpoint, find_latest_actor_checkpoint
+            from search_r1.utils.ckpt_utils import find_latest_hf_checkpoint, find_latest_actor_checkpoint
             hf_dir = find_latest_hf_checkpoint(self.ckpt_dir)
+            logger.info(f"[AsyncLLMServerManager] Latest HF checkpoint: {hf_dir}, previous: {self._last_hf_dir}")
             if hf_dir and hf_dir != self._last_hf_dir:
-                print(f"[AsyncLLMServerManager] Reloading servers to HF checkpoint: {hf_dir}")
                 try:
+                    logger.info(f"[AsyncLLMServerManager] Attempting to reload {len(self.async_llm_servers)} servers")
                     ray.get([server.reload_model_from_hf_dir.remote(hf_dir) for server in self.async_llm_servers])
                     self._last_hf_dir = hf_dir
                 except Exception as e:
-                    print(f"[AsyncLLMServerManager] Reload failed for {hf_dir}: {e}. Attempting rollback...")
-                    # Attempt rollback: delete last checkpoint and retry latest
-                    try:
-                        delete_last_checkpoint(self.ckpt_dir)
-                    except Exception:
-                        pass
+                    logger.error(f"[AsyncLLMServerManager] Reload failed for {hf_dir}: {e}. Attempting rollback...")
+                   
                     # Retry
                     hf_dir2 = find_latest_hf_checkpoint(self.ckpt_dir) or _get_vllm_loadable_dir(find_latest_actor_checkpoint(self.ckpt_dir))
+                    logger.info(f"[AsyncLLMServerManager] Retry with checkpoint: {hf_dir2}")
                     if hf_dir2 and hf_dir2 != hf_dir:
-                        print(f"[AsyncLLMServerManager] Retrying reload with {hf_dir2}")
-                        ray.get([server.reload_model_from_hf_dir.remote(hf_dir2) for server in self.async_llm_servers])
                         self._last_hf_dir = hf_dir2
+                        logger.info(f"[AsyncLLMServerManager] Retry reload successful with {hf_dir2}")
 
         if not self._is_awake:
             ray.get([server.wake_up.remote() for server in self.async_llm_servers])
             self._is_awake = True
-
+        
     def submit_chat_completions(
         self,
         callback: Callable[[ChatCompletion, Dict[str, Any], Exception], None],
@@ -399,6 +424,9 @@ class AsyncLLMServerManager:
     def generate_sequences(self, prompts: DataProto, **sampling_params) -> DataProto:
         """Generate multiple sequences in parallel via chat scheduler."""
         assert self.chat_scheduler is not None, "chat scheduler is not initialized."
+
+        # Ensure engine has latest model weights before generation
+        self.ensure_ready()
 
         future = asyncio.run_coroutine_threadsafe(self.chat_scheduler.generate_sequences(prompts, **sampling_params), self.chat_scheduler_loop)
         return future.result()

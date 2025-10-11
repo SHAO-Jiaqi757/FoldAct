@@ -75,7 +75,7 @@ class SimpleDenseFeedbackRewardManager:
     """Simplified reward manager focused on grounding, information sufficiency, and refinement."""
     
     def __init__(self, tokenizer, num_examine=100, compute_score=None, reward_fn_key="data_source", 
-                 enable_llm_evaluation=True, llm_model="gpt-4.1-mini", log_dir: Optional[str] = None):
+                 enable_llm_evaluation=False, llm_model="gpt-4.1-mini", log_dir: Optional[str] = None):
         self.tokenizer = tokenizer
         self.num_examine = num_examine
         self.compute_score = compute_score or default_compute_score
@@ -105,6 +105,11 @@ class SimpleDenseFeedbackRewardManager:
         
         # 简化的配置
         self.config = self._get_simplified_config()
+
+        # In-memory caches
+        # Cache for information quality evaluations keyed by query string
+        self._info_quality_cache: Dict[str, Dict[str, Any]] = {}
+        self._cache_lock = threading.Lock()
         
         # 设置日志级别
         self._setup_logging()
@@ -649,6 +654,7 @@ class SimpleDenseFeedbackRewardManager:
                                      component: TrajectoryComponent, sorted_components: List[TrajectoryComponent], 
                                      component_idx: int, temporal_meta: Dict) -> float:
         """Apply reward adjustments for four core aspects (grounding only for search/think, with decay and upper limit)"""
+        # Always start from base_score. Base answer quality does not require LLM evaluation.
         score = base_score
         # Collect a human-readable breakdown for debugging
         debug_parts: List[str] = []
@@ -658,7 +664,7 @@ class SimpleDenseFeedbackRewardManager:
             pass
         
         # 1. Information insufficient penalty
-        if temporal_meta.get("has_insufficient_info", False):
+        if self.enable_llm_evaluation and temporal_meta.get("has_insufficient_info", False):
             if component.component_type == "answer":
                 # Check if there is insufficient information before
                 for i in range(component_idx - 1, -1, -1):
@@ -677,7 +683,7 @@ class SimpleDenseFeedbackRewardManager:
                         break
         
         # 2. Reasoning grounding evaluation (only for search/think, with decay and total upper limit, to avoid reward hacking)
-        if component.component_type in ["search", "think"]:
+        if self.enable_llm_evaluation and component.component_type in ["search", "think"]:
             reasoning_grounded = temporal_meta.get("reasoning_grounded", True)
             if reasoning_grounded:
                 applied_steps = temporal_meta.get("grounding_applied", 0)
@@ -722,7 +728,7 @@ class SimpleDenseFeedbackRewardManager:
             #         pass
         
         # 3. Information improvement reward (from insufficient to sufficient)
-        if component.component_type == "information":
+        if self.enable_llm_evaluation and component.component_type == "information":
             refinement_success = temporal_meta.get("refinement_success", False)
             if refinement_success:
                 refinement_steps = temporal_meta.get("refinement_steps", 0)
@@ -822,8 +828,11 @@ class SimpleDenseFeedbackRewardManager:
                 continue
             start_idx, end_idx = span
             
-            # Base score: only based on final answer quality
-            base_score = feedback.answer_quality_score if component.component_type == "answer" else 0.0
+            # Base score: apply final answer quality regardless of LLM evaluator availability
+            if component.component_type == "answer":
+                base_score = feedback.answer_quality_score
+            else:
+                base_score = 0.0
             
             # Apply reward adjustments for four core aspects
             final_score = self._apply_core_reward_adjustments(
@@ -832,7 +841,7 @@ class SimpleDenseFeedbackRewardManager:
 
             # If there is a stashed refinement bonus and this is an answer,
             # apply it here and clear the pending amount.
-            if component.component_type == "answer":
+            if self.enable_llm_evaluation and component.component_type == "answer":
                 pending_refine = float(temporal_meta.get("refinement_bonus_pending", 0.0))
                 if pending_refine != 0.0:
                     final_score += pending_refine
@@ -841,7 +850,7 @@ class SimpleDenseFeedbackRewardManager:
                         f"Applied stashed refinement bonus {pending_refine:.3f} to answer component {i+1}")
 
             # Apply repetition penalties for think components
-            if self.config.get("enable_repetition_penalty", True) and component.component_type == "think":
+            if self.enable_llm_evaluation and self.config.get("enable_repetition_penalty", True) and component.component_type == "think":
                 rep_penalty = self._compute_repetition_penalty(component, sorted_components, i)
                 temporal_meta["repetition_penalty"] = temporal_meta.get("repetition_penalty", 0.0) + rep_penalty
                 final_score -= rep_penalty
@@ -1131,71 +1140,6 @@ class SimpleDenseFeedbackRewardManager:
 
     
 
-    def _evaluate_reasoning_grounding(self, reasoning_text: str, search_evidence: List[Dict], 
-                                      question: str) -> Dict[str, Any]:
-        """Synchronous wrapper: call LLM evaluator (internal safe running coroutine)."""
-        if not self.llm_evaluator:
-            raise RuntimeError("LLM evaluator not available")
-        # Guard: evidence must start with "<information>Doc 1" pattern; otherwise skip evaluation
-        try:
-            def _valid_ev_item(ev: Dict) -> bool:
-                txt = str(ev.get("content", ""))
-                # Accept either inner content starting with "Doc 1" or a full tag prefix
-                return re.match(r"^\s*(?:<information>)?\s*Doc\s*1", txt, flags=re.IGNORECASE) is not None
-            if not search_evidence or not any(_valid_ev_item(ev) for ev in search_evidence):
-                logger.info("Skipping grounding LLM evaluation: evidence not starting with '<information>Doc 1'")
-                return {
-                    "premise_grounding": "Unspecified",
-                    "anchor_type": "NONE",
-                    "evidence_citations": [],
-                    "unmatched_premises": [],
-                    "premise_justification": "Skipped: evidence not in expected '<information>Doc 1' format",
-                    "evaluation_success": False,
-                    "fallback": True,
-                }
-        except Exception:
-            # On any unexpected error in checking, fall back to skipping to be safe
-            return {
-                "premise_grounding": "Unspecified",
-                "anchor_type": "NONE",
-                "evidence_citations": [],
-                "unmatched_premises": [],
-                "premise_justification": "Skipped: evidence format check error",
-                "evaluation_success": False,
-                "fallback": True,
-            }
-        # Skip evaluation if reasoning text is too long (cost control / latency)
-        try:
-            max_chars = int(self.config.get("max_reasoning_eval_chars", 1200))
-        except Exception:
-            max_chars = 1200
-        text = (reasoning_text or "").strip()
-        if max_chars > 0 and len(text) > max_chars or len(text.split()) < self.config.get("min_component_length", 3):
-            logger.info(f"Skipping grounding LLM evaluation: reasoning too long ({len(text)} > {max_chars} chars)")
-            return {
-                "premise_grounding": "Unspecified",
-                "anchor_type": "NONE",
-                "evidence_citations": [],
-                "unmatched_premises": [],
-                "premise_justification": f"Skipped: reasoning too long ({len(text)} > {max_chars}) or too short ({len(text.split()) < self.config.get('min_component_length', 3)})",
-                "evaluation_success": False,
-                "fallback": True,
-            }
-        try:
-            return self._run_async(self.llm_evaluator.evaluate_reasoning_grounding(
-                reasoning_text, search_evidence, question
-            ))
-        except Exception as e:
-            logger.error(f"Error in LLM grounding evaluation: {e}")
-            return {
-                "premise_grounding": "Unspecified",
-                "anchor_type": "NONE",
-                "evidence_citations": [],
-                "unmatched_premises": [],
-                "premise_justification": f"Evaluation error: {str(e)}",
-                "evaluation_success": False
-            }
-
     def _evaluate_information_quality_batch(self, information_components: List[TrajectoryComponent], 
                                            search_components: List[TrajectoryComponent], 
                                            ground_truth: str) -> List[Dict[str, Any]]:
@@ -1205,28 +1149,72 @@ class SimpleDenseFeedbackRewardManager:
         if not self.llm_evaluator:
             logger.warning("LLM evaluator not available; skipping information quality evaluation and returning neutral results")
             return []
-        evaluation_requests = []
+        # Build requests with their original indices
+        indexed_requests: List[Tuple[int, Dict[str, Any]]] = []
         for i, info_comp in enumerate(information_components):
             # Skip empty evidence
             if getattr(info_comp, 'content', None) is None or str(info_comp.content).strip() == "":
                 continue
             search_query = self._find_corresponding_search_query(info_comp, search_components)
             documents = [{"content": info_comp.content}]
-            evaluation_requests.append({
+            indexed_requests.append((i, {
                 "type": "information_quality",
                 "query": search_query,
                 "documents": documents,
                 "component_index": i
-            })
+            }))
+
         # If there is no evidence, do not call the LLM evaluator
-        if not evaluation_requests:
+        if not indexed_requests:
             logger.info("No information quality requests to evaluate (empty evidence); skipping LLM call")
             return []
-        try:
-            return self._run_async(self.llm_evaluator.batch_evaluate(evaluation_requests))
-        except Exception as e:
-            logger.error(f"Error in batch information quality evaluation: {e}; returning neutral results")
-            return []
+
+        # Prepare result container aligned to the number of requests (by component index order)
+        total_requests = len(indexed_requests)
+        # Map from original index to result
+        results_by_index: Dict[int, Dict[str, Any]] = {}
+
+        # 1) Serve cache hits
+        cache_hits = 0
+        misses: List[Tuple[int, Dict[str, Any]]] = []
+        with self._cache_lock:
+            for idx, req in indexed_requests:
+                q = str(req.get("query", ""))
+                if q and q in self._info_quality_cache:
+                    results_by_index[idx] = self._info_quality_cache[q]
+                    cache_hits += 1
+                else:
+                    misses.append((idx, req))
+        if cache_hits:
+            try:
+                self.file_logger.info(f"Information quality cache hits: {cache_hits}/{total_requests}")
+            except Exception:
+                pass
+
+        # 2) Batch-evaluate cache misses
+        if misses:
+            miss_only_requests = [req for (_, req) in misses]
+            try:
+                miss_results: List[Dict[str, Any]] = self._run_async(self.llm_evaluator.batch_evaluate(miss_only_requests))
+            except Exception as e:
+                logger.error(f"Error in batch information quality evaluation (misses): {e}; returning neutral results for misses")
+                miss_results = [{} for _ in miss_only_requests]
+
+            # Map results back and write to cache
+            with self._cache_lock:
+                for (idx, req), res in zip(misses, miss_results):
+                    results_by_index[idx] = res
+                    q = str(req.get("query", ""))
+                    if q:
+                        # Store/overwrite cache entry for this query
+                        self._info_quality_cache[q] = res
+
+        # 3) Reconstruct results in the same order as the filtered inputs (indexed_requests order)
+        final_results: List[Dict[str, Any]] = []
+        for idx, _ in indexed_requests:
+            final_results.append(results_by_index.get(idx, {}))
+
+        return final_results
     
     def _find_corresponding_search_query(self, info_component: TrajectoryComponent, 
                                        search_components: List[TrajectoryComponent]) -> str:
@@ -1253,9 +1241,25 @@ class SimpleDenseFeedbackRewardManager:
  
     def _analyze_temporal_dependencies_sync(self, components: List[TrajectoryComponent], 
                                            ground_truth, question: str = None) -> Dict:
-        """Analyze temporal dependencies, focusing on four core aspects (using LLM evaluation)"""
+        """Analyze temporal dependencies.
+
+        If LLM evaluation is disabled, return a neutral analysis that does not
+        trigger any penalties/bonuses tied to LLM signals.
+        """
+        if not self.enable_llm_evaluation:
+            logger.info("LLM evaluation disabled; using neutral temporal analysis (no LLM-based penalties)")
+            sorted_components = sorted(components, key=lambda x: x.start_token_idx)
+            return {
+                "has_insufficient_info": False,
+                "reasoning_grounded": False,
+                "refinement_success": False,
+                "refinement_steps": 0,
+                "temporal_sequence": [comp.component_type for comp in sorted_components],
+                "llm_evaluation_results": [],
+            }
+
         logger.info("Analyzing temporal dependencies with LLM evaluation")
-        
+
         # Sort components by time order
         sorted_components = sorted(components, key=lambda x: x.start_token_idx)
         
@@ -1458,23 +1462,37 @@ class SimpleDenseFeedbackRewardManager:
 
     
     def __call__(self, data: DataProto, return_dict=False):
-        """Process batch data and return dense reward tensors (Synchronous version)"""
+        """Process batch data and return dense reward tensors (Synchronous version)
+
+        This function is made robust to always return a tensor shaped like
+        (batch_size, response_length) even if per-item processing fails or
+        required metadata is missing. This prevents batch dimension mismatch
+        errors in downstream trainers.
+        """
         logger.info(f"Processing batch with {len(data)} items")
-        
+
         # Log to file
         self.file_logger.info(f"=== BATCH PROCESSING START ===")
         self.file_logger.info(f"Batch size: {len(data)}")
         self.file_logger.info(f"Return dict: {return_dict}")
-        
-        # Safe check
+
+        # Pre-compute target output shape
+        try:
+            batch_responses = data.batch.get("responses", None)
+            if isinstance(batch_responses, torch.Tensor) and batch_responses.dim() >= 2:
+                batch_size, resp_len = int(batch_responses.shape[0]), int(batch_responses.shape[1])
+            else:
+                batch_size, resp_len = int(len(data) or 0), 0
+        except Exception:
+            batch_size, resp_len = int(len(data) or 0), 0
+
+        # Safe check: empty batch
         if not data or len(data) == 0:
             logger.warning("Empty data batch received")
             file_logger.warning("Empty data batch received")
-            if return_dict:
-                return {"reward_tensor": torch.tensor([])}
-            else:
-                return torch.tensor([])
-        
+            empty = torch.zeros((batch_size, resp_len), dtype=torch.float32)
+            return {"reward_tensor": empty} if return_dict else empty
+
         dense_reward_tensors = []
         try:
             for i in range(len(data)):
@@ -1488,17 +1506,24 @@ class SimpleDenseFeedbackRewardManager:
                         self.file_logger.warning(f"Data item {i} missing required attributes, skipping")
                         continue
                     
-                    # Check necessary fields
+                    # Check necessary fields. If missing, fall back to zeros for this item.
                     required_fields = ["prompts", "responses", "attention_mask"]
+                    missing_required = False
                     for field in required_fields:
                         if field not in data_item.batch:
-                            logger.warning(f"Data item {i} missing required field: {field}, skipping")
-                            self.file_logger.warning(f"Data item {i} missing required field: {field}, skipping")
-                            continue
-                    
+                            missing_required = True
+                            logger.warning(f"Data item {i} missing required field: {field}, using zero rewards for this item")
+                            self.file_logger.warning(f"Data item {i} missing required field: {field}, using zero rewards for this item")
+                            break
+                    if missing_required:
+                        dense_reward_tensors.append(torch.zeros(resp_len, dtype=torch.float32))
+                        continue
+
+                    # reward_model metadata may be absent in some configs; do not hard fail.
                     if "reward_model" not in data_item.non_tensor_batch:
-                        logger.warning(f"Data item {i} missing reward_model field, skipping")
-                        self.file_logger.warning(f"Data item {i} missing reward_model field, skipping")
+                        logger.warning(f"Data item {i} missing reward_model field, using zero rewards for this item")
+                        self.file_logger.warning(f"Data item {i} missing reward_model field, using zero rewards for this item")
+                        dense_reward_tensors.append(torch.zeros(resp_len, dtype=torch.float32))
                         continue
                     
                     # Process single data item (Synchronous call)
@@ -1512,38 +1537,28 @@ class SimpleDenseFeedbackRewardManager:
                 except Exception as e:
                     logger.error(f"Error processing data item {i}: {e}")
                     self.file_logger.error(f"Error processing data item {i}: {e}")
-                    # Create default reward tensor as fallback
-                    default_reward = torch.zeros(500, dtype=torch.float32)
-                    dense_reward_tensors.append(default_reward)
+                    # Create default reward tensor as fallback with correct response length
+                    dense_reward_tensors.append(torch.zeros(resp_len, dtype=torch.float32))
                     continue
             
-            # Check if there are valid reward tensors
+            # Ensure we have an output even if no items produced a reward
             if not dense_reward_tensors:
-                logger.warning("No valid reward tensors generated")
-                if return_dict:
-                    return {"reward_tensor": torch.tensor([])}
-                else:
-                    return torch.tensor([])
-            
-            # Align each sample's reward length to its response length (no fixed cap)
-            if not isinstance(data.batch.get("responses", None), torch.Tensor):
-                raise ValueError("Batch is missing 'responses' tensor for shaping reward output")
-            batch_size, resp_len = data.batch["responses"].shape[0], data.batch["responses"].shape[1]
+                logger.warning("No valid reward tensors generated; returning zeros of expected shape")
+                stacked_rewards = torch.zeros((batch_size, resp_len), dtype=torch.float32)
+            else:
+                # Align each sample's reward length to its response length (no fixed cap)
+                if not isinstance(data.batch.get("responses", None), torch.Tensor):
+                    raise ValueError("Batch is missing 'responses' tensor for shaping reward output")
 
-            # If some items were skipped, keep alignment by truncating to available size
-            if len(dense_reward_tensors) != batch_size:
-                logger.warning(
-                    f"dense_reward_tensors count {len(dense_reward_tensors)} != batch_size {batch_size}; "
-                    "will align by trimming to the smaller size"
-                )
-            out_bs = min(batch_size, len(dense_reward_tensors))
-            stacked_rewards = torch.zeros((out_bs, resp_len), dtype=torch.float32)
-            for idx in range(out_bs):
-                rt = dense_reward_tensors[idx]
-                if rt.numel() >= resp_len:
-                    stacked_rewards[idx, :] = rt[:resp_len]
-                else:
-                    stacked_rewards[idx, : rt.numel()] = rt
+                # Build full batch-sized tensor and fill from available per-item rewards
+                stacked_rewards = torch.zeros((batch_size, resp_len), dtype=torch.float32)
+                fill_count = min(batch_size, len(dense_reward_tensors))
+                for idx in range(fill_count):
+                    rt = dense_reward_tensors[idx]
+                    if rt.numel() >= resp_len:
+                        stacked_rewards[idx, :] = rt[:resp_len]
+                    else:
+                        stacked_rewards[idx, : rt.numel()] = rt
             logger.info(f"Final stacked rewards shape: {stacked_rewards.shape}")
             
             # Return result
@@ -1557,12 +1572,9 @@ class SimpleDenseFeedbackRewardManager:
                 
         except Exception as e:
             logger.error(f"Critical error in reward manager: {e}")
-            # Return default values
-            default_reward = torch.zeros((len(data), 500), dtype=torch.float32)
-            if return_dict:
-                return {"reward_tensor": default_reward}
-            else:
-                return default_reward
+            # Return default values with best-effort shape
+            fallback = torch.zeros((batch_size, resp_len), dtype=torch.float32)
+            return {"reward_tensor": fallback} if return_dict else fallback
     
     def _process_single_item_sync(self, data_item, item_index):
         """Process single data item, return feedback and reward tensor (Synchronous version)"""

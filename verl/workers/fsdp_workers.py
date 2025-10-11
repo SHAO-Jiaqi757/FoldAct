@@ -592,6 +592,7 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
+        log_gpu_memory_usage("update_actor started", logger=logger)
         # Support all hardwares
         data = data.to(get_torch_device().current_device())
 
@@ -684,9 +685,12 @@ class ActorRolloutRefWorker(Worker):
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
             with adapter_ctx:
-                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=False)
+            tensors = {"old_log_probs": output}
+            if entropys is not None:
+                tensors["entropys"] = entropys
             output = DataProto.from_dict(
-                tensors={"old_log_probs": output, "entropys": entropys},
+                tensors=tensors,
                 meta_info={"temperature": self.config.rollout.temperature},
             )
             output = self.ulysses_sharding_manager.postprocess_data(output)
@@ -706,6 +710,7 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_prob(self, data: DataProto):
+        log_gpu_memory_usage("compute_ref_log_prob started", logger=logger)
         if self._is_lora:
             # if _is_lora, actor without lora applied is the ref
             data.meta_info['is_lora'] = True
@@ -1461,7 +1466,57 @@ class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
-        raise NotImplementedError("AsyncActorRolloutRefWorker does not support generate_sequences")
+        log_gpu_memory_usage("generate_sequences started", logger=logger)
+        """Generate sequences via the async HTTP servers when in async mode.
+
+        This provides a compatibility path so callers that invoke
+        `actor_rollout_wg.generate_sequences(...)` still work when
+        `actor_rollout_ref.rollout.mode == "async"`.
+
+        It discovers the colocated Async LLM server by DP rank and delegates
+        to the configured chat scheduler (defaulting to the naive scheduler).
+        """
+        # Lazy import to avoid hard dependency at worker init
+        import importlib
+        import asyncio
+        import ray
+        from omegaconf import OmegaConf
+
+        # Resolve server address for this DP rank; fall back to rank 0 if missing
+        server_name = f"async_llm_server_{self.vllm_dp_rank}"
+        try:
+            server = ray.get_actor(server_name)
+        except Exception:
+            # Best-effort fallback
+            server = ray.get_actor("async_llm_server_0")
+        address = ray.get(server.get_server_address.remote())
+
+        # Pick scheduler class from config or use the naive one
+        sched_path = OmegaConf.select(self.config.rollout, "chat_scheduler")
+        if not sched_path:
+            sched_path = "search_r1.async_runtime.naive_chat_scheduler.NaiveChatCompletionScheduler"
+        module_path, class_name = sched_path.rsplit(".", 1)
+        scheduler_cls = getattr(importlib.import_module(module_path), class_name)
+
+        # Initialize a local scheduler instance targeting the discovered server
+        scheduler = scheduler_cls(
+            config=self.config.rollout,
+            model_path=self.config.model.path,
+            server_addresses=[address],
+        )
+
+        # Run the async generation to completion in a private loop
+        # Note: generate_sequences is an async coroutine on the scheduler
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(scheduler.generate_sequences(prompts))
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+        return result
 
     @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
     def execute_method(self, method: Union[str, bytes], *args, **kwargs):

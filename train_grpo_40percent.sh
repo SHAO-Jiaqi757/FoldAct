@@ -1,6 +1,25 @@
+
 # Use A800s only by physical index and align CUDA order to PCIe bus IDs.
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-export CUDA_VISIBLE_DEVICES=4,5
+export CUDA_VISIBLE_DEVICES=1,2,6,7
+# Kill all processes using GPUs 4,5 and 1,2,6,7 to ensure clean state
+echo "[INFO] Killing all processes on GPUs 4,5 and 1,2,6,7..."
+nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits -i 4,5,1,2,6,7 | xargs -r kill -9 2>/dev/null || true
+sleep 2
+
+# Enable memory logging and debugging
+export VERL_LOGGING_LEVEL=WARNING
+export CUDA_LAUNCH_BLOCKING=1
+
+
+# PyTorch 扩展/第三方 JIT 用
+export TORCH_CUDA_ARCH_LIST="8.0;8.6"
+# FlashInfer 自身的 AOT/JIT 用（空格分隔）
+# export FLASHINFER_CUDA_ARCH_LIST="8.0 8.6"
+# 让注意力后端用 FlashInfer（尤其 FP8 KV / PageAttention）
+# export VLLM_ATTENTION_BACKEND=FLASHINFER
+# 开启 FlashInfer 采样内核
+# export VLLM_USE_FLASHINFER_SAMPLER=1
 
 export DATA_DIR='/datapool/data/deepresearcher'
 # Avoid NCCL peer access attempts between non-P2P GPU pairs
@@ -33,7 +52,6 @@ export TEST_DATA_DIR='/datapool/data/deepresearcher'
 export VLLM_USE_V1=1
 unset VLLM_ATTENTION_BACKEND
 # export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True  # Not compatible with vLLM memory pool
-export CUDA_LAUNCH_BLOCKING=1
 export VLLM_USE_MODELSCOPE=false
 
 # max_prompt_length = (config['training']['max_start_length'] + config['training']['max_response_length'] * (config['training']['max_turns'] - 1) + config['training']['max_obs_length'] * config['training']['max_turns'])
@@ -73,15 +91,51 @@ fi
 
 
 # ========= NCCL & 环境变量 =========
-export NCCL_DEBUG=INFO
-export NCCL_SOCKET_IFNAME=bond0       
-export NCCL_SOCKET_DISABLE_IPV6=1
-export NCCL_IB_DISABLE=0              
+###############################################################################
+# Distributed and NCCL safety/debug settings (single-node friendly)
+###############################################################################
+# Prevent accidentally connecting to a remote Ray cluster
+unset RAY_ADDRESS
 
-NCCL_DEBUG=INFO NCCL_SOCKET_IFNAME=bond0 NCCL_SOCKET_DISABLE_IPV6=1 
+# Clear any stale torch.distributed env from previous multi-node runs
+for v in MASTER_ADDR MASTER_PORT NODE_RANK RANK WORLD_SIZE LOCAL_RANK LOCAL_WORLD_SIZE; do
+  unset "$v"
+done
+
+# Force local rendezvous for rank0 if anything reads these on driver side
+export MASTER_ADDR=127.0.0.1
+export MASTER_PORT=${MASTER_PORT:-29549}
+
+# NCCL diagnostics and safer defaults for single-node TCP
+export NCCL_DEBUG=WARN
+# Prefer excluding loopback/docker to let NCCL pick the active NIC automatically
+export NCCL_SOCKET_IFNAME='^lo,docker0'
+export NCCL_SOCKET_DISABLE_IPV6=1
+# Disable IB/RDMA on single-node to avoid cross-host handshakes
+export NCCL_IB_DISABLE=1
+# Better surfacing of async errors and blocking waits for clear stack traces
+export NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_BLOCKING_WAIT=1
+# Optional: richer torch.distributed logs when debugging hangs
+# export TORCH_DISTRIBUTED_DEBUG=DETAIL
+
+# Quick echo for visibility in logs
+echo "[Env] MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT NCCL_IB_DISABLE=$NCCL_IB_DISABLE NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME"
+
+NCCL_DEBUG=INFO NCCL_SOCKET_IFNAME='^lo,docker0' NCCL_SOCKET_DISABLE_IPV6=1 
 
 nvidia-smi -i 4,5 -c EXCLUSIVE_PROCESS
 export HYDRA_FULL_ERROR=1
+LOG_TO_FILE=${LOG_TO_FILE:-0}
+LOG_DIR=${LOG_DIR:-logs}
+if [ "$LOG_TO_FILE" = "1" ]; then
+  mkdir -p "$LOG_DIR"
+  LOG_FILE="$LOG_DIR/${EXPERIMENT_NAME}-$(date +%Y%m%d-%H%M%S).log"
+  # Prune logs older than 7 days to control disk usage
+  find "$LOG_DIR" -type f -name "${EXPERIMENT_NAME}-*.log*" -mtime +7 -delete 2>/dev/null || true
+  echo "[INFO] Logging to $LOG_FILE (toggle with LOG_TO_FILE=0/1)"
+fi
+
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.train_files=$TRAIN_DATA_DIR/train_transformed.parquet \
     data.val_files=$TEST_DATA_DIR/test_transformed.parquet \
@@ -95,37 +149,39 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.path=$BASE_MODEL \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
     actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.model.enable_activation_offload=false \
+    actor_rollout_ref.model.enable_activation_offload=true \
+    actor_rollout_ref.model.trust_remote_code=true \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.285 \
     actor_rollout_ref.actor.use_torch_compile=false \
     actor_rollout_ref.actor.use_kl_loss=true \
     actor_rollout_ref.actor.ppo_mini_batch_size=128 \
-    actor_rollout_ref.actor.ppo_micro_batch_size=64 \
+    actor_rollout_ref.actor.ppo_micro_batch_size=6 \
     actor_rollout_ref.actor.use_dynamic_bsz=true \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=10240 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=4096 \
     actor_rollout_ref.actor.fsdp_config.param_offload=true \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size=64 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size=6 \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=true \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=true \
-    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=12288 \
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=12288 \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=4096 \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.mode=async \
     actor_rollout_ref.rollout.chat_scheduler=search_r1.async_runtime.naive_chat_scheduler.NaiveChatCompletionScheduler \
     actor_rollout_ref.rollout.dtype=float16 \
-    actor_rollout_ref.rollout.max_num_batched_tokens=3072 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=4096 \
     actor_rollout_ref.rollout.max_model_len=4096 \
     actor_rollout_ref.rollout.external_executor=false \
-    actor_rollout_ref.rollout.cuda_visible_devices=[1,2] \
+    actor_rollout_ref.rollout.cuda_visible_devices=[4] \
+    +actor_rollout_ref.rollout.dp_size_override=1 \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
-    env.rollout.n=2 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.45 \
+    env.rollout.n=1 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.95 \
     actor_rollout_ref.rollout.max_num_seqs=32 \
     actor_rollout_ref.rollout.engine_kwargs.vllm.swap_space=16 \
-    actor_rollout_ref.ref.log_prob_micro_batch_size=64 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size=6 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -135,10 +191,10 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +trainer.val_only=false \
     ++trainer.val_before_train=false \
     trainer.default_hdfs_dir=null \
-    trainer.n_gpus_per_node=2 \
+    trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.save_freq=10 \
-    trainer.test_freq=50 \
+    trainer.save_freq=1 \
+    trainer.test_freq=400 \
     trainer.project_name=$WAND_PROJECT \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.resume_mode=enable \
@@ -148,6 +204,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.default_local_dir=verl_checkpoints/$EXPERIMENT_NAME \
     trainer.max_actor_ckpt_to_keep=1 \
     trainer.max_critic_ckpt_to_keep=1 \
+    actor_rollout_ref.actor.checkpoint.contents=['model','optimizer','extra','hf_model'] \
     max_turns=6 \
     final_turn_do_search=true \
     +retriever.url="http://10.201.8.114:8000/retrieve" \
@@ -159,11 +216,11 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +data.train_data_num=3072 \
     +data.val_data_num=256 \
     data.max_start_length=512 \
-    data.max_obs_length=640 \
+    data.max_obs_length=1900 \
     data.filter_overlong_prompts=False \
     data.truncation=right \
     +data.shuffle_train_dataloader=True \
     +actor_rollout_ref.actor.fsdp_config.grad_offload=true \
     algorithm.no_think_rl=false \
-    actor_rollout_ref.rollout.n_agent=3 \
-    2>&1 | tee $EXPERIMENT_NAME.log
+    actor_rollout_ref.rollout.n_agent=1 \
+    2>&1 | { if [ "$LOG_TO_FILE" = "1" ]; then tee -a "$LOG_FILE"; else cat; fi; }
