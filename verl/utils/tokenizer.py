@@ -33,7 +33,7 @@ def set_pad_token_id(tokenizer):
         warnings.warn(f"tokenizer.pad_token is None. Now set to {tokenizer.eos_token}", stacklevel=1)
 
 
-def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, **kwargs):
+def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, verify_chat_template=True, **kwargs):
     """Create a huggingface pretrained tokenizer which correctness handles eos and pad tokens.
 
     Args:
@@ -41,6 +41,7 @@ def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, **kw
         name (str): The name of the tokenizer.
         correct_pad_token (bool): Whether to correct the pad token id.
         correct_gemma2 (bool): Whether to correct the gemma2 tokenizer.
+        verify_chat_template (bool): Whether to verify and ensure correct chat template for known models.
 
     Returns:
 
@@ -55,9 +56,18 @@ def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, **kw
         warnings.warn("Found gemma-2-2b-it tokenizer. Set eos_token and eos_token_id to <end_of_turn> and 107.", stacklevel=1)
         kwargs["eos_token"] = "<end_of_turn>"
         kwargs["eos_token_id"] = 107
+    
     tokenizer = AutoTokenizer.from_pretrained(name_or_path, **kwargs)
+    
     if correct_pad_token:
         set_pad_token_id(tokenizer)
+    
+    # Verify and ensure correct chat template for Qwen models
+    if verify_chat_template and isinstance(name_or_path, str) and "qwen" in name_or_path.lower():
+        from verl.utils.chat_template import ensure_qwen_chat_template, verify_chat_template as verify_fn
+        tokenizer = ensure_qwen_chat_template(tokenizer, force=False)
+        verify_fn(tokenizer, model_type="qwen")
+    
     return tokenizer
 
 

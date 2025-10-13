@@ -14,5 +14,6 @@
 
 from . import tokenizer
 from .tokenizer import hf_processor, hf_tokenizer
+from . import chat_template
 
 __all__ = tokenizer.__all__ + ["hf_processor", "hf_tokenizer"]

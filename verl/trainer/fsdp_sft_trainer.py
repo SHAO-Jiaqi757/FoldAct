@@ -186,6 +186,21 @@ class FSDPSFTTrainer:
         if self.config.ulysses_sequence_parallel_size > 1:
             assert self.use_remove_padding, "Sequence parallel is only supported when remove_padding is enabled"
 
+        # Determine dtype and attention implementation
+        def _str_to_dtype(x: str):
+            x = str(x).lower()
+            if x in ("bf16", "bfloat16"): return torch.bfloat16
+            if x in ("fp16", "float16", "half"): return torch.float16
+            if x in ("fp32", "float32", "32", "f32"): return torch.float32
+            return torch.float32
+
+        default_dtype = "bfloat16" if is_cuda_available else "float32"
+        torch_dtype = _str_to_dtype(self.config.model.get("torch_dtype", default_dtype))
+        attn_impl = self.config.model.get(
+            "attn_implementation",
+            "flash_attention_2" if is_cuda_available else "eager",
+        )
+
         # This may be very large
         init_context = get_init_weight_context_manager(use_meta_tensor=not config.tie_word_embeddings, mesh=self.device_mesh)
 
@@ -193,8 +208,8 @@ class FSDPSFTTrainer:
             self.model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
                 local_model_path,
                 config=config,
-                torch_dtype=torch.float32,
-                attn_implementation="flash_attention_2",
+                torch_dtype=torch_dtype,
+                attn_implementation=attn_impl,
                 trust_remote_code=trust_remote_code,
             )
 
