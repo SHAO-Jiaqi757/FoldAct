@@ -71,7 +71,13 @@ class GenerationConfig:
     final_turn_do_search: bool = False
     # Enable sliding window context: keep only the most recent N turns (0 = keep all)
     context_window_turns: int = 0
-    full_context_rollout_ratio: float = 0.0
+    
+    # KL-Aware Training: Compare compressed vs full context policies
+    # Ratio of rollouts that use full context (e.g., 0.1 = 10% full, 90% compressed)
+    full_context_ratio: float = 0.1
+    # Whether to compute full-context log_prob baseline for compressed rollouts
+    # This enables KL(π_comp || π_full) regularization during training
+    enable_kl_baseline: bool = True
 
 class LLMGenerationManager:
     def __init__(
@@ -410,17 +416,26 @@ class LLMGenerationManager:
             initial_question_ids = gen_batch.batch['input_ids'].clone()
             turn_history: List[Dict[str, torch.Tensor]] = []
         
-        # GRPO full-context strategy: randomly decide for this rollout instance
-        # If ratio=0.1, then 10% of rollouts will use full context for ALL turns
+        # KL-Aware Training: Decide context strategy
         import random
-        full_context_ratio = getattr(self.config, "full_context_rollout_ratio", 0.0)
-        use_full_context_this_rollout = (random.random() < full_context_ratio) if full_context_ratio > 0 else False
+        full_context_ratio = getattr(self.config, "full_context_ratio", 0.1)
+        enable_kl_baseline = getattr(self.config, "enable_kl_baseline", True)
+        
+        # Random selection: full context or compressed context
+        use_full_context_this_rollout = random.random() < full_context_ratio
         
         # Track if observation is too long (forces summarized context)
         force_summarized = False
         
-        if use_full_context_this_rollout:
-            logger.info(f"[GRPO] This rollout selected for FULL CONTEXT (ratio={full_context_ratio:.1%})")
+        # For KL-aware training: track full context separately if using compressed
+        full_context_for_kl_baseline = None  # Will store full context if needed
+        
+        context_type = "full" if use_full_context_this_rollout else "compressed"
+        logger.info(f"[KL-Aware] Rollout context: {context_type} (full_ratio={full_context_ratio:.1%}, kl_baseline={enable_kl_baseline})")
+        
+        # Context length monitoring
+        context_lengths_per_turn = []  # Track context length at each turn
+        full_context_lengths_per_turn = []  # Track what full context would be (for compressed rollouts)
 
         # Main generation loop
         for step in range(self.config.max_turns):
@@ -482,21 +497,40 @@ class LLMGenerationManager:
                     if step == 0 or step == self.config.max_turns - 1:
                         logger.info(f"Step {step}: FORCED summarized context (observation too long)")
                 elif use_full_context_this_rollout:
-                    # This rollout was selected for full context (GRPO strategy)
+                    # This rollout uses full context
                     all_tokens: List[torch.Tensor] = []
                     for t in turn_history:
                         all_tokens.append(t['responses'])
                         if t.get('observations') is not None:
                             all_tokens.append(t['observations'])
                     windowed_input_ids = self.tensor_fn.concatenate_with_padding(all_tokens) if all_tokens else initial_question_ids
-                    logger.info(f"Step {step}: Using FULL context (GRPO rollout strategy, {len(turn_history)} turns)")
+                    if step == 0:
+                        logger.info(f"Step {step}: Using FULL context ({len(turn_history)} turns)")
                 else:
-                    # Default: use sliding window
+                    # This rollout uses compressed context (sliding window)
                     windowed_input_ids = self._apply_sliding_window(turn_history, initial_question_ids)
+                    
+                    # KL-Aware: Always update full context for baseline computation (keep all turns)
+                    if enable_kl_baseline:
+                        all_tokens: List[torch.Tensor] = []
+                        for t in turn_history:
+                            all_tokens.append(t['responses'])
+                            if t.get('observations') is not None:
+                                all_tokens.append(t['observations'])
+                        full_context_for_kl_baseline = self.tensor_fn.concatenate_with_padding(all_tokens) if all_tokens else initial_question_ids
                 
                 rollings.batch['input_ids'] = windowed_input_ids
                 rollings.batch['attention_mask'] = self.tensor_fn.create_attention_mask(windowed_input_ids)
                 rollings.batch['position_ids'] = self.tensor_fn.create_position_ids(rollings.batch['attention_mask'])
+                
+                # Monitor context length (after context decision is made)
+                current_context_length = windowed_input_ids.shape[1]
+                context_lengths_per_turn.append(current_context_length)
+                
+                # If compressed rollout with KL baseline, also track full context length
+                if not use_full_context_this_rollout and enable_kl_baseline and full_context_for_kl_baseline is not None:
+                    full_length = full_context_for_kl_baseline.shape[1]
+                    full_context_lengths_per_turn.append(full_length)
             else:
                 rollings = self._update_rolling_state(
                     rollings,
@@ -573,6 +607,41 @@ class LLMGenerationManager:
         meta_info['active_mask'] = active_mask.tolist()
         meta_info['valid_action_stats'] = valid_action_stats.tolist()
         meta_info['valid_search_stats'] = valid_search_stats.tolist()
+        
+        # KL-Aware Training: Add context type and full context baseline if needed
+        meta_info['context_type'] = context_type
+        if not use_full_context_this_rollout and enable_kl_baseline and full_context_for_kl_baseline is not None:
+            meta_info['has_kl_baseline'] = True
+            # Store full context for later log_prob computation
+            meta_info['full_context_input_ids'] = full_context_for_kl_baseline
+        else:
+            meta_info['has_kl_baseline'] = False
+        
+        # Context Length Monitoring: Add statistics for WandB tracking
+        if context_lengths_per_turn:
+            final_context_length = context_lengths_per_turn[-1]
+            meta_info['final_context_length'] = final_context_length
+            meta_info['avg_context_length'] = sum(context_lengths_per_turn) / len(context_lengths_per_turn)
+            
+            # If compressed rollout with full context tracking
+            if full_context_lengths_per_turn:
+                final_full_length = full_context_lengths_per_turn[-1]
+                tokens_saved = final_full_length - final_context_length
+                reduction_ratio = tokens_saved / final_full_length if final_full_length > 0 else 0.0
+                
+                meta_info['compression_stats'] = {
+                    'compressed_length': final_context_length,
+                    'full_length': final_full_length,
+                    'tokens_saved': tokens_saved,
+                    'reduction_ratio': reduction_ratio,
+                }
+                
+                logger.info(f"[Context Length] Compressed: {final_context_length} tokens, "
+                           f"Full would be: {final_full_length} tokens, "
+                           f"Saved: {tokens_saved} tokens ({reduction_ratio:.1%} reduction)")
+            else:
+                # Full context rollout
+                logger.info(f"[Context Length] Full context: {final_context_length} tokens")
         
         print("ACTIVE_TRAJ_NUM:", active_num_list)
         
