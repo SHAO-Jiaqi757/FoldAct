@@ -40,7 +40,7 @@ def format_trace_step(step: Dict[str, Any]) -> str:
             title = doc.get("title", "")
             doc_content = doc.get("content", "")
             doc_texts.append(f"Document {i+1}:\nTitle: {title}\nContent: {doc_content}")
-        return f"<search_result>\n" + "\n\n".join(doc_texts) + "\n</search_result>"
+        return f"<information>\n" + "\n\n".join(doc_texts) + "\n</information>"
     elif step_type == "CorrectAnswer":
         return f"<answer>\n{content}\n</answer>"
     else:

@@ -175,11 +175,11 @@ def evaluate_model(
     has_summary = False
     
     if test_samples:
-        # Check if prompt exists and contains full context (has <search_results> not <search_results_summary>)
+        # Check if prompt exists and contains full context (has <information> not <information_summary>)
         if 'prompt' in test_samples[0]:
             prompt_content = test_samples[0]['prompt'][0]['content']
-            # If it contains <search_results_summary>, it's a summary format, not full context
-            has_full_context = '<search_results_summary>' not in prompt_content and '<reasoning_summary>' not in prompt_content
+            # If it contains <information_summary>, it's a summary format, not full context
+            has_full_context = '<information_summary>' not in prompt_content and '<think_summary>' not in prompt_content
         
         # Check if summary field exists
         has_summary = 'summary' in test_samples[0] and test_samples[0].get('summary')

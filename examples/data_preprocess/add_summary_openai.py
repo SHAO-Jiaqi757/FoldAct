@@ -36,13 +36,13 @@ Your task: Create a summary that enables the model to produce the correct next a
 **Structure:**
 
 Question: [State the question clearly]
-<reasoning_summary>[Brief summary of logical steps taken]<reasoning_summary>
-<search_results_summary>
+<think_summary>[Brief summary of logical steps taken]<think_summary>
+<information_summary>
 [Key Information from Search Results: Copy ALL relevant facts from search results EXACTLY as provided]
 - Minimize the context length by only including the most relevant information, including important names, dates, facts
 - Use direct quotes from search results
 - Preserve the exact wording for critical information
-<search_results_summary>
+<information_summary>
 
 
 **Critical Requirements:**
