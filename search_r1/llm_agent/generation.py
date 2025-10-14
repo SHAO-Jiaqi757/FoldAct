@@ -69,6 +69,9 @@ class GenerationConfig:
     retriever_enable_global_rate_limit:bool = True 
     # Whether to allow do_search during the final rollout and append <information>
     final_turn_do_search: bool = False
+    # Enable sliding window context: keep only the most recent N turns (0 = keep all)
+    context_window_turns: int = 0
+    full_context_rollout_ratio: float = 0.0
 
 class LLMGenerationManager:
     def __init__(
@@ -97,6 +100,39 @@ class LLMGenerationManager:
 
 
         self.search_tool=SearchTool(config=config,tool_schema=TOOL_SCHEMA)
+
+    def _apply_sliding_window(self, turn_history: List[Dict[str, torch.Tensor]], 
+                            initial_question: torch.Tensor) -> torch.Tensor:
+        """
+        Apply sliding window to keep only the most recent N turns.
+        Returns concatenated input_ids for current rolling context.
+
+        Behavior:
+        - If context_window_turns <= 0: keep all turns
+        - If context_window_turns >= len(turn_history): keep all turns
+        - Else: keep only the last N turns
+        Edge case:
+        - If no turns exist yet, return the initial_question
+        """
+        window_size = getattr(self.config, "context_window_turns", 0)
+        if len(turn_history) == 0:
+            return initial_question
+
+        if window_size <= 0 or window_size >= len(turn_history):
+            selected_turns = turn_history
+        else:
+            selected_turns = turn_history[-window_size:]
+
+        all_tokens: List[torch.Tensor] = []
+        for turn in selected_turns:
+            all_tokens.append(turn['responses'])
+            if turn.get('observations') is not None:
+                all_tokens.append(turn['observations'])
+
+        if all_tokens:
+            return self.tensor_fn.concatenate_with_padding(all_tokens)
+        else:
+            return initial_question
 
     def _batch_tokenize(self, responses: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Tokenize a batch of responses."""
@@ -160,8 +196,14 @@ class LLMGenerationManager:
         responses, responses_offsets = self._batch_tokenize(responses_str)
         return responses, responses_offsets, responses_str
 
-    def _process_next_obs(self, next_obs: List[str]) -> torch.Tensor:
-        """Process next observations from environment."""
+    def _process_next_obs(self, next_obs: List[str]) -> Tuple[torch.Tensor, torch.Tensor, bool]:
+        """Process next observations from environment.
+        
+        Returns:
+            next_obs_ids: Tokenized observation IDs
+            information_types: Type markers for each token
+            obs_too_long: Flag indicating if any observation exceeded max_obs_length
+        """
         
         result = self.tokenizer(
             next_obs, 
@@ -174,11 +216,13 @@ class LLMGenerationManager:
         next_obs_ids = result['input_ids']
         information_types = result['attention_mask'] * ResponseType.information.value
 
+        obs_too_long = False
         if next_obs_ids.shape[1] > self.config.max_obs_length:
-            print(f"[WARNING] OBSERVATION TOO LONG, CONSIDER CHANGING YOUR CONFIG, {next_obs_ids.shape[1]} & {self.config.max_obs_length}")            
+            obs_too_long = True
+            print(f"[WARNING] OBSERVATION TOO LONG ({next_obs_ids.shape[1]} > {self.config.max_obs_length}), FORCING SUMMARIZED CONTEXT")            
             next_obs_ids = next_obs_ids[:, :self.config.max_obs_length]
 
-        return next_obs_ids, information_types
+        return next_obs_ids, information_types, obs_too_long
 
     def _update_rolling_state(self, rollings: DataProto, cur_responses: torch.Tensor, 
                             next_obs_ids: torch.Tensor) -> Dict:
@@ -341,7 +385,7 @@ class LLMGenerationManager:
         return padded_output
     
     def run_llm_loop(self, gen_batch, initial_input_ids: torch.Tensor) -> Tuple[Dict, Dict]:
-        """Run main LLM generation loop."""
+        """Run main LLM generation loop with optional sliding window context management."""
         
         original_left_side = {'input_ids': initial_input_ids[:, -self.config.max_start_length:]}
         original_right_side = {
@@ -359,6 +403,24 @@ class LLMGenerationManager:
         valid_search_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
         active_num_list = [active_mask.sum().item()]
         rollings = gen_batch
+
+        # Track history for sliding window if enabled
+        use_sliding = getattr(self.config, "context_window_turns", 0) > 0
+        if use_sliding:
+            initial_question_ids = gen_batch.batch['input_ids'].clone()
+            turn_history: List[Dict[str, torch.Tensor]] = []
+        
+        # GRPO full-context strategy: randomly decide for this rollout instance
+        # If ratio=0.1, then 10% of rollouts will use full context for ALL turns
+        import random
+        full_context_ratio = getattr(self.config, "full_context_rollout_ratio", 0.0)
+        use_full_context_this_rollout = (random.random() < full_context_ratio) if full_context_ratio > 0 else False
+        
+        # Track if observation is too long (forces summarized context)
+        force_summarized = False
+        
+        if use_full_context_this_rollout:
+            logger.info(f"[GRPO] This rollout selected for FULL CONTEXT (ratio={full_context_ratio:.1%})")
 
         # Main generation loop
         for step in range(self.config.max_turns):
@@ -398,15 +460,49 @@ class LLMGenerationManager:
             valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
             valid_search_stats += torch.tensor(is_search, dtype=torch.int)
 
-            next_obs_ids, information_types = self._process_next_obs(next_obs)
+            next_obs_ids, information_types, obs_too_long = self._process_next_obs(next_obs)
+            if obs_too_long:
+                force_summarized = True  # Force summarized context for remaining turns
+            
             responses_types = torch.cat([action_types, information_types], dim=1)
 
             # Update states
-            rollings = self._update_rolling_state(
-                rollings,
-                responses_ids,
-                next_obs_ids
-            )
+            if use_sliding:
+                # Store current turn and rebuild rolling context using sliding window
+                turn_history.append({
+                    'responses': responses_ids.clone(),
+                    'observations': next_obs_ids.clone(),
+                })
+                
+                # Decide whether to use full context for this turn
+                # Priority: force_summarized > use_full_context_this_rollout
+                if force_summarized:
+                    # Observation too long: FORCE summarized context (safety override)
+                    windowed_input_ids = self._apply_sliding_window(turn_history, initial_question_ids)
+                    if step == 0 or step == self.config.max_turns - 1:
+                        logger.info(f"Step {step}: FORCED summarized context (observation too long)")
+                elif use_full_context_this_rollout:
+                    # This rollout was selected for full context (GRPO strategy)
+                    all_tokens: List[torch.Tensor] = []
+                    for t in turn_history:
+                        all_tokens.append(t['responses'])
+                        if t.get('observations') is not None:
+                            all_tokens.append(t['observations'])
+                    windowed_input_ids = self.tensor_fn.concatenate_with_padding(all_tokens) if all_tokens else initial_question_ids
+                    logger.info(f"Step {step}: Using FULL context (GRPO rollout strategy, {len(turn_history)} turns)")
+                else:
+                    # Default: use sliding window
+                    windowed_input_ids = self._apply_sliding_window(turn_history, initial_question_ids)
+                
+                rollings.batch['input_ids'] = windowed_input_ids
+                rollings.batch['attention_mask'] = self.tensor_fn.create_attention_mask(windowed_input_ids)
+                rollings.batch['position_ids'] = self.tensor_fn.create_position_ids(rollings.batch['attention_mask'])
+            else:
+                rollings = self._update_rolling_state(
+                    rollings,
+                    responses_ids,
+                    next_obs_ids
+                )
             original_right_side = self._update_right_side(
                 original_right_side,
                 responses_ids,
@@ -454,7 +550,8 @@ class LLMGenerationManager:
 
             if do_search_final:
                 # Process observations: get token ids and corresponding information types
-                next_obs_ids, information_types = self._process_next_obs(next_obs)
+                next_obs_ids, information_types, obs_too_long = self._process_next_obs(next_obs)
+                # Note: We don't update force_summarized here since this is the final turn
                 # Extend response types to include information types so lengths match
                 responses_types = torch.cat([responses_types, information_types], dim=1)
                 original_right_side = self._update_right_side(
