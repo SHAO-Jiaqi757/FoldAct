@@ -145,7 +145,7 @@ def main():
     print("The training pipeline will automatically use this chat template.")
     print("\nNext steps:")
     print("  1. Ensure your data uses generic format: [{'role': 'user', 'content': '...'}]")
-    print("  2. Run training with: bash examples/sft/search_r1/train_summary_mixed.sh")
+    print("  2. Run training with: bash examples/sft/context_summary/train_summary_mixed.sh")
     print("  3. The framework will automatically apply the Qwen template during training")
     print("=" * 80)
     

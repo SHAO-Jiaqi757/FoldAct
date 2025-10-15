@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# 训练脚本 - 数据集 2: Summary 替换模式
-# prompt = summary only (丢弃原始 prompt)
-# 模型学习: 从简洁的上下文中推理
+# 训练脚本 - 数据集 1: Summary 前缀模式
+# answer = summary + 原始 answer
+# 模型学习: 先总结，再推理回答
 
 set -x
 
 if [ "$#" -lt 2 ]; then
-    echo "Usage: train_summary_only.sh <nproc_per_node> <save_path> [other_configs...]"
-    echo "Example: bash train_summary_only.sh 8 /tmp/sft_summary_only"
+    echo "Usage: train_summary_prefix.sh <nproc_per_node> <save_path> [other_configs...]"
+    echo "Example: bash train_summary_prefix.sh 8 /tmp/sft_summary_prefix"
     exit 1
 fi
 
@@ -18,8 +18,8 @@ save_path=$2
 shift 2
 
 # Data paths (pre-split files under data/sft_compress)
-TRAIN_FILES=${TRAIN_FILES:-data/sft_compress/sft_train_summary_only_train.parquet}
-VAL_FILES=${VAL_FILES:-data/sft_compress/sft_train_summary_only_val.parquet}
+TRAIN_FILES=${TRAIN_FILES:-data/sft_compress/sft_train_summary_prefix_train.parquet}
+VAL_FILES=${VAL_FILES:-data/sft_compress/sft_train_summary_prefix_val.parquet}
 
 if [ ! -f "$TRAIN_FILES" ]; then
   echo "错误: 训练文件不存在: $TRAIN_FILES"
@@ -39,9 +39,9 @@ ACC_STEPS=${ACC_STEPS:-6}
 GLOBAL_TBS=$(( MICRO_BSZ * nproc_per_node * ACC_STEPS ))
 
 echo "=================================================="
-echo "训练配置 - 数据集 2: Summary 替换模式"
+echo "训练配置 - 数据集 1: Summary 前缀模式"
 echo "=================================================="
-echo "数据集: prompt = summary only"
+echo "数据集: answer = summary + 原始 answer"
 echo "模型: $MODEL"
 echo "训练文件: $TRAIN_FILES"
 echo "验证文件: $VAL_FILES"
@@ -58,7 +58,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     data.response_key=extra_info \
     data.prompt_dict_keys=['question'] \
     data.response_dict_keys=['answer'] \
-    data.max_length=2048 \
+    data.max_length=4096 \
     data.truncation=right \
     data.micro_batch_size_per_gpu=$MICRO_BSZ \
     data.train_batch_size=$GLOBAL_TBS \
@@ -73,8 +73,8 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     optim.clip_grad=1.0 \
     optim.lr_scheduler=cosine \
     trainer.default_local_dir=$save_path \
-    trainer.project_name=search-r1-sft-summary-only \
-    trainer.experiment_name=summary-only-$(basename $MODEL) \
+    trainer.project_name=search-agent-sft-summary-prefix \
+    trainer.experiment_name=summary-prefix-$(basename $MODEL) \
     trainer.total_epochs=5 \
     trainer.logger=['console'] \
     trainer.default_hdfs_dir=null \

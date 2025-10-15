@@ -73,13 +73,13 @@ echo "════════════════════════�
 phase1_path="${base_save_path}/phase1_summary_only"
 
 if [ "${DRY_RUN:-0}" = "1" ]; then
-  echo "[DRY_RUN] Phase 1 cmd: bash examples/sft/search_r1/train_summary_only.sh $nproc_per_node $phase1_path \\
+  echo "[DRY_RUN] Phase 1 cmd: bash examples/sft/context_summary/train_summary_only.sh $nproc_per_node $phase1_path \\
     model.partial_pretrain=$MODEL \\
     trainer.total_epochs=10 \\
     optim.lr=1e-5 \\
     ${EXTRA_HYDRA[*]}"
 else
-  bash examples/sft/search_r1/train_summary_only.sh $nproc_per_node $phase1_path \
+  bash examples/sft/context_summary/train_summary_only.sh $nproc_per_node $phase1_path \
       model.partial_pretrain=$MODEL \
       trainer.total_epochs=10 \
       optim.lr=1e-5 \
@@ -113,14 +113,14 @@ echo "从 checkpoint 继续训练: $latest_ckpt"
 phase2_path="${base_save_path}/phase2_summary_prefix"
 
 if [ "${DRY_RUN:-0}" = "1" ]; then
-  echo "[DRY_RUN] Phase 2 cmd: bash examples/sft/search_r1/train_summary_prefix.sh $nproc_per_node $phase2_path \\
+  echo "[DRY_RUN] Phase 2 cmd: bash examples/sft/context_summary/train_summary_prefix.sh $nproc_per_node $phase2_path \\
     model.partial_pretrain=$latest_ckpt \\
     trainer.total_epochs=5 \\
     optim.lr=5e-6 \\
     ${EXTRA_HYDRA[*]}"
   exit 0
 else
-  bash examples/sft/search_r1/train_summary_prefix.sh $nproc_per_node $phase2_path \
+  bash examples/sft/context_summary/train_summary_prefix.sh $nproc_per_node $phase2_path \
       model.partial_pretrain=$latest_ckpt \
       trainer.total_epochs=5 \
       optim.lr=5e-6 \
