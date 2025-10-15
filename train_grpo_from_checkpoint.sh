@@ -155,12 +155,15 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.reward_fn_key=data_source \
     data.train_batch_size=128 \
     data.val_batch_size=8 \
-    data.max_prompt_length=6144 \
-    data.max_response_length=2048 \
+    data.max_prompt_length=4096 \
+    data.max_response_length=1024 \
     algorithm.adv_estimator=grpo \
     \
     `# ========== MODEL CONFIGURATION (from checkpoint) ==========` \
-    actor_rollout_ref.model.path=$BASE_MODEL \
+    `# Actor model uses the checkpoint for training` \
+    +actor_rollout_ref.actor.model.path=$BASE_MODEL \
+    `# Rollout model uses base HuggingFace model for vLLM compatibility` \
+    actor_rollout_ref.model.path=Qwen/Qwen2.5-3B-Instruct \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_activation_offload=true \
@@ -177,9 +180,9 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     \
     `# ========== ACTOR FSDP & BATCH SIZE ==========` \
     actor_rollout_ref.actor.ppo_mini_batch_size=128 \
-    actor_rollout_ref.actor.ppo_micro_batch_size=4 \
+    actor_rollout_ref.actor.ppo_micro_batch_size=2 \
     actor_rollout_ref.actor.use_dynamic_bsz=true \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=6144 \
     actor_rollout_ref.actor.fsdp_config.param_offload=true \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
     +actor_rollout_ref.actor.fsdp_config.grad_offload=true \
@@ -192,13 +195,13 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.temperature=0.7 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.max_model_len=8192 \
-    actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
-    actor_rollout_ref.rollout.max_num_seqs=16 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=6144 \
+    actor_rollout_ref.rollout.max_num_seqs=4 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.95 \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.external_executor=false \
-    actor_rollout_ref.rollout.cuda_visible_devices=[1,2,6,7] \
-    +actor_rollout_ref.rollout.dp_size_override=4 \
+    actor_rollout_ref.rollout.cuda_visible_devices=[5] \
+    +actor_rollout_ref.rollout.dp_size_override=1 \
     actor_rollout_ref.rollout.engine_kwargs.vllm.swap_space=16 \
     actor_rollout_ref.rollout.n_agent=1 \
     env.rollout.n=5 \
@@ -253,7 +256,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +data.val_data_num=256 \
     data.max_start_length=512 \
     data.max_obs_length=1900 \
-    data.filter_overlong_prompts=False \
+    data.filter_overlong_prompts=True \
     data.truncation=right \
     +data.shuffle_train_dataloader=True \
     \
@@ -277,4 +280,3 @@ echo "======================================================================="
 echo "Experiment: $EXPERIMENT_NAME"
 echo "Checkpoints saved to: verl_checkpoints/$EXPERIMENT_NAME"
 echo "Log file: $LOG_FILE"
-
