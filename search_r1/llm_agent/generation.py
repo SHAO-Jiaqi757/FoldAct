@@ -800,13 +800,19 @@ class LLMGenerationManager:
                     is_search.append(0)
                 elif action == 'search':
                     # Only consume search result for active entries
-                    next_obs.append(f'\n\n<information>{search_results.pop(0).strip()}</information>\n\n If you find the information is not enough, you should reflect and care about following actions')
+                    # next_obs.append(f'\n\n<information>{search_results.pop(0).strip()}</information>\n\n If you find the information is not enough, you should reflect and care about following actions')
+                    next_obs.append(f'\n\n<information>{search_results.pop(0).strip()}</information>\n\n')
                     dones.append(0)
                     valid_action.append(1)
                     is_search.append(1)
+                elif action in ["think", "think_summary", "information_summary"]:
+                    dones.append(0)
+                    valid_action.append(1)
+                    is_search.append(0)
                 else:
                     next_obs.append(f'\nMy previous action is invalid. \
 If I want to search, I should put the query between <search> and </search>. \
+If I want to present thinking process, I should put the thinking process between <think> and </think>. \
 If I want to give the final answer, I should put the answer between <answer> and </answer>. Let me try again.\n')
                     dones.append(0)
                     valid_action.append(0)
