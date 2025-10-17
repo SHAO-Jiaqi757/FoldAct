@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Add summary field to SFT training data using OpenAI API with batch concurrent processing.
+Add summary field to Multi-turn SFT training data using OpenAI API with batch concurrent processing.
+Only processes samples with turn_index >= 1.
 Summary should:
 1. State the question
 2. Summarize reasoning logic
@@ -36,13 +37,13 @@ Your task: Create a summary that enables the model to produce the correct next a
 **Structure:**
 
 Question: [State the question clearly]
-<think_summary>[Brief summary of logical steps taken]<think_summary>
+<think_summary>[Brief summary of logical steps taken]</think_summary>
 <information_summary>
 [Key Information from Search Results: Copy ALL relevant facts from search results EXACTLY as provided]
 - Minimize the context length by only including the most relevant information, including important names, dates, facts
 - Use direct quotes from search results
 - Preserve the exact wording for critical information
-<information_summary>
+</information_summary>
 
 
 **Critical Requirements:**
@@ -60,11 +61,33 @@ Question: [State the question clearly]
 Generate the summary following the structure above:"""
 
 
+def extract_context_from_multiturn(sample: Dict[str, Any]) -> str:
+    """Extract context from multiturn format for summary generation."""
+    messages = sample["prompt"]
+    
+    # Build context from all messages
+    context_parts = []
+    for msg in messages:
+        role = msg["role"]
+        content = msg["content"]
+        
+        if role == "user":
+            if content.startswith("Question:"):
+                context_parts.append(content)
+            elif content.startswith("<information>"):
+                context_parts.append(content)
+        elif role == "assistant":
+            if content.startswith("<think>") or content.startswith("<search>"):
+                context_parts.append(content)
+    
+    return "\n\n".join(context_parts)
+
+
 async def generate_summary_async(
     client: AsyncOpenAI,
     question_context: str,
     expected_answer: str,
-    model: str = "gpt-4o-mini",
+    model: str = "gpt-4.1-mini",
     semaphore: asyncio.Semaphore = None
 ) -> str:
     """Generate summary using OpenAI API asynchronously."""
@@ -106,27 +129,43 @@ async def process_batch_async(
     client = AsyncOpenAI(api_key=api_key, base_url=os.environ.get("OPENAI_URL"))
     
     # Read all samples
-    samples = []
+    all_samples = []
     with open(input_file, 'r', encoding='utf-8') as f:
         for i, line in enumerate(f):
             if limit and i >= limit:
                 break
             line = line.strip()
             if line:
-                samples.append(json.loads(line))
+                all_samples.append(json.loads(line))
     
-    print(f"Loaded {len(samples)} samples from {input_file}")
+    print(f"Loaded {len(all_samples)} total samples from {input_file}")
+    
+    # Filter samples with turn_index >= 1
+    samples_to_process = []
+    for sample in all_samples:
+        turn_index = sample.get("extra_info", {}).get("turn_index", -1)
+        if turn_index >= 1:
+            samples_to_process.append(sample)
+    
+    print(f"Found {len(samples_to_process)} samples with turn_index >= 1 to process")
     print(f"Using model: {model}")
     print(f"Max concurrent requests: {max_concurrent}")
+    
+    if not samples_to_process:
+        print("No samples to process. Copying input to output...")
+        with open(output_file, 'w', encoding='utf-8') as f:
+            for sample in all_samples:
+                f.write(json.dumps(sample, ensure_ascii=False) + '\n')
+        return
     
     # Create semaphore to limit concurrent requests
     semaphore = asyncio.Semaphore(max_concurrent)
     
-    # Create tasks for all samples
+    # Create tasks for samples that need summaries
     tasks = []
-    for sample in samples:
-        question_context = sample["extra_info"]["question"]
-        expected_answer = sample["extra_info"]["answer"]
+    for sample in samples_to_process:
+        question_context = extract_context_from_multiturn(sample)
+        expected_answer = sample["answer"]
         
         task = generate_summary_async(
             client=client,
@@ -142,36 +181,43 @@ async def process_batch_async(
     summaries = await atqdm.gather(*tasks, desc="Processing")
     
     # Add summaries to samples
-    for sample, summary in zip(samples, summaries):
-        sample["summary"] = summary
+    summary_index = 0
+    for sample in all_samples:
+        turn_index = sample.get("extra_info", {}).get("turn_index", -1)
+        if turn_index >= 1:
+            sample["summary"] = summaries[summary_index]
+            summary_index += 1
     
     # Write output
     print(f"\nWriting results to {output_file}...")
     with open(output_file, 'w', encoding='utf-8') as f:
-        for sample in samples:
+        for sample in all_samples:
             f.write(json.dumps(sample, ensure_ascii=False) + '\n')
     
-    print(f"Done! Processed {len(samples)} samples.")
+    print(f"Done! Processed {len(samples_to_process)} samples with summaries.")
+    print(f"Total samples in output: {len(all_samples)}")
     
     # Show sample summary
-    if samples:
+    if samples_to_process:
         print("\n" + "="*80)
         print("EXAMPLE SUMMARY:")
         print("="*80)
-        print(f"Question (first 200 chars):\n{samples[0]['extra_info']['question'][:200]}...")
-        print(f"\nGenerated Summary (first 500 chars):\n{samples[0]['summary'][:500]}...")
+        first_sample = samples_to_process[0]
+        print(f"Turn Index: {first_sample.get('extra_info', {}).get('turn_index', 'N/A')}")
+        print(f"Question (first 200 chars):\n{first_sample.get('extra_info', {}).get('question', '')[:200]}...")
+        print(f"\nGenerated Summary (first 500 chars):\n{first_sample['summary'][:500]}...")
         print("="*80)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Add summary field to SFT data using OpenAI API"
+        description="Add summary field to Multi-turn SFT data using OpenAI API"
     )
     parser.add_argument(
         "--input_file",
         type=str,
         required=True,
-        help="Path to input JSONL file"
+        help="Path to input JSONL file (multiturn format)"
     )
     parser.add_argument(
         "--output_file",
@@ -188,8 +234,8 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="gpt-4o-mini",
-        help="OpenAI model to use (default: gpt-4o-mini)"
+        default="gpt-4.1-mini",
+        help="OpenAI model to use (default: gpt-4.1-mini)"
     )
     parser.add_argument(
         "--max_concurrent",
@@ -226,4 +272,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

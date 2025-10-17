@@ -24,12 +24,16 @@ The conversation is split at each search_result step to create multiple training
 import argparse
 import json
 import os
+import random
 from typing import List, Dict, Any
 
 
-def format_reasoning(content: str) -> str:
-    """Format reasoning content with <think> tags."""
-    return f"<think>\n{content}\n</think>"
+def format_reasoning(content: str, use_think_tags: bool = True) -> str:
+    """Format reasoning content with or without <think> tags."""
+    if use_think_tags:
+        return f"<think>\n{content}\n</think>"
+    else:
+        return content
 
 
 def format_search(query: str) -> str:
@@ -52,7 +56,7 @@ def format_answer(content: str) -> str:
     return f"<answer>\n{content}\n</answer>"
 
 
-def process_single_example_multiturn(example: Dict[str, Any]) -> List[Dict[str, Any]]:
+def process_single_example_multiturn(example: Dict[str, Any], think_drop_prob: float = 0.3) -> List[Dict[str, Any]]:
     """
     Process a single example into multiple multi-turn training samples.
     
@@ -105,6 +109,52 @@ def process_single_example_multiturn(example: Dict[str, Any]) -> List[Dict[str, 
     
     sft_samples = []
     
+    # First, create a training sample for the initial assistant response (turn_index 0)
+    # This teaches the model to respond to questions directly
+    if turns and (turns[0]["reasoning"] or turns[0]["search"]):
+        messages = []
+        
+        # Turn 0: User asks question
+        messages.append({
+            "role": "user", 
+            "content": question
+        })
+        
+        # Turn 1: Assistant responds with initial reasoning/search
+        assistant_content = ""
+        if turns[0]["reasoning"]:
+            reasoning_text = "\n".join(turns[0]["reasoning"])
+            use_think_tags = random.random() > think_drop_prob
+            formatted_reasoning = format_reasoning(reasoning_text, use_think_tags)
+            assistant_content += formatted_reasoning + "\n\n"
+        
+        if turns[0]["search"]:
+            assistant_content += format_search(turns[0]["search"])
+        
+        assistant_content = assistant_content.strip()
+        if assistant_content:
+            # Create SFT sample for initial response
+            # prompt should only contain user question, not the assistant response
+            prompt_messages = [{
+                "role": "user", 
+                "content": question
+            }]
+            
+            sft_sample = {
+                "data_source": "search_agent_multiturn",
+                "prompt": prompt_messages,  # Only user question, no assistant response
+                "ability": "search_reasoning", 
+                "answer": assistant_content,  # The assistant response to predict
+                "extra_info": {
+                    "question": question,
+                    "split_index": -1,  # Special index for initial response
+                    "total_splits": len(search_result_turns) + 1,  # +1 for initial response
+                    "turn_index": 0,  # This is turn_index 0
+                    "num_assistant_turns": 0,  # No assistant turns in prompt
+                },
+            }
+            sft_samples.append(sft_sample)
+    
     # Create training samples by cutting at each search_result
     # Strategy: Build up the conversation progressively
     # Each sample trains on ALL assistant responses up to that point
@@ -128,10 +178,15 @@ def process_single_example_multiturn(example: Dict[str, Any]) -> List[Dict[str, 
             # Assistant turn: <think>...</think> <search>...</search> or <answer>...</answer>
             assistant_content = ""
             
-            # Add reasoning if present
+            # Add reasoning if present (randomly drop think tags)
             if turn["reasoning"]:
                 reasoning_text = "\n".join(turn["reasoning"])
-                assistant_content += format_reasoning(reasoning_text) + "\n\n"
+                use_think_tags = random.random() > think_drop_prob
+                formatted_reasoning = format_reasoning(reasoning_text, use_think_tags)
+                if use_think_tags:
+                    assistant_content += formatted_reasoning + "\n\n"
+                else:
+                    assistant_content += formatted_reasoning + "\n\n"
             
             # Add search or answer
             if turn["search"]:
@@ -159,11 +214,14 @@ def process_single_example_multiturn(example: Dict[str, Any]) -> List[Dict[str, 
             # Extract the final assistant response as the answer field
             final_assistant_content = messages[-1]["content"]
             
-            # Create SFT sample with full multi-turn conversation
+            # Remove the last assistant message from prompt to avoid duplication
+            prompt_messages = messages[:-1]  # All messages except the last assistant response
+            
+            # Create SFT sample with multi-turn conversation (excluding final assistant response)
             # MultiTurnSFTDataset will compute loss on ALL assistant messages in this conversation
             sft_sample = {
                 "data_source": "search_agent_multiturn",
-                "prompt": messages,  # Complete multi-turn conversation
+                "prompt": prompt_messages,  # Multi-turn conversation without final assistant response
                 "ability": "search_reasoning",
                 "answer": final_assistant_content,  # The final assistant response
                 "extra_info": {
@@ -171,7 +229,7 @@ def process_single_example_multiturn(example: Dict[str, Any]) -> List[Dict[str, 
                     "split_index": idx,
                     "total_splits": len(search_result_turns),
                     "turn_index": split_turn_idx + 1,
-                    "num_assistant_turns": sum(1 for m in messages if m["role"] == "assistant"),
+                    "num_assistant_turns": sum(1 for m in prompt_messages if m["role"] == "assistant"),
                 },
             }
             sft_samples.append(sft_sample)
@@ -188,6 +246,8 @@ def main():
     parser.add_argument("--output_format", type=str, default="parquet",
                         choices=["parquet", "jsonl"],
                         help="Output format (parquet or jsonl)")
+    parser.add_argument("--think_drop_prob", type=float, default=0.3,
+                        help="Probability of dropping <think> tags (0.0 = never drop, 1.0 = always drop)")
     
     args = parser.parse_args()
     
@@ -201,7 +261,7 @@ def main():
                 continue
             try:
                 example = json.loads(line)
-                samples = process_single_example_multiturn(example)
+                samples = process_single_example_multiturn(example, args.think_drop_prob)
                 all_samples.extend(samples)
                 if line_num % 50 == 0:
                     print(f"Processed {line_num} examples, generated {len(all_samples)} training samples so far")

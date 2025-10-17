@@ -20,76 +20,36 @@ The pipeline transforms raw Agent traces into two specialized training datasets 
 python3 examples/data_preprocess/process_search_agent_multiturn.py \
     --input_file data/sft_compress/filtered_results_sample_200.jsonl \
     --output_file data/sft_compress/sft_train_multiturn.jsonl \
-    --output_format jsonl
+    --output_format jsonl \
+    --think_drop_prob 0.3
 ```
 
 
 ### Dataset with Summary
 
-1. Split long reasoning traces into multiple training samples at each `search_result` step.
 
-**Script**: `examples/data_preprocess/process_search_agent_sft.py`
-
-
-**Logic**:
-- For a trace with N `search_result` steps, generates N training samples
-- Each sample includes:
-  - **Prompt**: Question + reasoning steps + search queries + search results up to step i
-  - **Answer**: Next reasoning/search/answer steps until step i+1 (or end)
-
-**Example**:
-```
-Original trace: Question → reasoning₁ → search₁ → result₁ → reasoning₂ → search₂ → result₂ → answer
-
-Generated samples:
-Sample 1: [Question → reasoning₁ → search₁ → result₁] → [reasoning₂ → search₂]
-Sample 2: [Question → reasoning₁ → search₁ → result₁ → reasoning₂ → search₂ → result₂] → [answer]
-```
-
-**Output**: `sft_train_sample.jsonl` (~1,600 training samples from 200 original traces)
+**Script**: `examples/data_preprocess/add_summary_multiturn.py`
 
 **Usage**:
 ```bash
-python3 examples/data_preprocess/process_search_agent_sft.py \
-    --input_file data/sft_compress/filtered_results_sample_200.jsonl \
-    --output_file data/sft_compress/sft_train_sample.jsonl
-```
-
-2. Summary Generation: Add concise summaries to each training sample using OpenAI API (GPT-4o-mini)
-
-**Script**: `examples/data_preprocess/add_summary_openai.py`
-
-**Summary Components**:
-1. **Question**: Clearly state what needs to be answered
-2. **Reasoning Summary**: Brief description of logical thinking process
-3. **Search Results Summary**: Key information from search results (verbatim quotes)
-
-**Output**: `sft_train_with_summary.jsonl` (each sample now includes a `summary` field)
-
-**Usage**:
-```bash
-python3 examples/data_preprocess/add_summary_openai.py \
-    --input_file data/sft_compress/sft_train_sample.jsonl \
-    --output_file data/sft_compress/sft_train_with_summary.jsonl \
+# 使用OpenAI API添加summary（需要API key）
+python3 examples/data_preprocess/add_summary_multiturn.py \
+    --input_file data/sft_compress/sft_train_multiturn.jsonl \
+    --output_file data/sft_compress/sft_train_multiturn_with_summary.jsonl \
     --max_concurrent 100
 ```
 
+
+**Summary Components**:
+1. **Question**: Clearly state what needs to be answered
+2. **Reasoning Summary**: Brief description of logical thinking process  
+3. **Search Results Summary**: Key information from search results (verbatim quotes)
+
+
+
 3. Dataset Splitting: Create two specialized datasets for different training objectives.
 
-**Script**: `examples/data_preprocess/split_summary_datasets.py`
-
-
-**Dataset 1 (Summary Prefix)**: `sft_train_summary_prefix.jsonl`
-- **Prompt**: Original full context (question + reasoning + search results)
-- **Answer**: **Summary + Original answer**
-- **Purpose**: Teach model to generate summaries and perform complete reasoning
-- **Size**: 1.6MB → Parquet: 2.9MB (train) + 166KB (val)
-
-**Dataset 2 (Summary Only)**: `sft_train_summary_only.jsonl`
-- **Prompt**: **Summary only** (discard original context)
-- **Answer**: Original answer (no summary prefix)
-- **Purpose**: Teach model to reason efficiently from concise context
-- **Size**: 442KB → Parquet: 657KB (train) + 53KB (val)
+**Script**: `examples/data_preprocess/split_summary_datasets_multiturn.py`
 
 **Comparison**:
 ```
@@ -106,8 +66,8 @@ python3 examples/data_preprocess/add_summary_openai.py \
 
 **Usage**:
 ```bash
-python3 examples/data_preprocess/split_summary_datasets.py \
-    --input_file data/sft_compress/sft_train_with_summary.jsonl \
+python3 examples/data_preprocess/split_summary_datasets_multiturn.py \
+    --input_file data/sft_compress/sft_train_multiturn_with_summary.jsonl \
     --output_dataset1 data/sft_compress/sft_train_summary_prefix.jsonl \
     --output_dataset2 data/sft_compress/sft_train_summary_only.jsonl
 ```
@@ -124,8 +84,6 @@ python3 examples/data_preprocess/split_summary_datasets.py \
 # One command to do everything (split + convert)
 bash examples/data_preprocess/prepare_train_val_datasets.sh
 
-# Customize validation ratio (e.g., 15%)
-VAL_RATIO=0.15 bash examples/data_preprocess/prepare_train_val_datasets.sh
 ```
 
 
@@ -312,20 +270,22 @@ data/sft_compress/
 **Complete pipeline from scratch**:
 
 ```bash
-# 1. Process traces into training samples
-python3 examples/data_preprocess/process_search_agent_sft.py \
+# 1. Process traces into multiturn format
+python3 examples/data_preprocess/process_search_agent_multiturn.py \
     --input_file data/sft_compress/filtered_results_sample_200.jsonl \
-    --output_file data/sft_compress/sft_train_sample.jsonl
+    --output_file data/sft_compress/sft_train_multiturn.jsonl \
+    --output_format jsonl \
+    --think_drop_prob 0.3
 
-# 2. Add summaries with OpenAI API
-python3 examples/data_preprocess/add_summary_openai.py \
-    --input_file data/sft_compress/sft_train_sample.jsonl \
-    --output_file data/sft_compress/sft_train_with_summary.jsonl \
+# 2. Add summaries to multiturn data (only turn_index >= 1)
+python3 examples/data_preprocess/add_summary_multiturn.py \
+    --input_file data/sft_compress/sft_train_multiturn.jsonl \
+    --output_file data/sft_compress/sft_train_multiturn_with_summary.jsonl \
     --max_concurrent 100
 
-# 3. Split into two datasets
-python3 examples/data_preprocess/split_summary_datasets.py \
-    --input_file data/sft_compress/sft_train_with_summary.jsonl \
+# 3. Generate two training datasets
+python3 examples/data_preprocess/split_summary_datasets_multiturn.py \
+    --input_file data/sft_compress/sft_train_multiturn_with_summary.jsonl \
     --output_dataset1 data/sft_compress/sft_train_summary_prefix.jsonl \
     --output_dataset2 data/sft_compress/sft_train_summary_only.jsonl
 

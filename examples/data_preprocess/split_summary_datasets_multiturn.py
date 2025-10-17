@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Split summary dataset into two variants:
-1. Dataset 1: Keep original prompt, answer = summary + original answer
-2. Dataset 2: prompt = summary only (discard original prompt), keep original answer
+Split multiturn summary dataset into two variants:
+1. Dataset 1: Keep original multiturn prompt, answer = summary + original answer
+2. Dataset 2: prompt = summary only (discard original multiturn prompt), keep original answer
 """
 
 import argparse
@@ -11,37 +11,39 @@ from pathlib import Path
 from typing import Dict, Any
 
 
-def create_dataset1(sample: Dict[Any, Any]) -> Dict[Any, Any]:
+def create_dataset1_multiturn(sample: Dict[Any, Any]) -> Dict[Any, Any]:
     """
-    Dataset 1: Keep original prompt, answer = summary + original answer
+    Dataset 1: Keep original multiturn prompt, answer = summary + original answer
     """
     new_sample = sample.copy()
     
     # Get summary and original answer
     summary = sample.get("summary", "")
-    original_answer = sample["extra_info"]["answer"]
+    original_answer = sample["answer"]
     
     # Combine summary + answer
     combined_answer = f"{summary}\n\n{original_answer}"
     
-    # Update extra_info
+    # Update answer field
+    new_sample["answer"] = combined_answer
+    
+    # Add metadata
     new_sample["extra_info"] = sample["extra_info"].copy()
-    new_sample["extra_info"]["answer"] = combined_answer
     new_sample["extra_info"]["has_summary_prefix"] = True
     
     return new_sample
 
 
-def create_dataset2(sample: Dict[Any, Any]) -> Dict[Any, Any]:
+def create_dataset2_multiturn(sample: Dict[Any, Any]) -> Dict[Any, Any]:
     """
-    Dataset 2: prompt = summary only (discard original prompt), keep original answer
+    Dataset 2: prompt = summary only (discard original multiturn prompt), keep original answer
     """
     new_sample = sample.copy()
     
     # Get summary
     summary = sample.get("summary", "")
     
-    # Replace prompt with summary
+    # Replace multiturn prompt with simple user message containing summary
     new_sample["prompt"] = [
         {
             "role": "user",
@@ -57,13 +59,13 @@ def create_dataset2(sample: Dict[Any, Any]) -> Dict[Any, Any]:
     return new_sample
 
 
-def process_file(
+def process_multiturn_file(
     input_file: str,
     output_dataset1: str,
     output_dataset2: str,
     limit: int = None
 ):
-    """Process input file and create two output datasets."""
+    """Process multiturn input file and create two output datasets."""
     
     samples = []
     
@@ -94,11 +96,11 @@ def process_file(
     
     # Create Dataset 1
     print(f"\nCreating Dataset 1: answer = summary + original_answer")
-    dataset1 = [create_dataset1(s) for s in samples]
+    dataset1 = [create_dataset1_multiturn(s) for s in samples]
     
     # Create Dataset 2
-    print(f"Creating Dataset 2: prompt = summary, discard original prompt")
-    dataset2 = [create_dataset2(s) for s in samples]
+    print(f"Creating Dataset 2: prompt = summary, discard original multiturn prompt")
+    dataset2 = [create_dataset2_multiturn(s) for s in samples]
     
     # Save Dataset 1
     print(f"\nSaving Dataset 1 to {output_dataset1}...")
@@ -122,39 +124,40 @@ def process_file(
     print("\n" + "="*80)
     print("DATASET 1 EXAMPLE (answer = summary + original_answer)")
     print("="*80)
-    print(f"Prompt (first 200 chars):\n{dataset1[0]['extra_info']['question'][:200]}...")
-    print(f"\nAnswer (first 300 chars):\n{dataset1[0]['extra_info']['answer'][:300]}...")
+    print(f"Multiturn prompt length: {len(dataset1[0]['prompt'])} messages")
+    print(f"Answer (first 300 chars):\n{dataset1[0]['answer'][:300]}...")
     
     print("\n" + "="*80)
     print("DATASET 2 EXAMPLE (prompt = summary only)")
     print("="*80)
-    print(f"Prompt (first 300 chars):\n{dataset2[0]['extra_info']['question'][:300]}...")
-    print(f"\nAnswer (first 200 chars):\n{dataset2[0]['extra_info']['answer'][:200]}...")
+    print(f"Simple prompt: {len(dataset2[0]['prompt'])} message(s)")
+    print(f"Prompt content (first 300 chars):\n{dataset2[0]['prompt'][0]['content'][:300]}...")
+    print(f"Answer (first 200 chars):\n{dataset2[0]['answer'][:200]}...")
     print("="*80)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Split summary dataset into two training variants",
+        description="Split multiturn summary dataset into two training variants",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Process all samples
-  python3 split_summary_datasets.py \\
-      --input_file data/sft_compress/sft_train_with_summary.jsonl \\
+  python3 split_summary_datasets_multiturn.py \\
+      --input_file data/sft_compress/sft_train_multiturn_with_summary.jsonl \\
       --output_dataset1 data/sft_compress/sft_train_summary_prefix.jsonl \\
       --output_dataset2 data/sft_compress/sft_train_summary_only.jsonl
 
   # Test with first 10 samples
-  python3 split_summary_datasets.py \\
-      --input_file data/sft_compress/sft_train_with_summary.jsonl \\
+  python3 split_summary_datasets_multiturn.py \\
+      --input_file data/sft_compress/sft_train_multiturn_with_summary.jsonl \\
       --output_dataset1 data/sft_compress/test_dataset1.jsonl \\
       --output_dataset2 data/sft_compress/test_dataset2.jsonl \\
       --limit 10
 
-Dataset 1: Keep original context, prepend summary to answer
+Dataset 1: Keep original multiturn context, prepend summary to answer
   - Good for: Teaching model to first summarize then answer
-  - prompt: [original question + reasoning + search results]
+  - prompt: [original multiturn conversation]
   - answer: [summary] + [original answer]
 
 Dataset 2: Use summary as prompt, original answer
@@ -168,7 +171,7 @@ Dataset 2: Use summary as prompt, original answer
         "--input_file",
         type=str,
         required=True,
-        help="Input JSONL file with summaries"
+        help="Input JSONL file with multiturn summaries"
     )
     parser.add_argument(
         "--output_dataset1",
@@ -192,7 +195,7 @@ Dataset 2: Use summary as prompt, original answer
     args = parser.parse_args()
     
     try:
-        process_file(
+        process_multiturn_file(
             input_file=args.input_file,
             output_dataset1=args.output_dataset1,
             output_dataset2=args.output_dataset2,
@@ -209,6 +212,3 @@ Dataset 2: Use summary as prompt, original answer
 
 if __name__ == "__main__":
     exit(main())
-
-
-
