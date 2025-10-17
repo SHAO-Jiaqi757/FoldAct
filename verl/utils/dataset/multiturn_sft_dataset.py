@@ -62,9 +62,20 @@ class MultiTurnSFTDataset(Dataset):
             import numpy
             import pandas
 
+            # Handle numpy arrays and pandas Series
             while isinstance(ls, (pandas.core.series.Series, numpy.ndarray)) and len(ls) == 1:
                 ls = ls[0]
-            return ls
+            
+            # Ensure we always return a list of messages, even for single messages
+            if isinstance(ls, dict):
+                # Single message case - wrap in list
+                return [ls]
+            elif isinstance(ls, list):
+                # Already a list of messages
+                return ls
+            else:
+                # Fallback - try to convert to list
+                return list(ls) if hasattr(ls, '__iter__') else [ls]
 
         dataframes = []
         for parquet_file in self.parquet_files:

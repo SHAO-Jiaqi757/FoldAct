@@ -5,7 +5,7 @@
 # Phase 3: Summary Prefix (starting from Phase 2 checkpoint, learning summary generation)
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-export CUDA_VISIBLE_DEVICES=5
+export CUDA_VISIBLE_DEVICES=0,1
 set -e
 
 if [ "$#" -lt 2 ]; then
@@ -88,7 +88,7 @@ phase1_path="${base_save_path}/phase1_multiturn"
 if [ "${DRY_RUN:-0}" = "1" ]; then
   echo "[DRY_RUN] Phase 1 cmd: bash examples/sft/context_summary/train_multiturn.sh $nproc_per_node $phase1_path \\
     model.partial_pretrain=$MODEL \\
-    trainer.total_epochs=10 \\
+    trainer.total_epochs=5 \\
     optim.lr=1e-5 \\
     ${EXTRA_HYDRA[*]}"
 else
@@ -116,9 +116,8 @@ else
     data.val_files=$VAL_FILE \
     data.multiturn.enable=true \
     data.multiturn.messages_key=prompt \
-    data.max_length=2048 \
-    data.truncation=left \
-    data.micro_batch_size=1 \
+    data.max_length=4096 \
+    data.micro_batch_size=24 \
     model.partial_pretrain=$MODEL \
     model.enable_gradient_checkpointing=true \
     model.trust_remote_code=true \
@@ -129,7 +128,7 @@ else
     trainer.project_name=search_agent_progressive_phase1_multiturn \
     trainer.experiment_name=progressive_multiturn_${MODEL##*/} \
     trainer.logger=['console'] \
-    trainer.total_epochs=10 \
+    trainer.total_epochs=5 \
     trainer.default_hdfs_dir=null \
     optim.lr=1e-5 \
     optim.warmup_steps_ratio=0.05 \
@@ -169,13 +168,13 @@ phase2_path="${base_save_path}/phase2_summary_only"
 if [ "${DRY_RUN:-0}" = "1" ]; then
   echo "[DRY_RUN] Phase 2 cmd: bash examples/sft/context_summary/train_summary_only.sh $nproc_per_node $phase2_path \\
     model.partial_pretrain=$phase1_ckpt \\
-    trainer.total_epochs=10 \\
+    trainer.total_epochs=5 \\
     optim.lr=1e-5 \\
     ${EXTRA_HYDRA[*]}"
 else
   bash examples/sft/context_summary/train_summary_only.sh $nproc_per_node $phase2_path \
       model.partial_pretrain=$phase1_ckpt \
-      trainer.total_epochs=10 \
+      trainer.total_epochs=5 \
       optim.lr=1e-5 \
       "${EXTRA_HYDRA[@]}"
 fi

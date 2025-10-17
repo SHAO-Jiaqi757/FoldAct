@@ -80,6 +80,18 @@ class SFTDataset(Dataset):
 
             while isinstance(ls, (pandas.core.series.Series, numpy.ndarray)) and len(ls) == 1:
                 ls = ls[0]
+            
+            # Handle case where ls is a list of messages (for multiturn format)
+            if isinstance(ls, (list, numpy.ndarray)) and len(ls) > 0:
+                first_item = ls[0]
+                if isinstance(first_item, dict) and 'content' in first_item:
+                    # Extract content from the first message
+                    return first_item['content']
+            
+            # Handle case where ls is a single message dict (after unwrapping)
+            if isinstance(ls, dict) and 'content' in ls:
+                return ls['content']
+            
             return ls
 
         dataframes = []
@@ -89,15 +101,27 @@ class SFTDataset(Dataset):
             dataframes.append(dataframe)
         self.dataframe = pd.concat(dataframes)
         self.prompts = self.dataframe[self.prompt_key]
-        for key in self.prompt_dict_keys:
-            # type(x): pandas.core.series.Series
-            # type(x[0]): numpy.ndarray
-            # type(x[0][0]): dict
-            try:
-                self.prompts = self.prompts.apply(lambda x: series_to_item(x)[key], axis=1)  # noqa: B023
-            except Exception:
-                print(f"self.prompts={self.prompts}")
-                raise
+        
+        # Apply series_to_item to all prompts to handle message format
+        if not self.prompt_dict_keys:
+            # Apply the function to each prompt
+            processed_prompts = []
+            for i in range(len(self.prompts)):
+                processed = series_to_item(self.prompts.iloc[i])
+                processed_prompts.append(processed)
+            self.prompts = pd.Series(processed_prompts)
+        else:
+            # Handle dict keys case
+            for key in self.prompt_dict_keys:
+                # type(x): pandas.core.series.Series
+                # type(x[0]): numpy.ndarray
+                # type(x[0][0]): dict
+                try:
+                    self.prompts = self.prompts.apply(lambda x: series_to_item(x)[key], axis=1)  # noqa: B023
+                except Exception:
+                    print(f"self.prompts={self.prompts}")
+                    raise
+        
         if isinstance(self.prompts, pd.DataFrame):
             self.prompts = self.prompts.squeeze()
         self.prompts = self.prompts.tolist()

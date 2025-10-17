@@ -68,6 +68,12 @@ echo "【Step 3】Converting to Parquet format"
 echo "════════════════════════════════════════════════════════════════"
 
 echo ""
+echo "Converting Dataset 0 (Multiturn) - Train..."
+python3 examples/data_preprocess/convert_to_parquet.py \
+    --input ${BASE_DIR}/sft_train_multiturn.jsonl \
+    --output ${BASE_DIR}/sft_train_multiturn.parquet
+
+echo ""
 echo "Converting Dataset 1 (Summary Prefix) - Train..."
 python3 examples/data_preprocess/convert_to_parquet.py \
     --input ${BASE_DIR}/sft_train_summary_prefix_train.jsonl \
@@ -101,6 +107,9 @@ echo "║                     All Done!                                ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
 echo "Generated files:"
+echo "Dataset 0 (Multiturn):"
+echo "  📄 JSONL - Train: ${BASE_DIR}/sft_train_multiturn.jsonl"
+echo "  📦 Parquet - Train: ${BASE_DIR}/sft_train_multiturn.parquet"
 echo ""
 echo "Dataset 1 (Summary Prefix):"
 echo "  📄 JSONL - Train: ${BASE_DIR}/sft_train_summary_prefix_train.jsonl"
