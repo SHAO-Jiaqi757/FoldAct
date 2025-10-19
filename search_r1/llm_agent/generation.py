@@ -121,24 +121,67 @@ class LLMGenerationManager:
         - If no turns exist yet, return the initial_question
         """
         window_size = getattr(self.config, "context_window_turns", 0)
+        
+        # ========== CONTEXT SUMMARIZATION LOGGING ==========
+        print(f"\n{'='*80}")
+        print(f"[CONTEXT SUMMARY] Applying sliding window context compression")
+        print(f"{'='*80}")
+        print(f"[CONTEXT SUMMARY] Window size: {window_size}")
+        print(f"[CONTEXT SUMMARY] Total turns in history: {len(turn_history)}")
+        print(f"[CONTEXT SUMMARY] Initial question length: {initial_question.shape[1]} tokens")
+        
         if len(turn_history) == 0:
+            print(f"[CONTEXT SUMMARY] No turns in history, returning initial question")
             return initial_question
+
+        # Calculate context lengths for each turn
+        turn_lengths = []
+        for i, turn in enumerate(turn_history):
+            response_len = turn['responses'].shape[1]
+            obs_len = turn.get('observations', torch.tensor([])).shape[1] if turn.get('observations') is not None else 0
+            total_len = response_len + obs_len
+            turn_lengths.append(total_len)
+            print(f"[CONTEXT SUMMARY] Turn {i}: response={response_len} tokens, obs={obs_len} tokens, total={total_len} tokens")
 
         if window_size <= 0 or window_size >= len(turn_history):
             selected_turns = turn_history
+            print(f"[CONTEXT SUMMARY] Keeping ALL turns (window_size={window_size} >= {len(turn_history)} turns)")
         else:
             selected_turns = turn_history[-window_size:]
+            discarded_turns = len(turn_history) - window_size
+            print(f"[CONTEXT SUMMARY] Keeping LAST {window_size} turns, DISCARDING {discarded_turns} turns")
+            print(f"[CONTEXT SUMMARY] Kept turns: {discarded_turns} to {len(turn_history)-1}")
 
-        all_tokens: List[torch.Tensor] = []
-        for turn in selected_turns:
+        # Build compressed context (always start with the initial question)
+        all_tokens: List[torch.Tensor] = [initial_question.clone()]
+        total_compressed_length = initial_question.shape[1]
+        print(f"[CONTEXT SUMMARY] Added initial question: {initial_question.shape[1]} tokens")
+        
+        for i, turn in enumerate(selected_turns):
             all_tokens.append(turn['responses'])
             if turn.get('observations') is not None:
                 all_tokens.append(turn['observations'])
+            
+            turn_len = turn['responses'].shape[1] + (turn.get('observations', torch.tensor([])).shape[1] if turn.get('observations') is not None else 0)
+            total_compressed_length += turn_len
+            print(f"[CONTEXT SUMMARY] Selected turn {i}: {turn_len} tokens")
 
-        if all_tokens:
-            return self.tensor_fn.concatenate_with_padding(all_tokens)
-        else:
-            return initial_question
+        compressed_context = self.tensor_fn.concatenate_with_padding(all_tokens)
+        final_length = compressed_context.shape[1]
+        
+        # Calculate compression statistics (include initial question length)
+        original_length = initial_question.shape[1] + sum(turn_lengths)
+        tokens_saved = original_length - final_length
+        compression_ratio = tokens_saved / original_length if original_length > 0 else 0.0
+        
+        print(f"[CONTEXT SUMMARY] COMPRESSION RESULTS:")
+        print(f"[CONTEXT SUMMARY]   Original context: {original_length} tokens")
+        print(f"[CONTEXT SUMMARY]   Compressed context: {final_length} tokens")
+        print(f"[CONTEXT SUMMARY]   Tokens saved: {tokens_saved} tokens")
+        print(f"[CONTEXT SUMMARY]   Compression ratio: {compression_ratio:.1%}")
+        print(f"{'='*80}\n")
+        
+        return compressed_context
 
     def _batch_tokenize(self, responses: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Tokenize a batch of responses."""
@@ -412,9 +455,15 @@ class LLMGenerationManager:
 
         # Track history for sliding window if enabled
         use_sliding = getattr(self.config, "context_window_turns", 0) > 0
+        print(f"\n[DEBUG] use_sliding: {use_sliding}")
+        print(f"[DEBUG] context_window_turns: {getattr(self.config, 'context_window_turns', 0)}")
+        
+        # Initialize turn_history and initial_question_ids regardless of use_sliding
+        initial_question_ids = gen_batch.batch['input_ids'].clone()
+        turn_history: List[Dict[str, torch.Tensor]] = []
+        
         if use_sliding:
-            initial_question_ids = gen_batch.batch['input_ids'].clone()
-            turn_history: List[Dict[str, torch.Tensor]] = []
+            print(f"[DEBUG] Sliding window enabled, turn history initialized")
         
         # KL-Aware Training: Decide context strategy
         import random
@@ -464,7 +513,8 @@ class LLMGenerationManager:
 
             # Execute in environment and process observations
             next_obs, dones, valid_action, is_search, action_ranges = self.execute_predictions(
-                responses_str, self.tokenizer.pad_token, active_mask
+                responses_str, self.tokenizer.pad_token, active_mask, do_search=True, 
+                current_turn=step, max_turns=self.config.max_turns
             )
             action_types = self._build_action_types(responses_ids, responses_offsets, action_ranges, is_search, responses_str)
             
@@ -476,52 +526,163 @@ class LLMGenerationManager:
             valid_search_stats += torch.tensor(is_search, dtype=torch.int)
 
             next_obs_ids, information_types, obs_too_long = self._process_next_obs(next_obs)
+            
+            # ========== OBSERVATION LENGTH LOGGING ==========
             if obs_too_long:
+                print(f"\n{'='*60}")
+                print(f"[OBSERVATION WARNING] Turn {step} - Observation too long!")
+                print(f"{'='*60}")
+                print(f"[OBSERVATION WARNING] Observation length exceeds max_obs_length")
+                print(f"[OBSERVATION WARNING] FORCING summarized context for remaining turns")
+                print(f"[OBSERVATION WARNING] This overrides the original context strategy")
+                print(f"{'='*60}\n")
                 force_summarized = True  # Force summarized context for remaining turns
             
             responses_types = torch.cat([action_types, information_types], dim=1)
 
+            # ========== ADD TURN INFORMATION TO CONTEXT ==========
+            # Add turn number and constraint information to agent context
+            turn_context_info = f"\n\n[Turn {step + 1}/{self.config.max_turns}] You are currently on turn {step + 1} of {self.config.max_turns} maximum turns."
+            if step == self.config.max_turns - 1:
+                turn_context_info += f"\n⚠️ **FINAL TURN** ⚠️ This is your LAST turn. You MUST provide your final answer now using <answer>...</answer> tags."
+            else:
+                remaining_turns = self.config.max_turns - step - 1
+                turn_context_info += f" You have {remaining_turns} turn(s) remaining. Use <search>...</search> to search for information or <answer>...</answer> to provide your final answer."
+            
+            # Tokenize and add turn context to the input
+            turn_context_tokens = self.tokenizer.encode(turn_context_info, add_special_tokens=False, return_tensors='pt')
+            if turn_context_tokens.shape[1] > 0:
+                # Broadcast turn context tokens to match batch size
+                batch_size = rollings.batch['input_ids'].shape[0]
+                turn_context_tokens = turn_context_tokens.expand(batch_size, -1).to(rollings.batch['input_ids'].device)
+                
+                # Add turn context to the rolling state
+                rollings.batch['input_ids'] = torch.cat([rollings.batch['input_ids'], turn_context_tokens], dim=1)
+                rollings.batch['attention_mask'] = torch.cat([rollings.batch['attention_mask'], torch.ones_like(turn_context_tokens).to(rollings.batch['attention_mask'].device)], dim=1)
+                rollings.batch['position_ids'] = self.tensor_fn.create_position_ids(rollings.batch['attention_mask'])
+
+            # ========== TURN-BY-TURN GENERATION LOGGING ==========
+            print(f"\n{'='*80}")
+            print(f"[TURN GENERATION] Turn {step} - Model Generation Details")
+            print(f"[TURN GENERATION] Added turn context: {turn_context_info}")
+            print(f"{'='*80}")
+            
+            # Log the input context for this turn
+            if hasattr(self, 'tokenizer') and self.tokenizer is not None:
+                # Decode the current input context
+                current_context = rollings.batch['input_ids']
+                context_text = self.tokenizer.decode(current_context[0], skip_special_tokens=False)
+                print(f"[TURN GENERATION] INPUT CONTEXT (Turn {step}):")
+                print(f"[TURN GENERATION] Context length: {current_context.shape[1]} tokens")
+                print(f"[TURN GENERATION] Context preview: {context_text}")  # Last 500 chars
+                
+                # Decode the model's response
+                if responses_ids.shape[1] > 0:
+                    response_text = self.tokenizer.decode(responses_ids[0], skip_special_tokens=False)
+                    print(f"[TURN GENERATION] MODEL RESPONSE (Turn {step}):")
+                    print(f"[TURN GENERATION] Response length: {responses_ids.shape[1]} tokens")
+                    print(f"[TURN GENERATION] Response: {response_text}")
+                else:
+                    print(f"[TURN GENERATION] MODEL RESPONSE (Turn {step}): [EMPTY RESPONSE]")
+                
+                # Decode the observation if available
+                if next_obs_ids.shape[1] > 0:
+                    obs_text = self.tokenizer.decode(next_obs_ids[0], skip_special_tokens=False)
+                    print(f"[TURN GENERATION] OBSERVATION (Turn {step}):")
+                    print(f"[TURN GENERATION] Observation length: {next_obs_ids.shape[1]} tokens")
+                    print(f"[TURN GENERATION] Observation: {obs_text}")  # First 300 chars
+                else:
+                    print(f"[TURN GENERATION] OBSERVATION (Turn {step}): [NO OBSERVATION]")
+            else:
+                print(f"[TURN GENERATION] No tokenizer available for text decoding")
+            
+            print(f"{'='*80}\n")
+
             # Update states
             if use_sliding:
+                print(f"\n[DEBUG] Turn {step}: Entering sliding window block")
+                print(f"[DEBUG] Turn history length before append: {len(turn_history)}")
                 # Store current turn and rebuild rolling context using sliding window
                 turn_history.append({
                     'responses': responses_ids.clone(),
                     'observations': next_obs_ids.clone(),
                 })
+                print(f"[DEBUG] Turn history length after append: {len(turn_history)}")
                 
                 # Decide whether to use full context for this turn
                 # Priority: force_summarized > use_full_context_this_rollout
+                
+                # ========== CONTEXT DECISION LOGGING ==========
+                print(f"\n{'='*60}")
+                print(f"[CONTEXT DECISION] Turn {step} - Context Strategy Selection")
+                print(f"{'='*60}")
+                print(f"[CONTEXT DECISION] Force summarized: {force_summarized}")
+                print(f"[CONTEXT DECISION] Use full context this rollout: {use_full_context_this_rollout}")
+                print(f"[CONTEXT DECISION] Turn history length: {len(turn_history)}")
+                print(f"[CONTEXT DECISION] Context type: {context_type}")
+                
                 if force_summarized:
                     # Observation too long: FORCE summarized context (safety override)
+                    print(f"[CONTEXT DECISION] DECISION: FORCED summarized context (observation too long)")
                     windowed_input_ids = self._apply_sliding_window(turn_history, initial_question_ids)
                     if step == 0 or step == self.config.max_turns - 1:
-                        logger.info(f"Step {step}: FORCED summarized context (observation too long)")
+                        logger.info(f"Turn {step}: FORCED summarized context (observation too long)")
                 elif use_full_context_this_rollout:
                     # This rollout uses full context
-                    all_tokens: List[torch.Tensor] = []
+                    all_tokens: List[torch.Tensor] = [initial_question_ids.clone()]
                     for t in turn_history:
                         all_tokens.append(t['responses'])
                         if t.get('observations') is not None:
                             all_tokens.append(t['observations'])
-                    windowed_input_ids = self.tensor_fn.concatenate_with_padding(all_tokens) if all_tokens else initial_question_ids
+                    windowed_input_ids = self.tensor_fn.concatenate_with_padding(all_tokens)
+                    
+                    # Log full context statistics
+                    full_context_length = windowed_input_ids.shape[1]
+                    print(f"[CONTEXT DECISION] Full context length: {full_context_length} tokens")
+                    print(f"[CONTEXT DECISION] Full context turns: {len(turn_history)}")
+                    
                     if step == 0:
-                        logger.info(f"Step {step}: Using FULL context ({len(turn_history)} turns)")
+                        logger.info(f"Turn {step}: Using FULL context ({len(turn_history)} turns)")
                 else:
                     # This rollout uses compressed context (sliding window)
                     windowed_input_ids = self._apply_sliding_window(turn_history, initial_question_ids)
                     
                     # KL-Aware: Always update full context for baseline computation (keep all turns)
                     if enable_kl_baseline:
-                        all_tokens: List[torch.Tensor] = []
+                        all_tokens: List[torch.Tensor] = [initial_question_ids.clone()]
                         for t in turn_history:
                             all_tokens.append(t['responses'])
                             if t.get('observations') is not None:
                                 all_tokens.append(t['observations'])
-                        full_context_for_kl_baseline = self.tensor_fn.concatenate_with_padding(all_tokens) if all_tokens else initial_question_ids
+                        full_context_for_kl_baseline = self.tensor_fn.concatenate_with_padding(all_tokens)
+                        
+                        # Log KL baseline statistics
+                        compressed_length = windowed_input_ids.shape[1]
+                        full_length = full_context_for_kl_baseline.shape[1]
+                        tokens_saved = full_length - compressed_length
+                        reduction_ratio = tokens_saved / full_length if full_length > 0 else 0.0
+                        
+                        print(f"[CONTEXT DECISION] KL Baseline context lengths:")
+                        print(f"[CONTEXT DECISION]   Compressed: {compressed_length} tokens")
+                        print(f"[CONTEXT DECISION]   Full (baseline): {full_length} tokens")
+                        print(f"[CONTEXT DECISION]   Tokens saved: {tokens_saved} tokens")
+                        print(f"[CONTEXT DECISION]   Reduction ratio: {reduction_ratio:.1%}")
+                
+                print(f"{'='*60}\n")
                 
                 rollings.batch['input_ids'] = windowed_input_ids
                 rollings.batch['attention_mask'] = self.tensor_fn.create_attention_mask(windowed_input_ids)
                 rollings.batch['position_ids'] = self.tensor_fn.create_position_ids(rollings.batch['attention_mask'])
+                
+                # ========== FINAL CONTEXT LOGGING ==========
+                print(f"\n{'='*60}")
+                print(f"[FINAL CONTEXT] Turn {step} - Context for Next Turn")
+                print(f"{'='*60}")
+                print(f"[FINAL CONTEXT] Final context length: {windowed_input_ids.shape[1]} tokens")
+                if hasattr(self, 'tokenizer') and self.tokenizer is not None:
+                    final_context_text = self.tokenizer.decode(windowed_input_ids[0], skip_special_tokens=True)
+                    print(f"[FINAL CONTEXT] Final context preview: {final_context_text}")  # Last 300 chars
+                print(f"{'='*60}\n")
                 
                 # Monitor context length (after context decision is made)
                 current_context_length = windowed_input_ids.shape[1]
@@ -532,6 +693,14 @@ class LLMGenerationManager:
                     full_length = full_context_for_kl_baseline.shape[1]
                     full_context_lengths_per_turn.append(full_length)
             else:
+                # ========== NON-SLIDING WINDOW LOGGING ==========
+                print(f"\n{'='*60}")
+                print(f"[NON-SLIDING] Turn {step} - Using Standard Context Update")
+                print(f"{'='*60}")
+                print(f"[NON-SLIDING] Sliding window disabled (context_window_turns=0)")
+                print(f"[NON-SLIDING] Using standard rolling state update")
+                print(f"{'='*60}\n")
+                
                 rollings = self._update_rolling_state(
                     rollings,
                     responses_ids,
@@ -571,7 +740,8 @@ class LLMGenerationManager:
             # Optionally allow search on the final turn to include <information>
             do_search_final = getattr(self.config, "final_turn_do_search", False)
             next_obs, dones, valid_action, is_search, action_ranges = self.execute_predictions(
-                responses_str, self.tokenizer.pad_token, active_mask, do_search=do_search_final
+                responses_str, self.tokenizer.pad_token, active_mask, do_search=do_search_final,
+                current_turn=self.config.max_turns, max_turns=self.config.max_turns
             )
             responses_types = self._build_action_types(responses_ids, responses_offsets, action_ranges, is_search, responses_str)
 
@@ -623,6 +793,15 @@ class LLMGenerationManager:
             meta_info['final_context_length'] = final_context_length
             meta_info['avg_context_length'] = sum(context_lengths_per_turn) / len(context_lengths_per_turn)
             
+            # ========== FINAL CONTEXT SUMMARY LOGGING ==========
+            print(f"\n{'='*80}")
+            print(f"[FINAL CONTEXT SUMMARY] Rollout Complete - Context Statistics")
+            print(f"{'='*80}")
+            print(f"[FINAL CONTEXT SUMMARY] Context type: {context_type}")
+            print(f"[FINAL CONTEXT SUMMARY] Total turns processed: {len(context_lengths_per_turn)}")
+            print(f"[FINAL CONTEXT SUMMARY] Final context length: {final_context_length} tokens")
+            print(f"[FINAL CONTEXT SUMMARY] Average context length: {sum(context_lengths_per_turn) / len(context_lengths_per_turn):.1f} tokens")
+            
             # If compressed rollout with full context tracking
             if full_context_lengths_per_turn:
                 final_full_length = full_context_lengths_per_turn[-1]
@@ -636,12 +815,26 @@ class LLMGenerationManager:
                     'reduction_ratio': reduction_ratio,
                 }
                 
+                print(f"[FINAL CONTEXT SUMMARY] COMPRESSION RESULTS:")
+                print(f"[FINAL CONTEXT SUMMARY]   Compressed context: {final_context_length} tokens")
+                print(f"[FINAL CONTEXT SUMMARY]   Full context would be: {final_full_length} tokens")
+                print(f"[FINAL CONTEXT SUMMARY]   Tokens saved: {tokens_saved} tokens")
+                print(f"[FINAL CONTEXT SUMMARY]   Compression ratio: {reduction_ratio:.1%}")
+                print(f"[FINAL CONTEXT SUMMARY]   Memory efficiency: {1 - reduction_ratio:.1%} of full context")
+                
                 logger.info(f"[Context Length] Compressed: {final_context_length} tokens, "
                            f"Full would be: {final_full_length} tokens, "
                            f"Saved: {tokens_saved} tokens ({reduction_ratio:.1%} reduction)")
             else:
                 # Full context rollout
+                print(f"[FINAL CONTEXT SUMMARY] FULL CONTEXT ROLLOUT:")
+                print(f"[FINAL CONTEXT SUMMARY]   No compression applied")
+                print(f"[FINAL CONTEXT SUMMARY]   Context length: {final_context_length} tokens")
+                print(f"[FINAL CONTEXT SUMMARY]   All turns preserved")
+                
                 logger.info(f"[Context Length] Full context: {final_context_length} tokens")
+            
+            print(f"{'='*80}\n")
         
         print("ACTIVE_TRAJ_NUM:", active_num_list)
         
@@ -709,7 +902,7 @@ class LLMGenerationManager:
         
         return final_output
 
-    def execute_predictions(self,predictions:List[str],pad_token:str,active_mask=None,do_search=True) \
+    def execute_predictions(self,predictions:List[str],pad_token:str,active_mask=None,do_search=True,current_turn:int=0,max_turns:int=None) \
         -> Tuple[List[str], List[int], List[int], List[int], List[Optional[Tuple[int, int]]]]:
         """
         Execute predictions across multiple environments.
@@ -720,6 +913,8 @@ class LLMGenerationManager:
             envs: List of environment instances
             predictions: List of action predictions
             pad_token: Token to use for padding
+            current_turn: Current turn number (0-indexed)
+            max_turns: Maximum number of turns allowed
             
         Returns:
             List of observation strings
@@ -800,12 +995,31 @@ class LLMGenerationManager:
                     is_search.append(0)
                 elif action == 'search':
                     # Only consume search result for active entries
-                    # next_obs.append(f'\n\n<information>{search_results.pop(0).strip()}</information>\n\n If you find the information is not enough, you should reflect and care about following actions')
-                    next_obs.append(f'\n\n<information>{search_results.pop(0).strip()}</information>\n\n')
+                    # Add turn information to observation
+                    turn_info = f"\n[Turn {current_turn + 1}/{max_turns if max_turns else '?'}] "
+                    search_result = search_results.pop(0).strip()
+                    
+                    # Check if this is the last turn and provide sharp message
+                    if max_turns and current_turn >= max_turns - 1:
+                        sharp_message = f"\n\n⚠️ **FINAL TURN WARNING** ⚠️\nThis is your LAST turn (Turn {current_turn + 1}/{max_turns}). You MUST provide your final answer now using <answer>...</answer> tags. No more searches are allowed.\n\n"
+                        next_obs.append(f'{turn_info}<information>{search_result}</information>{sharp_message}')
+                    else:
+                        next_obs.append(f'{turn_info}<information>{search_result}</information>\n\n')
+                    
                     dones.append(0)
                     valid_action.append(1)
                     is_search.append(1)
                 elif action in ["think", "think_summary", "information_summary"]:
+                    # Add turn information to observation
+                    turn_info = f"\n[Turn {current_turn + 1}/{max_turns if max_turns else '?'}] "
+                    
+                    # Check if this is the last turn and provide sharp message
+                    if max_turns and current_turn >= max_turns - 1:
+                        sharp_message = f"\n\n⚠️ **FINAL TURN WARNING** ⚠️\nThis is your LAST turn (Turn {current_turn + 1}/{max_turns}). You MUST provide your final answer now using <answer>...</answer> tags.\n\n"
+                        next_obs.append(f'{turn_info}{sharp_message}')
+                    else:
+                        next_obs.append(f'{turn_info}')
+                    
                     dones.append(0)
                     valid_action.append(1)
                     is_search.append(0)
@@ -813,7 +1027,8 @@ class LLMGenerationManager:
                     next_obs.append(f'\nMy previous action is invalid. \
 If I want to search, I should put the query between <search> and </search>. \
 If I want to present thinking process, I should put the thinking process between <think> and </think>. \
-If I want to give the final answer, I should put the answer between <answer> and </answer>. Let me try again.\n')
+If I want to give the final answer, I should put the answer between <answer> and </answer>. \
+If I want to summarize, use <think_summary> and <information_summary>, if no <information> yet, <information_summary> is invalid. Let me try again.\n') 
                     dones.append(0)
                     valid_action.append(0)
                     is_search.append(0)

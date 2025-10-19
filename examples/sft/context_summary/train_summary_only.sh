@@ -54,10 +54,8 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
      -m verl.trainer.fsdp_sft_trainer \
     data.train_files=$TRAIN_FILES \
     data.val_files=$VAL_FILES \
-    data.prompt_key=prompt \
-    data.response_key=answer \
-    data.prompt_dict_keys=[] \
-    data.response_dict_keys=[] \
+    data.multiturn.enable=true \
+    data.multiturn.messages_key=prompt \
     data.max_length=2048 \
     data.truncation=right \
     data.micro_batch_size_per_gpu=$MICRO_BSZ \

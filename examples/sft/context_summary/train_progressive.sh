@@ -2,7 +2,7 @@
 # Progressive three-stage training strategy
 # Phase 1: Multi-turn SFT (learning complete reasoning chains)
 # Phase 2: Summary Only (starting from Phase 1 checkpoint, learning efficient reasoning)
-# Phase 3: Summary Prefix (starting from Phase 2 checkpoint, learning summary generation)
+# Phase 3: Prev-Turn Context (starting from Phase 2 checkpoint, learning summary generation with previous-turn context)
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=0,1
@@ -18,7 +18,7 @@ if [ "$#" -lt 2 ]; then
     echo "This script runs three training phases:"
     echo "  Phase 1: Multi-turn SFT (full reasoning chains)"
     echo "  Phase 2: Summary Only (efficient reasoning from summaries)"
-    echo "  Phase 3: Summary Prefix (summary generation + complete reasoning)"
+    echo "  Phase 3: Prev-Turn Context (summary generation grounded on previous turn)"
     exit 1
 fi
 
@@ -68,7 +68,7 @@ echo "╚═══════════════════════�
 echo ""
 echo "Phase 1: Multi-turn SFT (complete reasoning chains)"
 echo "Phase 2: Summary Only (efficient reasoning)"
-echo "Phase 3: Summary Prefix (summary generation)"
+echo "Phase 3: Prev-Turn Context (summary generation with previous turn context)"
 echo ""
 echo "Model: $MODEL"
 echo "GPUs: $nproc_per_node (CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES)"
@@ -198,10 +198,10 @@ fi
 echo "Phase 2 checkpoint: $phase2_ckpt"
 
 # ============================================================================
-# Phase 3: Summary Prefix Training (starting from Phase 2 checkpoint)
+# Phase 3: Prev-Turn Context Training (starting from Phase 2 checkpoint)
 # ============================================================================
 echo ""
-echo "【Phase 3】Starting Fine-tuning - Summary Prefix"
+echo "【Phase 3】Starting Fine-tuning - Prev-Turn Context"
 echo "════════════════════════════════════════════════════════════════"
 echo "Continuing training from checkpoint: $phase2_ckpt"
 
@@ -223,7 +223,7 @@ else
 fi
 
 echo ""
-echo "✓ Phase 3 (Summary Prefix) completed!"
+echo "✓ Phase 3 (Prev-Turn Context) completed!"
 
 # ============================================================================
 # Summary
@@ -235,12 +235,12 @@ echo "╚═══════════════════════�
 echo ""
 echo "Phase 1 Model (Multi-turn): $phase1_path/global_step_*"
 echo "Phase 2 Model (Summary Only): $phase2_path/global_step_*"
-echo "Phase 3 Model (Summary Prefix - Final): $phase3_path/global_step_*"
+echo "Phase 3 Model (Prev-Turn Context - Final): $phase3_path/global_step_*"
 echo ""
 echo "Training Strategy Explanation:"
 echo "  Phase 1: Learn complete multi-turn reasoning chains"
 echo "  Phase 2: Learn efficient reasoning from summaries"
-echo "  Phase 3: Learn summary generation + complete reasoning"
+echo "  Phase 3: Learn summary generation grounded on previous-turn context"
 echo ""
 echo "Recommended to use the final model from Phase 3 for inference or subsequent RL training"
 echo ""

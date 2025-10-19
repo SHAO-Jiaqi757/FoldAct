@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# 训练脚本 - 数据集 1: Summary 前缀模式
-# answer = summary + 原始 answer
-# 模型学习: 先总结，再推理回答
+# 训练脚本 - 数据集 1: 前一轮上下文（Prev-Turn）模式 - MultiTurnSFTDataset版本
+# 使用 MultiTurnSFTDataset 处理多轮对话数据
+# answer = summary + 原始 answer（即上一轮模型的摘要与动作）
+# 模型学习: 结合上一轮总结与动作，在最新 observation 上生成下一步计划
 
 set -x
 
@@ -17,16 +18,18 @@ save_path=$2
 # Shift the arguments so $@ refers to the rest
 shift 2
 
-# Data paths (pre-split files under data/sft_compress)
+# Data paths (使用处理好的multiturn数据集)
 TRAIN_FILES=${TRAIN_FILES:-data/sft_compress/sft_train_summary_prefix_train.parquet}
 VAL_FILES=${VAL_FILES:-data/sft_compress/sft_train_summary_prefix_val.parquet}
 
 if [ ! -f "$TRAIN_FILES" ]; then
   echo "错误: 训练文件不存在: $TRAIN_FILES"
+  echo "请先运行数据预处理: bash examples/data_preprocess/run_multiturn_pipeline.sh"
   exit 1
 fi
 if [ ! -f "$VAL_FILES" ]; then
   echo "错误: 验证文件不存在: $VAL_FILES"
+  echo "请先运行数据预处理: bash examples/data_preprocess/run_multiturn_pipeline.sh"
   exit 1
 fi
 
@@ -39,9 +42,10 @@ ACC_STEPS=${ACC_STEPS:-6}
 GLOBAL_TBS=$(( MICRO_BSZ * nproc_per_node * ACC_STEPS ))
 
 echo "=================================================="
-echo "训练配置 - 数据集 1: Summary 前缀模式"
+echo "训练配置 - 数据集 1: 前一轮上下文 (Prev-Turn) 模式 - MultiTurnSFTDataset"
 echo "=================================================="
-echo "数据集: answer = summary + 原始 answer"
+echo "数据集: prompt 包含【原始问题 + 上一轮 summary/action + 最新 observation + 最终answer】"
+echo "监督信号: 使用 MultiTurnSFTDataset 处理完整对话，loss mask 应用于所有 assistant 响应"
 echo "模型: $MODEL"
 echo "训练文件: $TRAIN_FILES"
 echo "验证文件: $VAL_FILES"
@@ -50,14 +54,14 @@ echo "保存路径: $save_path"
 echo "计算批量: train_batch_size=$GLOBAL_TBS micro_batch_size_per_gpu=$MICRO_BSZ (acc_steps=$ACC_STEPS)"
 echo "=================================================="
 
+# 使用 MultiTurnSFTDataset 进行训练
+# 关键配置差异: 使用 multiturn.enable=true 和 multiturn.messages_key=prompt
 torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
      -m verl.trainer.fsdp_sft_trainer \
     data.train_files=$TRAIN_FILES \
     data.val_files=$VAL_FILES \
-    data.prompt_key=prompt \
-    data.response_key=answer \
-    data.prompt_dict_keys=[] \
-    data.response_dict_keys=[] \
+    data.multiturn.enable=true \
+    data.multiturn.messages_key=prompt \
     data.max_length=4096 \
     data.truncation=right \
     data.micro_batch_size_per_gpu=$MICRO_BSZ \

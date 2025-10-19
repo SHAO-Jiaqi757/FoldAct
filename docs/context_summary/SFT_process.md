@@ -49,102 +49,28 @@ python3 examples/data_preprocess/add_summary_multiturn.py \
 
 3. Dataset Splitting: Create two specialized datasets for different training objectives.
 
-**Script**: `examples/data_preprocess/split_summary_datasets_multiturn.py`
-
-**Comparison**:
 ```
-┌─────────────────────┬─────────────────────────┬──────────────────────────┐
-│ Feature             │ Dataset 1 (Prefix)      │ Dataset 2 (Only)         │
-├─────────────────────┼─────────────────────────┼──────────────────────────┤
-│ Prompt Source       │ Full original context   │ Summary only             │
-│ Answer Source       │ Summary + Original      │ Original answer          │
-│ Avg Token Length    │ ~3000 tokens            │ ~1500 tokens             │
-│ Learning Objective  │ Summarize + Reason      │ Efficient reasoning      │
-│ Training Speed      │ Slower (longer seq)     │ Faster (shorter seq)     │
-└─────────────────────┴─────────────────────────┴──────────────────────────┘
+┌─────────────────────┬──────────────────────────────────────────────┬──────────────────────────┐
+│ Feature             │ Dataset 1 (Prev Turn)                        │ Dataset 2 (Summary Only) │
+├─────────────────────┼──────────────────────────────────────────────┼──────────────────────────┤
+│ Prompt Source       │ Question + previous summary/action + latest obs │ Summary only           │
+│ Answer Source       │ Summary + Original answer                     │ Original answer          │
+│ Avg Token Length    │ ~1700 tokens                                  │ ~1500 tokens             │
+│ Learning Objective  │ Summarize & plan the next turn                │ Efficient reasoning      │
+│ Training Speed      │ Moderate                                      │ Faster (shorter seq)     │
+│ Dataset Format      │ MultiTurnSFTDataset (complete conversations)  │ MultiTurnSFTDataset      │
+└─────────────────────┴──────────────────────────────────────────────┴──────────────────────────┘
 ```
 
 **Usage**:
 ```bash
-python3 examples/data_preprocess/split_summary_datasets_multiturn.py \
-    --input_file data/sft_compress/sft_train_multiturn_with_summary.jsonl \
-    --output_dataset1 data/sft_compress/sft_train_summary_prefix.jsonl \
-    --output_dataset2 data/sft_compress/sft_train_summary_only.jsonl
-```
-
-**Split Train/Val and Convert to Parquet**
-`examples/data_preprocess/prepare_train_val_datasets.sh` 
-
-**Purpose**: 
-1. Split both datasets into train (90%) and validation (10%) sets
-2. Convert all splits to Parquet format (required by VERL trainer)
-
-**Quick Usage**:
-```bash
-# One command to do everything (split + convert)
-bash examples/data_preprocess/prepare_train_val_datasets.sh
-
+bash examples/data_preprocess/run_multiturn_pipeline.sh
 ```
 
 
 ## 🚀 Training Scripts
 
-
-### Strategy 1: Dataset 1 Only (Summary Prefix)
-
-**Script**: `examples/sft/context_summary/train_summary_prefix.sh`
-
-**When to use**: 
-- Need model to generate summaries
-- Have sufficient GPU memory and training time
-- Want single-stage training
-
-**Capabilities**:
-- ✅ Generate summaries from full context
-- ✅ Perform reasoning with summarization
-- ⚠️  Less optimized for concise input reasoning
-
-**Usage**:
-```bash
-# Basic training (8 GPUs)
-bash examples/sft/context_summary/train_summary_prefix.sh 8 /tmp/sft_prefix
-
-# With custom model
-MODEL=Qwen/Qwen2.5-7B-Instruct \
-bash examples/sft/context_summary/train_summary_prefix.sh 8 /tmp/sft_prefix
-
-# With Hydra overrides
-bash examples/sft/context_summary/train_summary_prefix.sh 8 /tmp/sft_prefix \
-    trainer.total_epochs=10 \
-    optim.lr=1e-5 \
-    trainer.logger=['console','wandb']
-```
-
-### Strategy 2: Dataset 2 Only (Summary Only)
-
-**Script**: `examples/sft/context_summary/train_summary_only.sh`
-
-**When to use**:
-- Quick prototyping or validation
-- Limited GPU resources
-- Only need reasoning from summaries (no summary generation)
-
-**Capabilities**:
-- ✅ Efficient reasoning from concise summaries
-- ✅ Faster training (shorter sequences)
-- ❌ Cannot generate summaries
-
-**Usage**:
-```bash
-# Basic training (8 GPUs)
-bash examples/sft/context_summary/train_summary_only.sh 8 /tmp/sft_only
-
-# Quick test with fewer epochs
-bash examples/sft/context_summary/train_summary_only.sh 8 /tmp/sft_only \
-    trainer.total_epochs=3
-```
-
-### Strategy 3: Progressive Training (Three-Phase)
+### Progressive Training (Three-Phase)
 
 **Script**: `examples/sft/context_summary/train_progressive.sh`
 
@@ -169,7 +95,7 @@ Phase 2: Summary Only (Efficient Reasoning)
 
          ↓ (Use Phase 2 checkpoint as initialization)
 
-Phase 3: Summary Prefix (Summary Generation)
+Phase 3: Prev-Turn Context (Summary Generation)
 ├─ Dataset: sft_train_summary_prefix.parquet
 ├─ Duration: 5 epochs
 ├─ Learning Rate: 5e-6 (lower to preserve previous learning)
@@ -177,28 +103,11 @@ Phase 3: Summary Prefix (Summary Generation)
 └─ Output: phase3_summary_prefix/global_step_* (final model)
 ```
 
-**Final Model Capabilities**:
-- ✅ Generate summaries from full context
-- ✅ Efficient reasoning from summaries
-- ✅ Complete reasoning chains
-- ✅ Better generalization (progressive learning)
 
 **Usage**:
 ```bash
 # Basic progressive training (8 GPUs)
 bash examples/sft/context_summary/train_progressive.sh 8 /tmp/sft_progressive
-
-# With custom model
-MODEL=Qwen/Qwen2.5-7B-Instruct \
-bash examples/sft/context_summary/train_progressive.sh 8 /tmp/sft_progressive
-
-# With additional Hydra overrides (apply to all phases)
-bash examples/sft/context_summary/train_progressive.sh 8 /tmp/sft_progressive \
-    trainer.logger=['console','wandb'] \
-    data.max_length=4096
-
-# Dry run (see commands without executing)
-DRY_RUN=1 bash examples/sft/context_summary/train_progressive.sh 8 /tmp/test
 ```
 
 **Training Flow**:
@@ -217,17 +126,6 @@ DRY_RUN=1 bash examples/sft/context_summary/train_progressive.sh 8 /tmp/test
 
 **Script**: `examples/sft/context_summary/evaluate_model.py`
 
-Evaluate model on two tasks:
-1. **Summary-Reasoning**: Full context → Generate summary + reasoning
-2. **Reasoning from Summary**: Summary → Generate reasoning/answer
-
-**Quick Evaluation**:
-```bash
-bash examples/sft/context_summary/quick_evaluate.sh \
-    /tmp/sft_mixed/phase2_summary_prefix/global_step_50 \
-    20  # number of test samples
-```
-
 **Manual Evaluation**:
 ```bash
 python3 examples/sft/context_summary/evaluate_model.py \
@@ -236,33 +134,6 @@ python3 examples/sft/context_summary/evaluate_model.py \
     --output results/eval_results.json \
     --num_samples 50 \
     --max_new_tokens 1024
-```
-
-**Analyze Results**:
-```bash
-python3 examples/sft/context_summary/analyze_results.py \
-    --results_file results/eval_results.json
-```
-
-## 📝 File Structure
-
-```
-data/sft_compress/
-├── filtered_results_sample_200.jsonl          # Original data (200 traces)
-├── sft_train_sample.jsonl                     # After Step 1 (~1,600 samples)
-├── sft_train_with_summary.jsonl              # After Step 2 (with summaries)
-│
-├── sft_train_summary_prefix.jsonl            # Dataset 1 (JSONL, 733 samples)
-├── sft_train_summary_prefix_train.jsonl      # Dataset 1 train (660 samples)
-├── sft_train_summary_prefix_val.jsonl        # Dataset 1 val (73 samples)
-├── sft_train_summary_prefix_train.parquet    # Dataset 1 train (Parquet, 2.7MB)
-├── sft_train_summary_prefix_val.parquet      # Dataset 1 val (Parquet, 339KB)
-│
-├── sft_train_summary_only.jsonl              # Dataset 2 (JSONL, 733 samples)
-├── sft_train_summary_only_train.jsonl        # Dataset 2 train (660 samples)
-├── sft_train_summary_only_val.jsonl          # Dataset 2 val (73 samples)
-├── sft_train_summary_only_train.parquet      # Dataset 2 train (Parquet, 613KB)
-└── sft_train_summary_only_val.parquet        # Dataset 2 val (Parquet, 90KB)
 ```
 
 ## 🎯 Quick Start
@@ -283,30 +154,10 @@ python3 examples/data_preprocess/add_summary_multiturn.py \
     --output_file data/sft_compress/sft_train_multiturn_with_summary.jsonl \
     --max_concurrent 100
 
-# 3. Generate two training datasets
-python3 examples/data_preprocess/split_summary_datasets_multiturn.py \
-    --input_file data/sft_compress/sft_train_multiturn_with_summary.jsonl \
-    --output_dataset1 data/sft_compress/sft_train_summary_prefix.jsonl \
-    --output_dataset2 data/sft_compress/sft_train_summary_only.jsonl
+# 3. Create Dataset 1 & 2, Split train/val and convert to Parquet
+bash examples/data_preprocess/run_multiturn_pipeline.sh
 
-# 4. Split train/val and convert to Parquet
-bash examples/data_preprocess/prepare_train_val_datasets.sh
-
-# 5. Train with progressive strategy (recommended)
+# 4. Train with progressive strategy (recommended)
 bash examples/sft/context_summary/train_progressive.sh 8 verl_checkpoints/sft_progressive
 
-# 6. Evaluate the trained model
-bash examples/sft/context_summary/quick_evaluate.sh \
-    verl_checkpoints/sft_progressive/phase3_summary_prefix/global_step_50 \
-    20
 ```
-
-## 💡 Tips & Best Practices
-
-1. **Use Progressive Training**: Best balance of efficiency and capability with complete reasoning chains
-2. **Phase 3 for Production**: Always use Phase 3 checkpoint for inference
-3. **Monitor Training**: Use `trainer.logger=['console','wandb']` for tracking
-4. **GPU Memory**: Reduce `data.max_length` if OOM occurs
-5. **Reproducibility**: Set `SEED=42` in environment for deterministic training
-6. **Evaluation**: Use held-out test set (not training data) for fair evaluation
-
