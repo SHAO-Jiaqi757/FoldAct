@@ -70,7 +70,7 @@ class GenerationConfig:
     # Whether to allow do_search during the final rollout and append <information>
     final_turn_do_search: bool = False
     # Enable sliding window context: keep only the most recent N turns (0 = keep all)
-    context_window_turns: int = 0
+    use_sliding: bool = False
     
     # KL-Aware Training: Compare compressed vs full context policies
     # Ratio of rollouts that use full context (e.g., 0.1 = 10% full, 90% compressed)
@@ -110,23 +110,20 @@ class LLMGenerationManager:
     def _apply_sliding_window(self, turn_history: List[Dict[str, torch.Tensor]], 
                             initial_question: torch.Tensor) -> torch.Tensor:
         """
-        Apply sliding window to keep only the most recent N turns.
-        Returns concatenated input_ids for current rolling context.
-
-        Behavior:
-        - If context_window_turns <= 0: keep all turns
-        - If context_window_turns >= len(turn_history): keep all turns
-        - Else: keep only the last N turns
-        Edge case:
-        - If no turns exist yet, return the initial_question
+        Apply adaptive sliding window based on whether the last turn has information.
+        
+        Logic:
+        - If last turn has information: apply aggressive truncation (keep only recent turns)
+        - If last turn has no information: keep more context (less aggressive truncation)
+        
+        This ensures that when the model sees information, it can focus on recent context,
+        but when it doesn't have information, it can access more historical context.
         """
-        window_size = getattr(self.config, "context_window_turns", 0)
         
         # ========== CONTEXT SUMMARIZATION LOGGING ==========
         print(f"\n{'='*80}")
-        print(f"[CONTEXT SUMMARY] Applying sliding window context compression")
+        print(f"[CONTEXT SUMMARY] Applying adaptive sliding window context compression")
         print(f"{'='*80}")
-        print(f"[CONTEXT SUMMARY] Window size: {window_size}")
         print(f"[CONTEXT SUMMARY] Total turns in history: {len(turn_history)}")
         print(f"[CONTEXT SUMMARY] Initial question length: {initial_question.shape[1]} tokens")
         
@@ -134,25 +131,55 @@ class LLMGenerationManager:
             print(f"[CONTEXT SUMMARY] No turns in history, returning initial question")
             return initial_question
 
-        # Calculate context lengths for each turn
-        turn_lengths = []
+        # Analyze each turn for information content
+        turn_analysis = []
         for i, turn in enumerate(turn_history):
             response_len = turn['responses'].shape[1]
             obs_len = turn.get('observations', torch.tensor([])).shape[1] if turn.get('observations') is not None else 0
             total_len = response_len + obs_len
-            turn_lengths.append(total_len)
-            print(f"[CONTEXT SUMMARY] Turn {i}: response={response_len} tokens, obs={obs_len} tokens, total={total_len} tokens")
+            
+            # Check if turn has meaningful information (observations)
+            has_information = obs_len > 0
+            turn_analysis.append({
+                'index': i,
+                'response_len': response_len,
+                'obs_len': obs_len,
+                'total_len': total_len,
+                'has_information': has_information
+            })
+            print(f"[CONTEXT SUMMARY] Turn {i}: response={response_len} tokens, obs={obs_len} tokens, total={total_len} tokens, has_info={has_information}")
 
-        if window_size <= 0 or window_size >= len(turn_history):
+        # Single-scheme truncation:
+        # Keep the contiguous block consisting of the most recent info-turn
+        # and any immediately preceding non-info turns. If no info exists, keep all.
+        has_info_flags = []
+        for i, t in enumerate(turn_history):
+            flag = False
+            obs = t.get('observations')
+            if obs is not None and obs.shape[1] > 0:
+                obs_text = self.tokenizer.decode(obs[0], skip_special_tokens=True)
+                flag = ('<information>' in obs_text) and ('</information>' in obs_text)
+            has_info_flags.append(flag)
+            print(f"[CONTEXT SUMMARY] Turn {i} has_info_tag={flag}")
+
+        # Find last info index
+        last_info_idx = -1
+        for i in range(len(turn_history) - 1, -1, -1):
+            if has_info_flags[i]:
+                last_info_idx = i
+                break
+
+        if last_info_idx == -1:
+            # No info yet → keep all context
             selected_turns = turn_history
-            print(f"[CONTEXT SUMMARY] Keeping ALL turns (window_size={window_size} >= {len(turn_history)} turns)")
+            print(f"[CONTEXT SUMMARY] No <information> found in history → keeping ALL turns")
         else:
-            selected_turns = turn_history[-window_size:]
-            discarded_turns = len(turn_history) - window_size
-            print(f"[CONTEXT SUMMARY] Keeping LAST {window_size} turns, DISCARDING {discarded_turns} turns")
-            print(f"[CONTEXT SUMMARY] Kept turns: {discarded_turns} to {len(turn_history)-1}")
-
-        # Build compressed context (always start with the initial question)
+            # Include contiguous non-info turns immediately before the last info turn
+            start_idx = last_info_idx
+            while start_idx - 1 >= 0 and not has_info_flags[start_idx - 1]:
+                start_idx -= 1
+            selected_turns = turn_history[start_idx:last_info_idx + 1]
+            print(f"[CONTEXT SUMMARY] Using block turns [{start_idx}..{last_info_idx}] (non-info before last info + last info)")
         all_tokens: List[torch.Tensor] = [initial_question.clone()]
         total_compressed_length = initial_question.shape[1]
         print(f"[CONTEXT SUMMARY] Added initial question: {initial_question.shape[1]} tokens")
@@ -170,7 +197,7 @@ class LLMGenerationManager:
         final_length = compressed_context.shape[1]
         
         # Calculate compression statistics (include initial question length)
-        original_length = initial_question.shape[1] + sum(turn_lengths)
+        original_length = initial_question.shape[1] + sum(ta['total_len'] for ta in turn_analysis)
         tokens_saved = original_length - final_length
         compression_ratio = tokens_saved / original_length if original_length > 0 else 0.0
         
@@ -454,9 +481,8 @@ class LLMGenerationManager:
         rollings = gen_batch
 
         # Track history for sliding window if enabled
-        use_sliding = getattr(self.config, "context_window_turns", 0) > 0
+        use_sliding = getattr(self.config, "use_sliding", False)
         print(f"\n[DEBUG] use_sliding: {use_sliding}")
-        print(f"[DEBUG] context_window_turns: {getattr(self.config, 'context_window_turns', 0)}")
         
         # Initialize turn_history and initial_question_ids regardless of use_sliding
         initial_question_ids = gen_batch.batch['input_ids'].clone()
@@ -525,6 +551,11 @@ class LLMGenerationManager:
             valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
             valid_search_stats += torch.tensor(is_search, dtype=torch.int)
 
+            # If all trajectories are finished (e.g., answered), stop immediately
+            if not active_mask.any():
+                print(f"\n[TURN GENERATION] All trajectories completed at turn {step}. Stopping loop.")
+                break
+
             next_obs_ids, information_types, obs_too_long = self._process_next_obs(next_obs)
             
             # ========== OBSERVATION LENGTH LOGGING ==========
@@ -549,17 +580,18 @@ class LLMGenerationManager:
                 remaining_turns = self.config.max_turns - step - 1
                 turn_context_info += f" You have {remaining_turns} turn(s) remaining. Use <search>...</search> to search for information or <answer>...</answer> to provide your final answer."
             
-            # Tokenize and add turn context to the input
-            turn_context_tokens = self.tokenizer.encode(turn_context_info, add_special_tokens=False, return_tensors='pt')
-            if turn_context_tokens.shape[1] > 0:
-                # Broadcast turn context tokens to match batch size
-                batch_size = rollings.batch['input_ids'].shape[0]
-                turn_context_tokens = turn_context_tokens.expand(batch_size, -1).to(rollings.batch['input_ids'].device)
-                
-                # Add turn context to the rolling state
-                rollings.batch['input_ids'] = torch.cat([rollings.batch['input_ids'], turn_context_tokens], dim=1)
-                rollings.batch['attention_mask'] = torch.cat([rollings.batch['attention_mask'], torch.ones_like(turn_context_tokens).to(rollings.batch['attention_mask'].device)], dim=1)
-                rollings.batch['position_ids'] = self.tensor_fn.create_position_ids(rollings.batch['attention_mask'])
+            # Tokenize and add turn context to the input only if any trajectories remain active
+            if active_mask.any():
+                turn_context_tokens = self.tokenizer.encode(turn_context_info, add_special_tokens=False, return_tensors='pt')
+                if turn_context_tokens.shape[1] > 0:
+                    # Broadcast turn context tokens to match batch size
+                    batch_size = rollings.batch['input_ids'].shape[0]
+                    turn_context_tokens = turn_context_tokens.expand(batch_size, -1).to(rollings.batch['input_ids'].device)
+                    
+                    # Add turn context to the rolling state
+                    rollings.batch['input_ids'] = torch.cat([rollings.batch['input_ids'], turn_context_tokens], dim=1)
+                    rollings.batch['attention_mask'] = torch.cat([rollings.batch['attention_mask'], torch.ones_like(turn_context_tokens).to(rollings.batch['attention_mask'].device)], dim=1)
+                    rollings.batch['position_ids'] = self.tensor_fn.create_position_ids(rollings.batch['attention_mask'])
 
             # ========== TURN-BY-TURN GENERATION LOGGING ==========
             print(f"\n{'='*80}")
@@ -621,13 +653,8 @@ class LLMGenerationManager:
                 print(f"[CONTEXT DECISION] Turn history length: {len(turn_history)}")
                 print(f"[CONTEXT DECISION] Context type: {context_type}")
                 
-                if force_summarized:
-                    # Observation too long: FORCE summarized context (safety override)
-                    print(f"[CONTEXT DECISION] DECISION: FORCED summarized context (observation too long)")
-                    windowed_input_ids = self._apply_sliding_window(turn_history, initial_question_ids)
-                    if step == 0 or step == self.config.max_turns - 1:
-                        logger.info(f"Turn {step}: FORCED summarized context (observation too long)")
-                elif use_full_context_this_rollout:
+                # When full context is selected, bypass any truncation regardless of force_summarized
+                if use_full_context_this_rollout:
                     # This rollout uses full context
                     all_tokens: List[torch.Tensor] = [initial_question_ids.clone()]
                     for t in turn_history:
@@ -643,6 +670,12 @@ class LLMGenerationManager:
                     
                     if step == 0:
                         logger.info(f"Turn {step}: Using FULL context ({len(turn_history)} turns)")
+                elif force_summarized:
+                    # Observation too long: apply summarized context
+                    print(f"[CONTEXT DECISION] DECISION: FORCED summarized context (observation too long)")
+                    windowed_input_ids = self._apply_sliding_window(turn_history, initial_question_ids)
+                    if step == 0 or step == self.config.max_turns - 1:
+                        logger.info(f"Turn {step}: FORCED summarized context (observation too long)")
                 else:
                     # This rollout uses compressed context (sliding window)
                     windowed_input_ids = self._apply_sliding_window(turn_history, initial_question_ids)
@@ -697,7 +730,6 @@ class LLMGenerationManager:
                 print(f"\n{'='*60}")
                 print(f"[NON-SLIDING] Turn {step} - Using Standard Context Update")
                 print(f"{'='*60}")
-                print(f"[NON-SLIDING] Sliding window disabled (context_window_turns=0)")
                 print(f"[NON-SLIDING] Using standard rolling state update")
                 print(f"{'='*60}\n")
                 
@@ -1051,14 +1083,19 @@ If I want to summarize, use <think_summary> and <information_summary>, if no <in
         contents = []
         action_ranges = []
                 
+        # Precompile a flexible pattern that tolerates whitespace/casing variations
+        tag_pattern = re.compile(
+            r'<\s*(search|answer)\b[^>]*>(.*?)</\s*\1\s*>',
+            re.IGNORECASE | re.DOTALL
+        )
+
         for prediction in predictions:
-            if isinstance(prediction, str): # for llm output
-                pattern = r'<(search|answer)>(.*?)</\1>'
-                match = re.search(pattern, prediction, re.DOTALL)
+            if isinstance(prediction, str):  # for llm output
+                match = tag_pattern.search(prediction)
                 if match:
-                    content = match.group(2).strip()  # Return only the content inside the tags
-                    action = match.group(1)
-                    action_range = (match.start(), match.end())
+                    content = match.group(2).strip()  # content between the tags
+                    action = match.group(1).lower()
+                    action_range = match.span()
                 else:
                     content = ''
                     action = None
