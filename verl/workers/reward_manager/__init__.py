@@ -18,4 +18,9 @@ from .simple_dense_feedback import SimpleDenseFeedbackRewardManager
 from .naive import NaiveRewardManager
 from .prime import PrimeRewardManager
 
-__all__ = ["BatchRewardManager", "DAPORewardManager", "SimpleDenseFeedbackRewardManager", "NaiveRewardManager", "PrimeRewardManager"]
+# Import the new hallucination penalty reward manager
+try:
+    from .hallucination_penalty_reward import HallucinationPenaltyRewardManager
+    __all__ = ["BatchRewardManager", "DAPORewardManager", "SimpleDenseFeedbackRewardManager", "NaiveRewardManager", "PrimeRewardManager", "HallucinationPenaltyRewardManager"]
+except ImportError:
+    __all__ = ["BatchRewardManager", "DAPORewardManager", "SimpleDenseFeedbackRewardManager", "NaiveRewardManager", "PrimeRewardManager"]

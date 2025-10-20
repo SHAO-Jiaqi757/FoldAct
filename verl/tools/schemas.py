@@ -105,8 +105,8 @@ class TrajectoryFeedback(BaseModel):
     components: List[TrajectoryComponent]
     final_answer: str
     ground_truth: Any  # 改为Any类型，接受各种格式（dict, list, str等）
-    think_score: float
+    think_score: float = 0.0
     answer_quality_score: float
-    has_insufficient_info: bool
-    has_repeated_tools: bool
-    exceeds_max_steps: bool
+    has_insufficient_info: bool = False
+    has_repeated_tools: bool = False
+    exceeds_max_steps: bool = False

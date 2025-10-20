@@ -102,9 +102,10 @@ class HallucinationPenaltyRewardManager:
         """Get configuration for hallucination penalty reward system"""
         return {
             "information_penalty": -0.5,              # Penalty for <information> components (hallucination)
-            "information_summary_bonus": 0.3,         # Bonus for <information_summary> components
+            "information_summary_bonus": 0.3,           # Bonus for <information_summary> components with context
+            "information_summary_penalty": -0.3,      # Penalty for <information_summary> components without context
             "format_bonus": 0.1,                      # Format reward: bonus when sequence ends with answer
-            "enable_debug_logs": True,
+            "enable_debug_logs": False,
             "reward_allocation_strategy": "component_based",
             "min_reward_value": -1.0,
             "max_reward_value": 2.0,
@@ -215,12 +216,14 @@ class HallucinationPenaltyRewardManager:
         """Return True if text contains an <information>...</information> block."""
         if not text:
             return False
-        return bool(re.search(r"<information>(.*?)</information>", text, flags=re.IGNORECASE | re.DOTALL))
+        # Optimize: use simple string search instead of regex for better performance
+        return "<information>" in text and "</information>" in text
 
     def _is_model_generated_information(self, component: TrajectoryComponent) -> bool:
         """Identify information blocks produced by the model (not environment observations)."""
-        content = (component.content or "").lower()
         if component.component_type == "information":
+            # Optimize: avoid lower() conversion and use faster string check
+            content = component.content or ""
             return "[turn" not in content  # Observations always include turn headers
         return self._contains_information_tag(component.content)
 
@@ -231,16 +234,21 @@ class HallucinationPenaltyRewardManager:
         model_information_indices = []
         information_summary_indices = []
 
+        # Optimize: single pass through components, cache results
         for idx, component in enumerate(components):
             if component.component_type == "information":
-                if self._is_model_generated_information(component):
+                # Cache the result to avoid repeated calls
+                is_model_generated = self._is_model_generated_information(component)
+                if is_model_generated:
                     model_information_indices.append(idx)
                 else:
                     observation_information_indices.append(idx)
             elif component.component_type == "information_summary":
                 information_summary_indices.append(idx)
-            elif self._is_model_generated_information(component):
-                model_information_indices.append(idx)
+            else:
+                # Only check for model-generated information if not already classified
+                if self._is_model_generated_information(component):
+                    model_information_indices.append(idx)
 
         summaries_with_context = 0
         summaries_without_context = 0
@@ -457,16 +465,30 @@ class HallucinationPenaltyRewardManager:
         except Exception:
             pass
         
-        # 1. Information summary bonus when grounded by contextual information
+        # 1. Information summary reward/penalty based on context availability
         if component.component_type == "information_summary":
-            bonus = hallucination_meta.get("information_summary_bonus", 0.0)
-            if bonus:
-                score += bonus
+            # Check if this summary has context (prior observation information)
+            has_context = any(info_idx < component_idx for info_idx in hallucination_meta.get("observation_information_indices", []))
+            
+            if has_context:
+                # Reward when there's actual context
+                bonus = hallucination_meta.get("information_summary_bonus", 0.0)
+                if bonus:
+                    score += bonus
+                    try:
+                        debug_parts.append(f"information_summary_bonus=+{bonus:.3f}")
+                    except Exception:
+                        pass
+                    logger.debug(f"Rewarding information summary (has context): {score:.3f}")
+            else:
+                # Penalty when no context available (hallucination)
+                penalty = self.config.get("information_summary_penalty", -0.3)
+                score += penalty
                 try:
-                    debug_parts.append(f"information_summary_bonus=+{bonus:.3f}")
+                    debug_parts.append(f"information_summary_penalty={penalty:.3f}")
                 except Exception:
                     pass
-                logger.debug(f"Rewarding information summary (context has information): {score:.3f}")
+                logger.debug(f"Penalizing information summary (no context): {score:.3f}")
         
         # 2. Information components receive hallucination penalty when generated by the model
         elif self._is_model_generated_information(component):
@@ -695,19 +717,16 @@ class HallucinationPenaltyRewardManager:
     def _process_single_item_sync(self, data_item, item_index):
         """Process single data item, return feedback and reward tensor (Synchronous version)"""
         try:
-            # Log to file
-            self.file_logger.info(f"=== PROCESSING SINGLE ITEM {item_index+1} ===")
+            # Log to file (only in debug mode to reduce I/O overhead)
+            if self.config.get("enable_debug_logs", False):
+                self.file_logger.info(f"=== PROCESSING SINGLE ITEM {item_index+1} ===")
             
             # Get response data
             response_ids = data_item.batch["responses"]
             response_ids_shape = response_ids.shape
-            logger.debug(f"Response IDs shape: {response_ids_shape}")
-            self.file_logger.info(f"Response IDs shape: {response_ids_shape}")
             
             # Calculate prompt length
             prompts_shape = data_item.batch["prompts"].shape
-            self.file_logger.debug(f"Prompts shape: {prompts_shape}")
-            self.file_logger.info(f"Prompts shape: {prompts_shape}")
             
             # Safe get prompt length
             if len(prompts_shape) >= 2:
@@ -719,13 +738,9 @@ class HallucinationPenaltyRewardManager:
                 logger.warning(f"Unexpected prompts shape: {prompts_shape}, using default prompt_length=0")
                 self.file_logger.warning(f"Unexpected prompts shape: {prompts_shape}, using default prompt_length=0")
             
-            logger.debug(f"Prompt length: {prompt_length}")
-            self.file_logger.info(f"Prompt length: {prompt_length}")
             
             # Get attention mask
             attention_mask_shape = data_item.batch["attention_mask"].shape
-            logger.debug(f"Attention mask shape: {attention_mask_shape}")
-            self.file_logger.info(f"Attention mask shape: {attention_mask_shape}")
             
             # Safe remove batch dimensions
             if len(attention_mask_shape) >= 2:
@@ -744,8 +759,6 @@ class HallucinationPenaltyRewardManager:
             if attention_mask.dim() != 1:
                 raise ValueError(f"Invalid attention_mask dimensions: {attention_mask.dim()}")
             
-            logger.debug(f"Final attention_mask shape: {attention_mask.shape}")
-            self.file_logger.info(f"Final attention_mask shape: {attention_mask.shape}")
             
             # Calculate valid response length
             if prompt_length > 0 and prompt_length < len(attention_mask):
@@ -758,8 +771,6 @@ class HallucinationPenaltyRewardManager:
                 valid_response_length = valid_response_length.item()
                 valid_response_length = int(valid_response_length)
             
-            logger.info(f"Final valid response length: {valid_response_length}")
-            self.file_logger.info(f"Final valid response length: {valid_response_length}")
             
             # Get valid response IDs
             if len(response_ids_shape) >= 2:

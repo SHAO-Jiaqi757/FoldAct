@@ -138,20 +138,11 @@ def process_conversation(conv: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             )
             context_flag = True
 
-        # For MultiTurnSFTDataset: Add the answer as the final assistant message in the conversation
-        # This creates a complete conversation that MultiTurnSFTDataset can process
-        complete_conversation = truncated_prompt.copy()
-        complete_conversation.append({
-            "role": "assistant",
-            "content": combined_answer
-        })
-        
-        new_row["prompt"] = complete_conversation
+        new_row["prompt"] = truncated_prompt
 
         new_extra = dict(extra)
         new_extra["context_prev_turn_only"] = context_flag
         new_extra["expected_answer_is_summary_plus_action"] = True
-        new_extra["multiturn_format"] = True  # Flag for MultiTurnSFTDataset
         if context_flag and previous_turn_index is not None:
             new_extra["previous_turn_index"] = previous_turn_index
         new_row["extra_info"] = new_extra
@@ -172,47 +163,9 @@ def process_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return processed
 
 
-def create_summary_only_dataset(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Create Dataset 2: prompt = summary only, keep original answer"""
-    dataset2 = []
-    
-    for row in rows:
-        new_sample = dict(row)
-        
-        # Get summary and original answer
-        summary = row.get("summary", "")
-        original_answer = row["answer"]
-        
-        # For MultiTurnSFTDataset: Create a simple conversation with summary as user message
-        # and original answer as assistant response
-        complete_conversation = [
-            {
-                "role": "user",
-                "content": summary
-            },
-            {
-                "role": "assistant", 
-                "content": original_answer
-            }
-        ]
-        
-        # Update prompt to include the complete conversation
-        new_sample["prompt"] = complete_conversation
-        
-        # Update extra_info question to use summary
-        new_sample["extra_info"] = row["extra_info"].copy()
-        new_sample["extra_info"]["question"] = summary
-        new_sample["extra_info"]["original_question_discarded"] = True
-        new_sample["extra_info"]["multiturn_format"] = True  # Flag for MultiTurnSFTDataset
-        
-        dataset2.append(new_sample)
-    
-    return dataset2
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Create both summary prefix and summary only datasets from SFT multi-turn data."
+        description="Create previous-turn-context dataset from SFT multi-turn data."
     )
     parser.add_argument(
         "--input_file",
@@ -221,16 +174,10 @@ def parse_args() -> argparse.Namespace:
         help="Path to sft_train_multiturn_with_summary.jsonl.",
     )
     parser.add_argument(
-        "--output_prefix_file",
+        "--output_file",
         type=Path,
         required=True,
-        help="Output path for the summary prefix dataset (Dataset 1).",
-    )
-    parser.add_argument(
-        "--output_only_file",
-        type=Path,
-        required=True,
-        help="Output path for the summary only dataset (Dataset 2).",
+        help="Output path for the truncated-context dataset.",
     )
     return parser.parse_args()
 
@@ -239,36 +186,9 @@ def main() -> None:
     args = parse_args()
 
     rows = load_jsonl(args.input_file)
-    
-    # Create Dataset 1: Summary prefix dataset (original functionality)
-    print("Creating Dataset 1: Summary prefix dataset...")
-    processed_prefix = process_rows(rows)
-    args.output_prefix_file.parent.mkdir(parents=True, exist_ok=True)
-    dump_jsonl(args.output_prefix_file, processed_prefix)
-    print(f"✓ Dataset 1 created: {len(processed_prefix)} samples → {args.output_prefix_file}")
-    
-    # Create Dataset 2: Summary only dataset
-    print("Creating Dataset 2: Summary only dataset...")
-    processed_only = create_summary_only_dataset(rows)
-    args.output_only_file.parent.mkdir(parents=True, exist_ok=True)
-    dump_jsonl(args.output_only_file, processed_only)
-    print(f"✓ Dataset 2 created: {len(processed_only)} samples → {args.output_only_file}")
-    
-    print("\n" + "="*80)
-    print("DATASET 1 EXAMPLE (Summary Prefix)")
-    print("="*80)
-    if processed_prefix:
-        print(f"Multiturn prompt length: {len(processed_prefix[0]['prompt'])} messages")
-        print(f"Answer (first 300 chars):\n{processed_prefix[0]['answer'][:300]}...")
-    
-    print("\n" + "="*80)
-    print("DATASET 2 EXAMPLE (Summary Only)")
-    print("="*80)
-    if processed_only:
-        print(f"Simple prompt: {len(processed_only[0]['prompt'])} message(s)")
-        print(f"Prompt content (first 300 chars):\n{processed_only[0]['prompt'][0]['content'][:300]}...")
-        print(f"Answer (first 200 chars):\n{processed_only[0]['answer'][:200]}...")
-    print("="*80)
+    processed = process_rows(rows)
+    args.output_file.parent.mkdir(parents=True, exist_ok=True)
+    dump_jsonl(args.output_file, processed)
 
 
 if __name__ == "__main__":

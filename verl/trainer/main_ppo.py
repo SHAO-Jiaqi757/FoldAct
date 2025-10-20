@@ -145,6 +145,10 @@ class TaskRunner:
             from verl.workers.reward_manager import SimpleDenseFeedbackRewardManager
             print("Loading SimpleDenseFeedbackRewardManager...")
             reward_manager_cls = SimpleDenseFeedbackRewardManager
+        elif reward_manager_name == "hallucination_penalty":
+            from verl.workers.reward_manager import HallucinationPenaltyRewardManager
+            print("Loading HallucinationPenaltyRewardManager...")
+            reward_manager_cls = HallucinationPenaltyRewardManager
         else:
             raise NotImplementedError
 
@@ -167,6 +171,24 @@ class TaskRunner:
                 **reward_kwargs,
             )
             print(f"✅ SimpleDenseFeedbackRewardManager initialized successfully!")
+        elif reward_manager_name == "hallucination_penalty":
+            print(f"\n🎯 Initializing HallucinationPenaltyRewardManager...")
+            reward_kwargs = dict(config.reward_model.get("reward_kwargs", {}))
+            reward_fn = reward_manager_cls(
+                tokenizer=tokenizer,
+                num_examine=0,
+                compute_score=None,  # Will use default
+                reward_fn_key=config.data.get("reward_fn_key", "data_source"),
+                **reward_kwargs,
+            )
+            val_reward_fn = reward_manager_cls(
+                tokenizer=tokenizer,
+                num_examine=1,
+                compute_score=None,  # Will use default
+                reward_fn_key=config.data.get("reward_fn_key", "data_source"),
+                **reward_kwargs,
+            )
+            print(f"✅ HallucinationPenaltyRewardManager initialized successfully!")
         else:
             reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=0, normalize_by_length=False)
             val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=1, normalize_by_length=False)

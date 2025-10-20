@@ -1,4 +1,6 @@
 import torch
+import json
+import uuid
 import re
 from collections import defaultdict
 import os
@@ -50,6 +52,8 @@ class ResponseType(Enum):
     search = 1
     answer = 2
     information = 3
+    information_summary = 4
+    think_summary = 5
 
 
 @dataclass
@@ -78,6 +82,8 @@ class GenerationConfig:
     # Whether to compute full-context log_prob baseline for compressed rollouts
     # This enables KL(π_comp || π_full) regularization during training
     enable_kl_baseline: bool = True
+    # Performance optimization: reduce logging overhead
+    enable_debug_logs: bool = False
 
 class LLMGenerationManager:
     def __init__(
@@ -121,14 +127,16 @@ class LLMGenerationManager:
         """
         
         # ========== CONTEXT SUMMARIZATION LOGGING ==========
-        print(f"\n{'='*80}")
-        print(f"[CONTEXT SUMMARY] Applying adaptive sliding window context compression")
-        print(f"{'='*80}")
-        print(f"[CONTEXT SUMMARY] Total turns in history: {len(turn_history)}")
-        print(f"[CONTEXT SUMMARY] Initial question length: {initial_question.shape[1]} tokens")
+        if getattr(self.config, 'enable_debug_logs', False):
+            print(f"\n{'='*80}")
+            print(f"[CONTEXT SUMMARY] Applying adaptive sliding window context compression")
+            print(f"{'='*80}")
+            print(f"[CONTEXT SUMMARY] Total turns in history: {len(turn_history)}")
+            print(f"[CONTEXT SUMMARY] Initial question length: {initial_question.shape[1]} tokens")
         
         if len(turn_history) == 0:
-            print(f"[CONTEXT SUMMARY] No turns in history, returning initial question")
+            if getattr(self.config, 'enable_debug_logs', False):
+                print(f"[CONTEXT SUMMARY] No turns in history, returning initial question")
             return initial_question
 
         # Analyze each turn for information content
@@ -147,7 +155,6 @@ class LLMGenerationManager:
                 'total_len': total_len,
                 'has_information': has_information
             })
-            print(f"[CONTEXT SUMMARY] Turn {i}: response={response_len} tokens, obs={obs_len} tokens, total={total_len} tokens, has_info={has_information}")
 
         # Single-scheme truncation:
         # Keep the contiguous block consisting of the most recent info-turn
@@ -157,10 +164,12 @@ class LLMGenerationManager:
             flag = False
             obs = t.get('observations')
             if obs is not None and obs.shape[1] > 0:
-                obs_text = self.tokenizer.decode(obs[0], skip_special_tokens=True)
-                flag = ('<information>' in obs_text) and ('</information>' in obs_text)
+                # Check if observation has substantial content (more than just turn headers)
+                obs_tokens = obs[0]
+                flag = obs_tokens.shape[0] > 20  # More than just turn headers and basic info
             has_info_flags.append(flag)
-            print(f"[CONTEXT SUMMARY] Turn {i} has_info_tag={flag}")
+            if getattr(self.config, 'enable_debug_logs', False):
+                print(f"[CONTEXT SUMMARY] Turn {i} has_info_tag={flag}")
 
         # Find last info index
         last_info_idx = -1
@@ -172,17 +181,20 @@ class LLMGenerationManager:
         if last_info_idx == -1:
             # No info yet → keep all context
             selected_turns = turn_history
-            print(f"[CONTEXT SUMMARY] No <information> found in history → keeping ALL turns")
+            if getattr(self.config, 'enable_debug_logs', False):
+                print(f"[CONTEXT SUMMARY] No <information> found in history → keeping ALL turns")
         else:
             # Include contiguous non-info turns immediately before the last info turn
             start_idx = last_info_idx
             while start_idx - 1 >= 0 and not has_info_flags[start_idx - 1]:
                 start_idx -= 1
             selected_turns = turn_history[start_idx:last_info_idx + 1]
-            print(f"[CONTEXT SUMMARY] Using block turns [{start_idx}..{last_info_idx}] (non-info before last info + last info)")
+            if getattr(self.config, 'enable_debug_logs', False):
+                print(f"[CONTEXT SUMMARY] Using block turns [{start_idx}..{last_info_idx}] (non-info before last info + last info)")
         all_tokens: List[torch.Tensor] = [initial_question.clone()]
         total_compressed_length = initial_question.shape[1]
-        print(f"[CONTEXT SUMMARY] Added initial question: {initial_question.shape[1]} tokens")
+        if getattr(self.config, 'enable_debug_logs', False):
+            print(f"[CONTEXT SUMMARY] Added initial question: {initial_question.shape[1]} tokens")
         
         for i, turn in enumerate(selected_turns):
             all_tokens.append(turn['responses'])
@@ -191,7 +203,8 @@ class LLMGenerationManager:
             
             turn_len = turn['responses'].shape[1] + (turn.get('observations', torch.tensor([])).shape[1] if turn.get('observations') is not None else 0)
             total_compressed_length += turn_len
-            print(f"[CONTEXT SUMMARY] Selected turn {i}: {turn_len} tokens")
+            if getattr(self.config, 'enable_debug_logs', False):
+                print(f"[CONTEXT SUMMARY] Selected turn {i}: {turn_len} tokens")
 
         compressed_context = self.tensor_fn.concatenate_with_padding(all_tokens)
         final_length = compressed_context.shape[1]
@@ -201,12 +214,13 @@ class LLMGenerationManager:
         tokens_saved = original_length - final_length
         compression_ratio = tokens_saved / original_length if original_length > 0 else 0.0
         
-        print(f"[CONTEXT SUMMARY] COMPRESSION RESULTS:")
-        print(f"[CONTEXT SUMMARY]   Original context: {original_length} tokens")
-        print(f"[CONTEXT SUMMARY]   Compressed context: {final_length} tokens")
-        print(f"[CONTEXT SUMMARY]   Tokens saved: {tokens_saved} tokens")
-        print(f"[CONTEXT SUMMARY]   Compression ratio: {compression_ratio:.1%}")
-        print(f"{'='*80}\n")
+        if getattr(self.config, 'enable_debug_logs', False):
+            print(f"[CONTEXT SUMMARY] COMPRESSION RESULTS:")
+            print(f"[CONTEXT SUMMARY]   Original context: {original_length} tokens")
+            print(f"[CONTEXT SUMMARY]   Compressed context: {final_length} tokens")
+            print(f"[CONTEXT SUMMARY]   Tokens saved: {tokens_saved} tokens")
+            print(f"[CONTEXT SUMMARY]   Compression ratio: {compression_ratio:.1%}")
+            print(f"{'='*80}\n")
         
         return compressed_context
 
@@ -525,6 +539,11 @@ class LLMGenerationManager:
             rollings_active = DataProto.from_dict({
                 k: v[active_mask] for k, v in rollings.batch.items()
             })            
+            # Capture the exact input used for generation for logging
+            try:
+                generation_input_ids_for_log = rollings_active.batch['input_ids']
+            except Exception:
+                generation_input_ids_for_log = rollings.batch['input_ids']
             gen_output = self._generate_with_gpu_padding(rollings_active)
 
             meta_info = gen_output.meta_info            
@@ -593,42 +612,35 @@ class LLMGenerationManager:
                     rollings.batch['attention_mask'] = torch.cat([rollings.batch['attention_mask'], torch.ones_like(turn_context_tokens).to(rollings.batch['attention_mask'].device)], dim=1)
                     rollings.batch['position_ids'] = self.tensor_fn.create_position_ids(rollings.batch['attention_mask'])
 
-            # ========== TURN-BY-TURN GENERATION LOGGING ==========
-            print(f"\n{'='*80}")
-            print(f"[TURN GENERATION] Turn {step} - Model Generation Details")
-            print(f"[TURN GENERATION] Added turn context: {turn_context_info}")
-            print(f"{'='*80}")
-            
-            # Log the input context for this turn
-            if hasattr(self, 'tokenizer') and self.tokenizer is not None:
-                # Decode the current input context
-                current_context = rollings.batch['input_ids']
-                context_text = self.tokenizer.decode(current_context[0], skip_special_tokens=False)
-                print(f"[TURN GENERATION] INPUT CONTEXT (Turn {step}):")
-                print(f"[TURN GENERATION] Context length: {current_context.shape[1]} tokens")
-                print(f"[TURN GENERATION] Context preview: {context_text}")  # Last 500 chars
+            # ========== TURN TRACE (single structured line) ==========
+            if getattr(self.config, 'enable_debug_logs', False):
+                trace_id = getattr(self, '_trace_id', None)
+                if trace_id is None:
+                    trace_id = uuid.uuid4().hex[:8]
+                    setattr(self, '_trace_id', trace_id)
+                # Decode the exact input that was fed to the generator (pre-context-updates)
+                current_context = generation_input_ids_for_log
+                context_text_full = self.tokenizer.decode(current_context[0], skip_special_tokens=True)
+                # Use postprocessed response text directly for fidelity
+                response_text_full = (responses_str[0] if isinstance(responses_str, list) and len(responses_str) > 0 else "")
+                # Get the observation that will be added to context after this response
+
+                response_text = response_text_full
                 
-                # Decode the model's response
-                if responses_ids.shape[1] > 0:
-                    response_text = self.tokenizer.decode(responses_ids[0], skip_special_tokens=False)
-                    print(f"[TURN GENERATION] MODEL RESPONSE (Turn {step}):")
-                    print(f"[TURN GENERATION] Response length: {responses_ids.shape[1]} tokens")
-                    print(f"[TURN GENERATION] Response: {response_text}")
-                else:
-                    print(f"[TURN GENERATION] MODEL RESPONSE (Turn {step}): [EMPTY RESPONSE]")
+                turn_record = {
+                    "trace_id": trace_id,
+                    "step": int(step),
+                    "context_type": context_type,
+                    "context": context_text_full,  # Human-readable (no special tokens)
+                    "response": response_text,
+                }
                 
-                # Decode the observation if available
-                if next_obs_ids.shape[1] > 0:
-                    obs_text = self.tokenizer.decode(next_obs_ids[0], skip_special_tokens=False)
-                    print(f"[TURN GENERATION] OBSERVATION (Turn {step}):")
-                    print(f"[TURN GENERATION] Observation length: {next_obs_ids.shape[1]} tokens")
-                    print(f"[TURN GENERATION] Observation: {obs_text}")  # First 300 chars
-                else:
-                    print(f"[TURN GENERATION] OBSERVATION (Turn {step}): [NO OBSERVATION]")
-            else:
-                print(f"[TURN GENERATION] No tokenizer available for text decoding")
-            
-            print(f"{'='*80}\n")
+                # Write turn record to file instead of printing
+                import os
+                log_dir = os.environ.get("TRAINING_LOG_DIR", ".")
+                log_file = os.path.join(log_dir, "training_turn_logs.jsonl")
+                with open(log_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"turn": turn_record}, ensure_ascii=False) + "\n")
 
             # Update states
             if use_sliding:
@@ -712,7 +724,7 @@ class LLMGenerationManager:
                 print(f"[FINAL CONTEXT] Turn {step} - Context for Next Turn")
                 print(f"{'='*60}")
                 print(f"[FINAL CONTEXT] Final context length: {windowed_input_ids.shape[1]} tokens")
-                if hasattr(self, 'tokenizer') and self.tokenizer is not None:
+                if hasattr(self, 'tokenizer') and self.tokenizer is not None and getattr(self.config, 'enable_debug_logs', False):
                     final_context_text = self.tokenizer.decode(windowed_input_ids[0], skip_special_tokens=True)
                     print(f"[FINAL CONTEXT] Final context preview: {final_context_text}")  # Last 300 chars
                 print(f"{'='*60}\n")
@@ -897,8 +909,23 @@ class LLMGenerationManager:
                 s_idx = torch.searchsorted(valid_offsets, s, right=True) - 1
                 e_idx = torch.searchsorted(valid_offsets, e)
 
-                types[i, s_idx:e_idx] = ResponseType.search.value if is_search[i] \
-                    else ResponseType.answer.value
+                # Determine the correct response type based on action
+                if is_search[i]:
+                    types[i, s_idx:e_idx] = ResponseType.search.value
+                else:
+                    # Check the action type from the response string (case-insensitive)
+                    action_str = responses_str[i][s:e].lower() if s < len(responses_str[i]) and e <= len(responses_str[i]) else ""
+                    if "<answer>" in action_str:
+                        types[i, s_idx:e_idx] = ResponseType.answer.value
+                    elif "<think_summary>" in action_str:
+                        types[i, s_idx:e_idx] = ResponseType.think_summary.value
+                    elif "<information_summary>" in action_str:
+                        types[i, s_idx:e_idx] = ResponseType.information_summary.value
+                    elif "<think>" in action_str and "<think_summary>" not in action_str:
+                        types[i, s_idx:e_idx] = ResponseType.think.value
+                    else:
+                        # Default to think for any other content
+                        types[i, s_idx:e_idx] = ResponseType.think.value
 
         return types
 
@@ -1034,9 +1061,11 @@ class LLMGenerationManager:
                     # Check if this is the last turn and provide sharp message
                     if max_turns and current_turn >= max_turns - 1:
                         sharp_message = f"\n\n⚠️ **FINAL TURN WARNING** ⚠️\nThis is your LAST turn (Turn {current_turn + 1}/{max_turns}). You MUST provide your final answer now using <answer>...</answer> tags. No more searches are allowed.\n\n"
-                        next_obs.append(f'{turn_info}<information>{search_result}</information>{sharp_message}')
+                        # Fix: Add proper role labeling for information blocks
+                        next_obs.append(f'{turn_info}user\n<information>{search_result}</information>\n\nassistant\n{sharp_message}')
                     else:
-                        next_obs.append(f'{turn_info}<information>{search_result}</information>\n\n')
+                        # Fix: Add proper role labeling for information blocks
+                        next_obs.append(f'{turn_info}user\n<information>{search_result}</information>\n\nassistant\n')
                     
                     dones.append(0)
                     valid_action.append(1)
@@ -1085,21 +1114,36 @@ If I want to summarize, use <think_summary> and <information_summary>, if no <in
                 
         # Precompile a flexible pattern that tolerates whitespace/casing variations
         tag_pattern = re.compile(
-            r'<\s*(search|answer)\b[^>]*>(.*?)</\s*\1\s*>',
+            r'<\s*(search|answer|think|think_summary|information_summary)\b[^>]*>(.*?)</\s*\1\s*>',
             re.IGNORECASE | re.DOTALL
         )
 
         for prediction in predictions:
             if isinstance(prediction, str):  # for llm output
-                match = tag_pattern.search(prediction)
-                if match:
-                    content = match.group(2).strip()  # content between the tags
-                    action = match.group(1).lower()
-                    action_range = match.span()
+                # Priority: answer action should be recognized first (ending signal)
+                answer_match = re.search(r'<\s*answer\b[^>]*>(.*?)</\s*answer\s*>', prediction, re.IGNORECASE | re.DOTALL)
+                if answer_match:
+                    content = answer_match.group(1).strip()
+                    action = 'answer'
+                    action_range = answer_match.span()
                 else:
-                    content = ''
-                    action = None
-                    action_range = None
+                    # Fallback to other actions
+                    match = tag_pattern.search(prediction)
+                    if match:
+                        content = match.group(2).strip()  # content between the tags
+                        action = match.group(1).lower()
+                        action_range = match.span()
+                        # Guard: treat <search> with blank/punctuation-only content as invalid
+                        if action == 'search':
+                            content_stripped = content.strip()
+                            if not content_stripped or not len(content_stripped) > 5:
+                                action = None
+                                content = ''
+                                action_range = None
+                    else:
+                        content = ''
+                        action = None
+                        action_range = None
             else:
                 raise ValueError(f"Invalid prediction type: {type(prediction)}")
             

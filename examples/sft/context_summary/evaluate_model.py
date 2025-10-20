@@ -1,40 +1,20 @@
 #!/usr/bin/env python3
 """
-Evaluate trained model performance on:
-1. Summary-Reasoning: Model generates summary from full context, then reasons
-2. Reasoning from Summary: Model reasons directly from given summary
+Evaluate trained model performance on any dataset.
+Unified evaluation that processes samples with their prompts and generates responses.
 """
 
 import argparse
 import json
-import torch
+import os
 from pathlib import Path
-from typing import List, Dict, Any
-from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from typing import List, Dict
 
+# Disable vLLM v1 which has issues
+os.environ['VLLM_USE_V1'] = '0'
 
-def load_model(model_path: str, device: str = "cuda"):
-    """Load model and tokenizer."""
-    print(f"Loading model from {model_path}...")
-    
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True
-    )
-    
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path,
-        trust_remote_code=True
-    )
-    
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    
-    print(f"✓ Model loaded on {device}")
-    return model, tokenizer
+from vllm import LLM, SamplingParams
+from transformers import AutoTokenizer
 
 
 def load_test_data(test_file: str, limit: int = None) -> List[Dict]:
@@ -50,195 +30,149 @@ def load_test_data(test_file: str, limit: int = None) -> List[Dict]:
     return samples
 
 
-def test_summary_reasoning(
-    model,
-    tokenizer,
-    sample: Dict,
-    max_new_tokens: int = 512
-) -> Dict[str, str]:
-    """
-    Test 1: Summary-Reasoning
-    Input: Full context (question + reasoning + search results)
-    Expected: Generate summary first, then reasoning/answer
-    """
-    # Use the prompt content (consistent with training)
-    full_context = sample['prompt'][0]['content']
-    
-    # Prepare input - tokenize directly
-    messages = [{"role": "user", "content": full_context}]
-    input_ids = tokenizer.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
-        tokenize=True,
-        return_tensors="pt"
-    ).to(model.device)
-    
-    input_length = input_ids.shape[1]
-    
-    # Generate
-    with torch.no_grad():
-        outputs = model.generate(
-            input_ids,
-            max_new_tokens=max_new_tokens,
-            temperature=0.7,
-            do_sample=True,
-            top_p=0.9,
-            pad_token_id=tokenizer.pad_token_id
-        )
-    
-    # Extract only the generated tokens (token-level slicing)
-    generated_tokens = outputs[0, input_length:]
-    
-    # Decode only the generated part
-    response = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
-    
-    return {
-        "input": full_context,
-        "generated": response,
-        "expected_summary": sample.get('summary', 'N/A'),
-        "expected_answer": sample['extra_info']['answer']
-    }
+def remove_assistant_from_context(messages: List[Dict]) -> List[Dict]:
+    """Remove assistant messages from context for evaluation."""
+    # Remove the last assistant message if it exists (added during dataset creation)
+    if messages and messages[-1].get('role') == 'assistant':
+        return messages[:-1]
+    return messages
 
 
-def test_reasoning_from_summary(
-    model,
-    tokenizer,
-    sample: Dict,
-    max_new_tokens: int = 256
-) -> Dict[str, str]:
-    """
-    Test 2: Reasoning from Summary
-    Input: Summary only (concise context)
-    Expected: Generate reasoning and answer directly
-    """
-    # Use summary as input
-    summary = sample.get('summary', '')
-    
-    if not summary:
-        return {"error": "No summary available"}
-    
-    # Prepare input - tokenize directly
-    messages = [{"role": "user", "content": summary}]
-    input_ids = tokenizer.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
-        tokenize=True,
-        return_tensors="pt"
-    ).to(model.device)
-    
-    input_length = input_ids.shape[1]
-    
-    # Generate
-    with torch.no_grad():
-        outputs = model.generate(
-            input_ids,
-            max_new_tokens=max_new_tokens,
-            temperature=0.7,
-            do_sample=True,
-            top_p=0.9,
-            pad_token_id=tokenizer.pad_token_id
-        )
-    
-    # Extract only the generated tokens (token-level slicing)
-    generated_tokens = outputs[0, input_length:]
-    
-    # Decode only the generated part
-    response = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
-    
-    return {
-        "input_summary": summary,
-        "generated": response,
-        "expected_answer": sample['extra_info']['answer']
-    }
-
-
-def evaluate_model(
+def evaluate_with_vllm(
     model_path: str,
     test_file: str,
     output_file: str,
     num_samples: int = 10,
-    max_new_tokens: int = 512
+    max_new_tokens: int = 1024
 ):
-    """Main evaluation function."""
+    """Evaluate using vLLM with training-matched parameters."""
     
-    # Load model
-    model, tokenizer = load_model(model_path)
+ 
+    
+    # Load tokenizer
+    print(f"\nLoading tokenizer from {model_path}...")
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        trust_remote_code=True
+    )
+    
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    print("✓ Tokenizer loaded")
+    
+    # Initialize vLLM with training-matched config
+    print("\nInitializing vLLM engine...")
+    print("⚠️  Using vLLM (non-v1) to match training inference")
+    
+    llm = LLM(
+        model=model_path,
+        dtype="float16",
+        tensor_parallel_size=1,
+        max_model_len=8192,  # Reduced from 12288 for single GPU
+        gpu_memory_utilization=0.7,
+        enable_chunked_prefill=False,  # Disable for single GPU simplicity
+        enforce_eager=True,
+        trust_remote_code=True,
+        disable_log_stats=True,
+    )
+    
+    print("✓ vLLM engine initialized")
     
     # Load test data
     print(f"\nLoading test data from {test_file}...")
     test_samples = load_test_data(test_file, limit=num_samples)
     print(f"✓ Loaded {len(test_samples)} test samples")
     
-    # Detect which tests to run based on data structure
-    # Check if prompt contains full context (not summary format)
-    has_full_context = False
-    has_summary = False
-    
-    if test_samples:
-        # Check if prompt exists and contains full context (has <information> not <information_summary>)
-        if 'prompt' in test_samples[0]:
-            prompt_content = test_samples[0]['prompt'][0]['content']
-            # If it contains <information_summary>, it's a summary format, not full context
-            has_full_context = '<information_summary>' not in prompt_content and '<think_summary>' not in prompt_content
-        
-        # Check if summary field exists
-        has_summary = 'summary' in test_samples[0] and test_samples[0].get('summary')
-    
-    print(f"\n📊 Data analysis:")
-    print(f"  - Full context available: {'✓' if has_full_context else '✗'}")
-    print(f"  - Summary available: {'✓' if has_summary else '✗'}")
+    # Create sampling params matching training
+    sampling_params = SamplingParams(
+        temperature=0.7,
+        top_p=1.0,
+        top_k=-1,
+        max_tokens=max_new_tokens,
+        skip_special_tokens=True,
+    )
     
     results = {
         "model_path": model_path,
         "test_file": test_file,
         "num_samples": len(test_samples),
-        "summary_reasoning_results": [],
-        "reasoning_from_summary_results": []
+        "inference_backend": "vLLM (single GPU)",
+        "config": {
+            "temperature": 0.7,
+            "top_p": 1.0,
+            "top_k": -1,
+            "max_tokens": max_new_tokens,
+            "dtype": "float16",
+        },
+        "evaluation_results": []
     }
     
     print("\n" + "="*80)
     print("EVALUATION STARTED")
     print("="*80)
     
-    # Test 1: Summary-Reasoning (only if full context is available)
-    if has_full_context:
-        print("\n📝 Test 1: Summary-Reasoning (Full Context → Summary + Answer)")
-        print("-"*80)
-        
-        for i, sample in enumerate(tqdm(test_samples, desc="Summary-Reasoning")):
-            result = test_summary_reasoning(
-                model, tokenizer, sample, max_new_tokens
-            )
-            result['sample_id'] = i
-            results['summary_reasoning_results'].append(result)
-            
-            if i == 0:  # Show first example
-                print(f"\n【Example 1】")
-                print(f"Input (first 200 chars): {result['input'][:200]}...")
-                print(f"\nGenerated:\n{result['generated'][:400]}...")
-                print(f"\nExpected Summary:\n{result['expected_summary'][:200]}...")
-    else:
-        print("\n⊘ Test 1: Summary-Reasoning - SKIPPED (no full context in data)")
+    # Prepare prompts and track raw formats
+    prompts = []
+    prompt_details = []  # Track both readable and raw formats
     
-    # Test 2: Reasoning from Summary (only if summary is available)
-    if has_summary:
-        print("\n\n🤔 Test 2: Reasoning from Summary (Summary → Answer)")
-        print("-"*80)
+    for sample in test_samples:
+        messages = sample['prompt'].copy()
+        if messages and messages[-1].get('role') == 'assistant':
+            messages = messages[:-1]
         
-        for i, sample in enumerate(tqdm(test_samples, desc="Reasoning from Summary")):
-            result = test_reasoning_from_summary(
-                model, tokenizer, sample, max_new_tokens
-            )
-            result['sample_id'] = i
-            results['reasoning_from_summary_results'].append(result)
-            
-            if i == 0:  # Show first example
-                print(f"\n【Example 1】")
-                print(f"Input Summary (first 200 chars): {result['input_summary'][:200]}...")
-                print(f"\nGenerated:\n{result['generated'][:400]}...")
-                print(f"\nExpected:\n{result['expected_answer'][:200]}...")
-    else:
-        print("\n⊘ Test 2: Reasoning from Summary - SKIPPED (no summary in data)")
+        # Apply chat template
+        prompt_text = tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False
+        )
+        prompts.append(prompt_text)
+        
+        # Also get tokenized version to show raw format
+        prompt_ids = tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_tensors="pt"
+        )
+        
+        # Decode with and without special tokens
+        prompt_readable = tokenizer.decode(prompt_ids[0], skip_special_tokens=True)
+        
+        prompt_details.append({
+            "readable": prompt_readable,
+            "token_count": len(prompt_ids[0]),
+        })
+    
+    # Generate with vLLM
+    print(f"\n📝 Generating {len(prompts)} responses...")
+    outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
+    
+    # Process results
+    for i, (sample, output, prompt_detail) in enumerate(zip(test_samples, outputs, prompt_details)):
+        generated = output.outputs[0].text.strip()
+        
+        result = {
+            "input": sample['prompt'],
+            "input_readable": prompt_detail['readable'],
+            "input_raw": prompt_detail['raw'],
+            "input_token_count": prompt_detail['token_count'],
+            "generated": generated,
+            "expected_summary": sample.get('summary', 'N/A'),
+            "expected_answer": sample['answer'],
+            "context_length": len(sample['prompt']),
+            "sample_id": i
+        }
+        results['evaluation_results'].append(result)
+        
+        if i == 0:  # Show first example
+            print(f"\n【Example 1】")
+            print(f"Context length: {result['context_length']} messages")
+            print(f"Input (first 200 chars): {result['input'][:200]}...")
+            print(f"\nGenerated:\n{result['generated'][:400]}...")
+            print(f"\nExpected Summary:\n{result['expected_summary'][:200]}...")
+            print(f"\nExpected Answer:\n{result['expected_answer'][:200]}...")
     
     # Save results
     print(f"\n\n💾 Saving results to {output_file}...")
@@ -257,15 +191,7 @@ def evaluate_model(
     print(f"Test file: {test_file}")
     print(f"Test samples: {len(test_samples)}")
     print(f"Results saved to: {output_file}")
-    print("\nTests performed:")
-    if has_full_context:
-        print(f"  ✓ Test 1 - Summary-Reasoning: {len(results['summary_reasoning_results'])} samples")
-    else:
-        print(f"  ⊘ Test 1 - Summary-Reasoning: SKIPPED")
-    if has_summary:
-        print(f"  ✓ Test 2 - Reasoning from Summary: {len(results['reasoning_from_summary_results'])} samples")
-    else:
-        print(f"  ⊘ Test 2 - Reasoning from Summary: SKIPPED")
+    print(f"  ✓ Evaluation completed: {len(results['evaluation_results'])} samples")
     print("="*80)
     
     return results
@@ -273,7 +199,7 @@ def evaluate_model(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate model performance on summary and reasoning tasks",
+        description="Simple vLLM evaluation matching training inference",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -304,7 +230,7 @@ Examples:
         "--test_file",
         type=str,
         required=True,
-        help="Path to test data (JSONL with summary field)"
+        help="Path to test data (JSONL file)"
     )
     parser.add_argument(
         "--output",
@@ -327,7 +253,7 @@ Examples:
     
     args = parser.parse_args()
     
-    evaluate_model(
+    evaluate_with_vllm(
         model_path=args.model_path,
         test_file=args.test_file,
         output_file=args.output,
