@@ -19,6 +19,7 @@ from verl import DataProto
 from verl.utils.tracking import Tracking
 from verl.tools.search_tool import SearchTool
 from verl.tools.schemas import OpenAIFunctionToolSchema
+from verl.utils.event_ledger import EventLedger, EventType
 import shutil
 import requests
 
@@ -71,8 +72,6 @@ class GenerationConfig:
     retriever_rate_limit:int = 120 
     retriever_timeout:int = 30 
     retriever_enable_global_rate_limit:bool = True 
-    # Whether to allow do_search during the final rollout and append <information>
-    final_turn_do_search: bool = False
     # Enable sliding window context: keep only the most recent N turns (0 = keep all)
     use_sliding: bool = False
     
@@ -191,6 +190,44 @@ class LLMGenerationManager:
             selected_turns = turn_history[start_idx:last_info_idx + 1]
             if getattr(self.config, 'enable_debug_logs', False):
                 print(f"[CONTEXT SUMMARY] Using block turns [{start_idx}..{last_info_idx}] (non-info before last info + last info)")
+        
+        # CRITICAL FIX: Add length check to prevent exceeding max_model_len
+        max_allowed_length = 7000  # Leave room for response generation (8192 - 1000 = 7192, use 7000 for safety)
+        
+        # Calculate current length
+        current_length = initial_question.shape[1]
+        for turn in selected_turns:
+            current_length += turn['responses'].shape[1]
+            if turn.get('observations') is not None:
+                current_length += turn['observations'].shape[1]
+        
+        # If still too long, apply aggressive truncation
+        if current_length > max_allowed_length:
+            if getattr(self.config, 'enable_debug_logs', False):
+                print(f"[CONTEXT SUMMARY] ⚠️ Context too long ({current_length} > {max_allowed_length}), applying aggressive truncation")
+            
+            # Keep only the most recent turns to fit within limit
+            truncated_turns = []
+            accumulated_length = initial_question.shape[1]
+            
+            # Start from the most recent turns and work backwards
+            for i in range(len(selected_turns) - 1, -1, -1):
+                turn = selected_turns[i]
+                turn_length = turn['responses'].shape[1]
+                if turn.get('observations') is not None:
+                    turn_length += turn['observations'].shape[1]
+                
+                if accumulated_length + turn_length <= max_allowed_length:
+                    truncated_turns.insert(0, turn)  # Insert at beginning to maintain order
+                    accumulated_length += turn_length
+                else:
+                    if getattr(self.config, 'enable_debug_logs', False):
+                        print(f"[CONTEXT SUMMARY] Stopping at turn {i} to stay within length limit")
+                    break
+            
+            selected_turns = truncated_turns
+            if getattr(self.config, 'enable_debug_logs', False):
+                print(f"[CONTEXT SUMMARY] Aggressive truncation: kept {len(selected_turns)} turns, estimated length: {accumulated_length}")
         all_tokens: List[torch.Tensor] = [initial_question.clone()]
         total_compressed_length = initial_question.shape[1]
         if getattr(self.config, 'enable_debug_logs', False):
@@ -280,9 +317,7 @@ class LLMGenerationManager:
         if self.config.no_think_rl:
             raise ValueError('stop')
             # if no_think_rl is enabled, only keep action in the str
-            actions, _ = self.env.postprocess_predictions(responses_str)
-            responses_str=[f"<answer>{envs[idx].ACTION_LOOKUP[action]}</answer>" for idx, action in enumerate(actions)]
-            print("RESPONSES:", responses_str)
+            # The downstream no_think_rl path is not supported in this workflow.
         responses, responses_offsets = self._batch_tokenize(responses_str)
         return responses, responses_offsets, responses_str
 
@@ -423,6 +458,28 @@ class LLMGenerationManager:
             if active_batch size is not divisible by num_gpus, pad with first sequence
             then remove padding from output
         """
+        # CRITICAL FIX: Check input length before generation - use simple truncation
+        input_ids = active_batch.batch['input_ids']
+        max_model_len = 8192  # vLLM max_model_len
+        max_allowed_prompt_len = max_model_len - 1000  # Leave room for response generation
+        
+        for i in range(input_ids.shape[0]):
+            prompt_len = input_ids[i].shape[0]
+            if prompt_len > max_allowed_prompt_len:
+                # Simple truncation: keep the most recent context
+                truncated_input = input_ids[i][-max_allowed_prompt_len:]
+                active_batch.batch['input_ids'][i] = truncated_input
+                
+                # Also truncate attention_mask if present
+                if 'attention_mask' in active_batch.batch:
+                    active_batch.batch['attention_mask'][i] = active_batch.batch['attention_mask'][i][-max_allowed_prompt_len:]
+                
+                # Truncate other related tensors if present
+                for key in ['responses', 'responses_with_info_mask', 'step_ids', 'responses_types']:
+                    if key in active_batch.batch and active_batch.batch[key].shape[1] > max_allowed_prompt_len:
+                        active_batch.batch[key][i] = active_batch.batch[key][i][-max_allowed_prompt_len:]
+                
+        
         num_gpus = self.config.num_gpus
         if num_gpus <= 1:
             if self.use_async and self.async_rollout_manager is not None:
@@ -490,7 +547,6 @@ class LLMGenerationManager:
         active_mask = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.bool)
         turns_stats = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
         valid_action_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
-        valid_search_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
         active_num_list = [active_mask.sum().item()]
         rollings = gen_batch
 
@@ -501,6 +557,11 @@ class LLMGenerationManager:
         # Initialize turn_history and initial_question_ids regardless of use_sliding
         initial_question_ids = gen_batch.batch['input_ids'].clone()
         turn_history: List[Dict[str, torch.Tensor]] = []
+        
+        # Initialize event ledgers for each example in batch (FULL CONTEXT TRACKING)
+        batch_size = gen_batch.batch['input_ids'].shape[0]
+        event_ledgers = [EventLedger(trajectory_id=f"traj_{i}") for i in range(batch_size)]
+        logger.info(f"[Event Ledger] Initialized {batch_size} event ledgers for full context tracking")
         
         if use_sliding:
             print(f"[DEBUG] Sliding window enabled, turn history initialized")
@@ -526,6 +587,12 @@ class LLMGenerationManager:
         context_lengths_per_turn = []  # Track context length at each turn
         full_context_lengths_per_turn = []  # Track what full context would be (for compressed rollouts)
 
+        # ========== PER-TURN CONTEXT SAVING ==========
+        # Save context for each turn to enable correct log_prob computation during training
+        # Key insight: Each turn's response should be trained with the context it actually saw
+        per_turn_contexts = [[] for _ in range(batch_size)]  # List of contexts for each trajectory
+        logger.info("[Per-Turn Context] Initialized per-turn context tracking")
+
         # Main generation loop
         for step in range(self.config.max_turns):
             if not active_mask.sum():
@@ -544,6 +611,34 @@ class LLMGenerationManager:
                 generation_input_ids_for_log = rollings_active.batch['input_ids']
             except Exception:
                 generation_input_ids_for_log = rollings.batch['input_ids']
+            
+            # ========== SAVE PER-TURN CONTEXT (BEFORE GENERATION) ==========
+            # This is the context that the model will actually see for this turn
+            # We save it BEFORE generation to ensure we capture the exact state
+            current_context_for_turn = rollings.batch['input_ids'].clone()
+            current_attention_mask_for_turn = rollings.batch.get('attention_mask', 
+                self.tensor_fn.create_attention_mask(current_context_for_turn)).clone()
+            
+            # Save context for each active trajectory (MEMORY OPTIMIZED)
+            for i in range(batch_size):
+                if active_mask[i]:
+                    # Store reference to original tensor instead of cloning
+                    # This reduces memory overhead significantly
+                    per_turn_contexts[i].append({
+                        'turn_id': step,
+                        'input_ids_ref': current_context_for_turn,  # Reference, not clone
+                        'attention_mask_ref': current_attention_mask_for_turn,  # Reference, not clone
+                        'item_idx': i,  # Index within the batch
+                        'response_start_idx': current_context_for_turn[i].size(0),  # Where response will start
+                        'context_length': current_attention_mask_for_turn[i].sum().item()
+                    })
+            
+            if step == 0 or step % 3 == 0:  # Log every 3 turns
+                avg_context_len = sum(current_attention_mask_for_turn[i].sum().item() 
+                                     for i in range(batch_size) if active_mask[i]) / max(active_mask.sum().item(), 1)
+                logger.info(f"[Per-Turn Context] Turn {step}: Saved context for {active_mask.sum().item()} trajectories (avg len: {avg_context_len:.0f})")
+                
+             
             gen_output = self._generate_with_gpu_padding(rollings_active)
 
             meta_info = gen_output.meta_info            
@@ -556,19 +651,100 @@ class LLMGenerationManager:
             )
             responses_offsets[active_mask] = active_offsets
 
+            # ========== SAVE RESPONSE INFO TO PER-TURN CONTEXT ==========
+            # After generating response, add it to the saved context for this turn
+            for i in range(batch_size):
+                if active_mask[i] and len(per_turn_contexts[i]) > 0:
+                    # Get the last saved context (for this turn)
+                    turn_ctx = per_turn_contexts[i][-1]
+                    turn_ctx['response'] = responses_ids[i].clone()
+                    turn_ctx['response_length'] = self.tensor_fn.create_attention_mask(responses_ids[i]).sum().item()
+                    # Assertions to ensure integrity of per-turn saved data
+                    assert 'input_ids_ref' in turn_ctx and 'attention_mask_ref' in turn_ctx, "Per-turn context references missing"
+                    assert isinstance(turn_ctx['response_length'], (int, float)), "response_length must be numeric"
+               
             # Execute in environment and process observations
-            next_obs, dones, valid_action, is_search, action_ranges = self.execute_predictions(
-                responses_str, self.tokenizer.pad_token, active_mask, do_search=True, 
+            next_obs, dones, valid_action = self.execute_predictions(
+                responses_str, self.tokenizer.pad_token, active_mask, 
                 current_turn=step, max_turns=self.config.max_turns
             )
-            action_types = self._build_action_types(responses_ids, responses_offsets, action_ranges, is_search, responses_str)
+            action_types = self._build_action_types(responses_ids, responses_offsets, responses_str)
+            # Assertions: shapes alignment
+            
+            # ========== RECORD EVENTS IN LEDGER (FULL CONTEXT) ==========
+            # Record actions and observations for each trajectory using action_types (no extra parsing)
+            def _summarize_action_from_types(row_types: torch.Tensor) -> Tuple[str, Optional[Tuple[int,int]]]:
+                """Infer a single action and a token-span from token-wise types.
+                Priority: search (flag) > answer > information_summary > think_summary > think.
+                """
+                # For non-search actions, check for search tokens first (they override other types)
+                search_sel = (row_types == ResponseType.search.value).nonzero(as_tuple=True)[0]
+                if search_sel.numel() > 0:
+                    return 'search', (int(search_sel.min().item()), int(search_sel.max().item() + 1))
+                
+                # Non-search priorities by token presence
+                priorities = [
+                    ('answer', ResponseType.answer.value),
+                    ('information_summary', ResponseType.information_summary.value),
+                    ('think_summary', ResponseType.think_summary.value),
+                ]
+                for name, val in priorities:
+                    sel = (row_types == val).nonzero(as_tuple=True)[0]
+                    if sel.numel() > 0:
+                        return name, (int(sel.min().item()), int(sel.max().item() + 1))
+                # Default think
+                sel = (row_types == ResponseType.think.value).nonzero(as_tuple=True)[0]
+                if sel.numel() > 0:
+                    return 'think', (int(sel.min().item()), int(sel.max().item() + 1))
+                return 'think', None
+
+            for i, (obs, row_types) in enumerate(zip(next_obs, action_types)):
+                if active_mask[i]:  # Only record for active trajectories
+                    ledger = event_ledgers[i]
+                    action, span = _summarize_action_from_types(row_types)
+                    # Extract content from pre-decoded strings (EFFICIENT)
+                    if span is not None:
+                        s_tok, e_tok = span
+                        try:
+                            # Use character positions from the original response string
+                            response_text = responses_str[i] if i < len(responses_str) else ""
+                            # Map token positions back to character positions using offsets
+                            s_char, e_char = self._token_to_char_range(response_text, s_tok, e_tok, responses_offsets[i])
+                            if s_char is not None and e_char is not None:
+                                content = response_text[s_char:e_char]
+                            else:
+                                content = ""
+                        except Exception:
+                            content = ''
+                    else:
+                        content = ''
+                    # Record the action taken
+                    if action == 'search':
+                        ledger.record_search(step, content, metadata={'valid': valid_action[i]})
+                    elif action == 'answer':
+                        ledger.record_answer(step, content)
+                    elif action == 'think_summary':
+                        ledger.record_summary(step, 'think_summary', content)
+                    elif action == 'information_summary':
+                        ledger.record_summary(step, 'information_summary', content)
+                    elif action == 'think':
+                        ledger.record_event(step, EventType.THINK, content)
+                    
+                    # Record environment-provided information
+                    if obs:
+                        # Extract actual information content (remove turn markers)
+                        info_content = obs
+                        ledger.record_information(step, info_content, source='environment',
+                                                 metadata={'search_query': content})
+            
+            if getattr(self.config, 'enable_debug_logs', False):
+                logger.debug(f"[Event Ledger] Turn {step}: Recorded {sum(len(l.get_events_at_turn(step)) for l in event_ledgers)} events")
             
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
             active_mask = active_mask * curr_active_mask
             active_num_list.append(active_mask.sum().item())
             turns_stats[curr_active_mask] += 1
             valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
-            valid_search_stats += torch.tensor(is_search, dtype=torch.int)
 
             # If all trajectories are finished (e.g., answered), stop immediately
             if not active_mask.any():
@@ -590,27 +766,6 @@ class LLMGenerationManager:
             
             responses_types = torch.cat([action_types, information_types], dim=1)
 
-            # ========== ADD TURN INFORMATION TO CONTEXT ==========
-            # Add turn number and constraint information to agent context
-            turn_context_info = f"\n\n[Turn {step + 1}/{self.config.max_turns}] You are currently on turn {step + 1} of {self.config.max_turns} maximum turns."
-            if step == self.config.max_turns - 1:
-                turn_context_info += f"\n⚠️ **FINAL TURN** ⚠️ This is your LAST turn. You MUST provide your final answer now using <answer>...</answer> tags."
-            else:
-                remaining_turns = self.config.max_turns - step - 1
-                turn_context_info += f" You have {remaining_turns} turn(s) remaining. Use <search>...</search> to search for information or <answer>...</answer> to provide your final answer."
-            
-            # Tokenize and add turn context to the input only if any trajectories remain active
-            if active_mask.any():
-                turn_context_tokens = self.tokenizer.encode(turn_context_info, add_special_tokens=False, return_tensors='pt')
-                if turn_context_tokens.shape[1] > 0:
-                    # Broadcast turn context tokens to match batch size
-                    batch_size = rollings.batch['input_ids'].shape[0]
-                    turn_context_tokens = turn_context_tokens.expand(batch_size, -1).to(rollings.batch['input_ids'].device)
-                    
-                    # Add turn context to the rolling state
-                    rollings.batch['input_ids'] = torch.cat([rollings.batch['input_ids'], turn_context_tokens], dim=1)
-                    rollings.batch['attention_mask'] = torch.cat([rollings.batch['attention_mask'], torch.ones_like(turn_context_tokens).to(rollings.batch['attention_mask'].device)], dim=1)
-                    rollings.batch['position_ids'] = self.tensor_fn.create_position_ids(rollings.batch['attention_mask'])
 
             # ========== TURN TRACE (single structured line) ==========
             if getattr(self.config, 'enable_debug_logs', False):
@@ -750,6 +905,11 @@ class LLMGenerationManager:
                     responses_ids,
                     next_obs_ids
                 )
+                
+                # Monitor context length for non-sliding window mode
+                current_context_length = rollings.batch['input_ids'].shape[1]
+                context_lengths_per_turn.append(current_context_length)
+                print(f"[NON-SLIDING] Context length: {current_context_length} tokens")
             original_right_side = self._update_right_side(
                 original_right_side,
                 responses_ids,
@@ -781,46 +941,28 @@ class LLMGenerationManager:
             responses_offsets[active_mask] = active_offsets
 
             # Execute in environment and process observations
-            # Optionally allow search on the final turn to include <information>
-            do_search_final = getattr(self.config, "final_turn_do_search", False)
-            next_obs, dones, valid_action, is_search, action_ranges = self.execute_predictions(
-                responses_str, self.tokenizer.pad_token, active_mask, do_search=do_search_final,
+            next_obs, dones, valid_action = self.execute_predictions(
+                responses_str, self.tokenizer.pad_token, active_mask,
                 current_turn=self.config.max_turns, max_turns=self.config.max_turns
             )
-            responses_types = self._build_action_types(responses_ids, responses_offsets, action_ranges, is_search, responses_str)
+            responses_types = self._build_action_types(responses_ids, responses_offsets, responses_str)
 
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
             active_mask = active_mask * curr_active_mask
             active_num_list.append(active_mask.sum().item())
             valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
-            valid_search_stats += torch.tensor(is_search, dtype=torch.int)
             
 
-            if do_search_final:
-                # Process observations: get token ids and corresponding information types
-                next_obs_ids, information_types, obs_too_long = self._process_next_obs(next_obs)
-                # Note: We don't update force_summarized here since this is the final turn
-                # Extend response types to include information types so lengths match
-                responses_types = torch.cat([responses_types, information_types], dim=1)
-                original_right_side = self._update_right_side(
-                    original_right_side,
-                    responses_ids,
-                    self.config.max_turns,
-                    responses_types,
-                    next_obs_ids,
-                )
-            else:
-                original_right_side = self._update_right_side(
-                    original_right_side,
-                    responses_ids,
-                    self.config.max_turns,
-                    responses_types
-            )
+            original_right_side = self._update_right_side(
+                original_right_side,
+                responses_ids,
+                self.config.max_turns,
+                responses_types
+        )
         
         meta_info['turns_stats'] = turns_stats.tolist()
         meta_info['active_mask'] = active_mask.tolist()
         meta_info['valid_action_stats'] = valid_action_stats.tolist()
-        meta_info['valid_search_stats'] = valid_search_stats.tolist()
         
         # KL-Aware Training: Add context type and full context baseline if needed
         meta_info['context_type'] = context_type
@@ -831,11 +973,28 @@ class LLMGenerationManager:
         else:
             meta_info['has_kl_baseline'] = False
         
+        # ========== SAVE EVENT LEDGERS (FULL CONTEXT) ==========
+        # CRITICAL: Save event ledgers in BOTH meta_info AND as individual items for batch processing
+        # meta_info: for logging and debugging
+        # Will be added to non_tensor_batch in compose_final_output for per-item access
+        meta_info['event_ledgers_serialized'] = [ledger.to_dict() for ledger in event_ledgers]
+        logger.info(f"[Event Ledger] Saved {len(event_ledgers)} ledgers with total {sum(len(l) for l in event_ledgers)} events")
+        
+        # ========== SAVE PER-TURN CONTEXTS ==========
+        # This is the CORE FIX for context mismatch problem
+        # Each turn's response should be trained with the context it actually saw
+        meta_info['per_turn_contexts'] = per_turn_contexts
+        total_turns = sum(len(contexts) for contexts in per_turn_contexts)
+        logger.info(f"[Per-Turn Context] Saved {total_turns} turn contexts across {batch_size} trajectories")
+        
+
+        
         # Context Length Monitoring: Add statistics for WandB tracking
         if context_lengths_per_turn:
             final_context_length = context_lengths_per_turn[-1]
+            avg_context_length = sum(context_lengths_per_turn) / len(context_lengths_per_turn)
             meta_info['final_context_length'] = final_context_length
-            meta_info['avg_context_length'] = sum(context_lengths_per_turn) / len(context_lengths_per_turn)
+            meta_info['avg_context_length'] = avg_context_length
             
             # ========== FINAL CONTEXT SUMMARY LOGGING ==========
             print(f"\n{'='*80}")
@@ -844,7 +1003,24 @@ class LLMGenerationManager:
             print(f"[FINAL CONTEXT SUMMARY] Context type: {context_type}")
             print(f"[FINAL CONTEXT SUMMARY] Total turns processed: {len(context_lengths_per_turn)}")
             print(f"[FINAL CONTEXT SUMMARY] Final context length: {final_context_length} tokens")
-            print(f"[FINAL CONTEXT SUMMARY] Average context length: {sum(context_lengths_per_turn) / len(context_lengths_per_turn):.1f} tokens")
+            print(f"[FINAL CONTEXT SUMMARY] Average context length: {avg_context_length:.1f} tokens")
+            
+            # Debug: Show individual turn lengths
+            print(f"[FINAL CONTEXT SUMMARY] Individual turn lengths: {context_lengths_per_turn}")
+        else:
+            # Fallback when context_lengths_per_turn is empty
+            final_context_length = original_right_side['responses'].size(1) if 'responses' in original_right_side else 0
+            meta_info['final_context_length'] = final_context_length
+            meta_info['avg_context_length'] = final_context_length
+            
+            print(f"\n{'='*80}")
+            print(f"[FINAL CONTEXT SUMMARY] Rollout Complete - Context Statistics")
+            print(f"{'='*80}")
+            print(f"[FINAL CONTEXT SUMMARY] Context type: {context_type}")
+            print(f"[FINAL CONTEXT SUMMARY] Total turns processed: 0 (context tracking failed)")
+            print(f"[FINAL CONTEXT SUMMARY] Final context length: {final_context_length} tokens")
+            print(f"[FINAL CONTEXT SUMMARY] Average context length: {final_context_length} tokens (fallback)")
+            print(f"[FINAL CONTEXT SUMMARY] ⚠️ WARNING: Context length tracking failed - using fallback values")
             
             # If compressed rollout with full context tracking
             if full_context_lengths_per_turn:
@@ -887,47 +1063,134 @@ class LLMGenerationManager:
     def _build_action_types(self,
                             responses_ids: torch.Tensor,
                             responses_offsets: torch.Tensor,
-                            action_ranges: List[Optional[Tuple[int, int]]],
-                            is_search: List[int], responses_str) -> torch.Tensor:
-
+                            responses_str: List[str]) -> torch.Tensor:
+        """
+        Build action types by directly parsing response strings.
+        This is the single source of truth for action type determination.
+        Now supports multiple action types within a single response.
+        
+        Args:
+            responses_ids: Token IDs for responses [batch_size, seq_len]
+            responses_offsets: Character offsets for each token [batch_size, seq_len]
+            responses_str: Raw response strings [batch_size]
+            
+        Returns:
+            types: Token-level action types [batch_size, seq_len]
+        """
         # The type is think by default
         types = torch.zeros_like(responses_ids)
+        
+        # Regex patterns for different action types (including search)
+        action_patterns = [
+            (r'<\s*search\b[^>]*>(.*?)</\s*search\s*>', ResponseType.search.value),
+            (r'<\s*answer\b[^>]*>(.*?)</\s*answer\s*>', ResponseType.answer.value),
+            (r'<\s*think_summary\b[^>]*>(.*?)</\s*think_summary\s*>', ResponseType.think_summary.value),
+            (r'<\s*information_summary\b[^>]*>(.*?)</\s*information_summary\s*>', ResponseType.information_summary.value),
+            (r'<\s*think\b[^>]*>(.*?)</\s*think\s*>', ResponseType.think.value),
+        ]
+        
+        for pattern, response_type in action_patterns:
+            type_name = ResponseType(response_type).name
+        
         for i in range(len(responses_ids)):
-            if action_ranges[i]:
-                # Keep only until the last non-zero index for searchsorted() to work
-                nonzero_idx = (responses_offsets[i] != 0).nonzero(as_tuple=True)[0]
-                if nonzero_idx.numel() == 0:
-                    # No valid offsets; skip labeling for this sample
-                    continue
-                last_nonzero_idx = nonzero_idx[-1]
-                valid_offsets = responses_offsets[i][:last_nonzero_idx+1]
+            response_text = responses_str[i] if i < len(responses_str) else ""
+           
+            found_any_match = False
 
-                # Select the smallest range of tokens to FULLY contain the action substring
-                # If s is in the middle of token i, then include token i
-                # If e is in the middle of token i, then use token i + 1 as the right bound instead
-                s, e = action_ranges[i]
-                s_idx = torch.searchsorted(valid_offsets, s, right=True) - 1
-                e_idx = torch.searchsorted(valid_offsets, e)
+            for pattern_idx, (pattern, response_type) in enumerate(action_patterns):
+                type_name = ResponseType(response_type).name
 
-                # Determine the correct response type based on action
-                if is_search[i]:
-                    types[i, s_idx:e_idx] = ResponseType.search.value
-                else:
-                    # Check the action type from the response string (case-insensitive)
-                    action_str = responses_str[i][s:e].lower() if s < len(responses_str[i]) and e <= len(responses_str[i]) else ""
-                    if "<answer>" in action_str:
-                        types[i, s_idx:e_idx] = ResponseType.answer.value
-                    elif "<think_summary>" in action_str:
-                        types[i, s_idx:e_idx] = ResponseType.think_summary.value
-                    elif "<information_summary>" in action_str:
-                        types[i, s_idx:e_idx] = ResponseType.information_summary.value
-                    elif "<think>" in action_str and "<think_summary>" not in action_str:
-                        types[i, s_idx:e_idx] = ResponseType.think.value
+                # Find all matches of this pattern
+                matches = list(re.finditer(pattern, response_text, re.IGNORECASE | re.DOTALL))
+
+                for match_idx, match in enumerate(matches):
+                    s, e = match.span()
+                    # Map character positions to token positions
+                    s_idx, e_idx = self._char_to_token_range(response_text, s, e, responses_offsets[i])
+                    if s_idx is not None and e_idx is not None:
+                        types[i, s_idx:e_idx] = response_type
+                        found_any_match = True
                     else:
-                        # Default to think for any other content
-                        types[i, s_idx:e_idx] = ResponseType.think.value
+                        logger.warning(f"[_build_action_types]       Failed to map char range to token range for {type_name}")
+
+            # If no action tags found, default to think
+            if not found_any_match:
+                types[i, :] = ResponseType.think.value
 
         return types
+    def _char_to_token_range(self, text: str, char_start: int, char_end: int, offsets: torch.Tensor) -> Tuple[Optional[int], Optional[int]]:
+        """
+        Convert character positions to token positions using offsets.
+        
+        Args:
+            text: The full text
+            char_start: Start character position
+            char_end: End character position  
+            offsets: Token offsets [seq_len]
+            
+        Returns:
+            (token_start, token_end) or (None, None) if conversion fails
+        """
+        # Keep only until the last non-zero index for searchsorted() to work
+        nonzero_idx = (offsets != 0).nonzero(as_tuple=True)[0]
+        if nonzero_idx.numel() == 0:
+            return None, None
+            
+        last_nonzero_idx = nonzero_idx[-1]
+        valid_offsets = offsets[:last_nonzero_idx+1]
+        
+        # Find token indices that contain the character range
+        # If char_start is in the middle of token i, include token i
+        # If char_end is in the middle of token i, use token i + 1 as the right bound
+        s_idx = torch.searchsorted(valid_offsets, char_start, right=True) - 1
+        e_idx = torch.searchsorted(valid_offsets, char_end)
+        
+        # Ensure indices are within bounds
+        s_idx = max(0, min(s_idx.item(), len(valid_offsets) - 1))
+        e_idx = max(0, min(e_idx.item(), len(valid_offsets)))
+        
+        return s_idx, e_idx
+    
+    def _token_to_char_range(self, text: str, token_start: int, token_end: int, offsets: torch.Tensor) -> Tuple[Optional[int], Optional[int]]:
+        """
+        Convert token positions to character positions using offsets.
+        
+        Args:
+            text: The full text
+            token_start: Start token position
+            token_end: End token position  
+            offsets: Token offsets [seq_len]
+            
+        Returns:
+            (char_start, char_end) or (None, None) if conversion fails
+        """
+        # Keep only until the last non-zero index for searchsorted() to work
+        nonzero_idx = (offsets != 0).nonzero(as_tuple=True)[0]
+        if nonzero_idx.numel() == 0:
+            return None, None
+            
+        last_nonzero_idx = nonzero_idx[-1]
+        valid_offsets = offsets[:last_nonzero_idx+1]
+        
+        # Ensure token indices are within bounds
+        token_start = max(0, min(token_start, len(valid_offsets) - 1))
+        token_end = max(token_start, min(token_end, len(valid_offsets)))
+        
+        # Get character positions from token offsets
+        char_start = int(valid_offsets[token_start].item())
+        char_end = int(valid_offsets[token_end].item()) if token_end < len(valid_offsets) else len(text)
+        
+        # Ensure character positions are within text bounds
+        char_start = max(0, min(char_start, len(text)))
+        char_end = max(char_start, min(char_end, len(text)))
+        
+        # Additional validation: ensure we don't go beyond text length
+        if char_start >= len(text):
+            return None, None
+        if char_end > len(text):
+            char_end = len(text)
+        
+        return char_start, char_end
 
     def _compose_final_output(self, left_side: Dict,
                             right_side: Dict,
@@ -959,10 +1222,33 @@ class LLMGenerationManager:
         final_output = DataProto.from_dict(final_output)
         final_output.meta_info.update(meta_info)
         
+        # CRITICAL FIX: Add event ledgers to non_tensor_batch for per-item access
+        # Extract event ledgers from meta_info and add as numpy array
+        if 'event_ledgers_serialized' in meta_info:
+            import numpy as np
+            # Store as object array to preserve dict structure
+            final_output.non_tensor_batch['event_ledger'] = np.array(
+                meta_info['event_ledgers_serialized'], 
+                dtype=object
+            )
+            logger.info(f"[Event Ledger] Added {len(meta_info['event_ledgers_serialized'])} ledgers to non_tensor_batch")
+        
+        # ========== ADD PER-TURN CONTEXTS TO NON_TENSOR_BATCH ==========
+        # This is the CORE FIX for context mismatch problem
+        # Store per-turn contexts for correct log_prob computation during training
+        if 'per_turn_contexts' in meta_info:
+            import numpy as np
+            final_output.non_tensor_batch['per_turn_contexts'] = np.array(
+                meta_info['per_turn_contexts'],
+                dtype=object
+            )
+            total_contexts = sum(len(contexts) for contexts in meta_info['per_turn_contexts'])
+            logger.info(f"[Per-Turn Context] Added {total_contexts} turn contexts to non_tensor_batch for {len(meta_info['per_turn_contexts'])} trajectories")
+        
         return final_output
 
-    def execute_predictions(self,predictions:List[str],pad_token:str,active_mask=None,do_search=True,current_turn:int=0,max_turns:int=None) \
-        -> Tuple[List[str], List[int], List[int], List[int], List[Optional[Tuple[int, int]]]]:
+    def execute_predictions(self,predictions:List[str],pad_token:str,active_mask=None,current_turn:int=0,max_turns:int=None) \
+        -> Tuple[List[str], List[int], List[int], List[Optional[Tuple[int, int]]]]:
         """
         Execute predictions across multiple environments.
         NOTE: the function is the actual `step` function in the environment
@@ -976,18 +1262,59 @@ class LLMGenerationManager:
             max_turns: Maximum number of turns allowed
             
         Returns:
-            List of observation strings
+            next_obs: List of observation strings
+            dones: List[int]
+            valid_action: List[int]
         """
 
-        cur_actions,contents,action_ranges=self.postprocess_predictions(predictions)
-        next_obs,dones,valid_action,is_search=[],[],[],[]
+        # Inline parsing of predictions into actions/contents/ranges (single source of truth)
+        cur_actions = []
+        contents = []
+        tag_pattern = re.compile(
+            r'<\s*(search|answer|think|think_summary|information_summary)\b[^>]*>(.*?)</\s*\1\s*>',
+            re.IGNORECASE | re.DOTALL
+        )
+        for prediction in predictions:
+            action = None
+            content = ''
+            if isinstance(prediction, str):
+                # 优先严格采用 search/answer 的第一个匹配（顺序出现的重要性）
+                found = False
+                for match in tag_pattern.finditer(prediction):
+                    tag = match.group(1).lower()
+                    content_candidate = match.group(2).strip()
+                    if tag == 'search':
+                        # search 不能单纯靠字符串出现，内容需有效（>5字符）
+                        if content_candidate and len(content_candidate) > 5:
+                            action = 'search'
+                            content = content_candidate
+                            found = True
+                            break  # 用第一个有效的 search
+                        else:
+                            continue
+                    elif tag == 'answer':
+                        action = 'answer'
+                        content = content_candidate
+                        found = True
+                        break  # 用第一个 answer
+                    elif tag in ['think', 'think_summary', 'information_summary']:
+                        # 其他类型顺序考虑，但如果没有search/answer才接受
+                        if not found:
+                            action = tag
+                            content = content_candidate
+                # 若未找到任何指令，保持默认
+            else:
+                raise ValueError(f"Invalid prediction type: {type(prediction)}")
+            cur_actions.append(action)
+            contents.append(content)
+        next_obs, dones, valid_action = [], [], []
 
         # Build search queries only for active slots requesting search
         active_search_indices = [i for i, (action, active) in enumerate(zip(cur_actions, active_mask)) if active and action == 'search']
         search_queries = [contents[i] for i in active_search_indices]
         expected_results = len(search_queries)
 
-        if do_search and search_queries:
+        if search_queries:
             parameters={"query_list":search_queries,"topk":self.config.topk}
             import asyncio
             import json
@@ -1044,111 +1371,59 @@ class LLMGenerationManager:
                 next_obs.append('')
                 dones.append(1)
                 valid_action.append(0)
-                is_search.append(0)
 
             else:
                 if action == 'answer':
                     next_obs.append('')
                     dones.append(1)
                     valid_action.append(1)
-                    is_search.append(0)
                 elif action == 'search':
                     # Only consume search result for active entries
                     # Add turn information to observation
                     turn_info = f"\n[Turn {current_turn + 1}/{max_turns if max_turns else '?'}] "
                     search_result = search_results.pop(0).strip()
-                    
+                   
                     # Check if this is the last turn and provide sharp message
-                    if max_turns and current_turn >= max_turns - 1:
-                        sharp_message = f"\n\n⚠️ **FINAL TURN WARNING** ⚠️\nThis is your LAST turn (Turn {current_turn + 1}/{max_turns}). You MUST provide your final answer now using <answer>...</answer> tags. No more searches are allowed.\n\n"
+                    if max_turns and current_turn >= max_turns - 2:
+                        sharp_message = f"\n\nThis is my LAST turn (Turn {current_turn + 1}/{max_turns}). I MUST provide final answer now with <answer> and </answer>."
                         # Fix: Add proper role labeling for information blocks
-                        next_obs.append(f'{turn_info}user\n<information>{search_result}</information>\n\nassistant\n{sharp_message}')
+                        next_obs.append(f'{turn_info}user\n<information>{search_result}</information>\n\nassistant\n{sharp_message}\n')
                     else:
                         # Fix: Add proper role labeling for information blocks
-                        next_obs.append(f'{turn_info}user\n<information>{search_result}</information>\n\nassistant\n')
+                        summary_prompt = (
+                        "I will provide concise, high-level summaries of both my previous reasoning and the gathered information.\n"
+                        "Use the <think_summary>...</think_summary> tag for my thought process summary,\n"
+                        "and the <information_summary>...</information_summary> tag for key retrieved facts or evidence.\n"
+                        "Focus on clarity and brevity to help guide my next response. Or I will use <answer> and </answer> to provide the final answer if information is enough."
+                        )
+                        next_obs.append(f'{turn_info}user\n<information>{search_result}</information>\n\nassistant\n{summary_prompt}\n')
                     
                     dones.append(0)
                     valid_action.append(1)
-                    is_search.append(1)
                 elif action in ["think", "think_summary", "information_summary"]:
                     # Add turn information to observation
                     turn_info = f"\n[Turn {current_turn + 1}/{max_turns if max_turns else '?'}] "
                     
                     # Check if this is the last turn and provide sharp message
-                    if max_turns and current_turn >= max_turns - 1:
-                        sharp_message = f"\n\n⚠️ **FINAL TURN WARNING** ⚠️\nThis is your LAST turn (Turn {current_turn + 1}/{max_turns}). You MUST provide your final answer now using <answer>...</answer> tags.\n\n"
+                    if max_turns and current_turn >= max_turns - 2:
+                        sharp_message = f"\n\nThis is my LAST turn (Turn {current_turn + 1}/{max_turns}). I MUST provide final answer now with <answer> and </answer>.\n\n"
                         next_obs.append(f'{turn_info}{sharp_message}')
                     else:
                         next_obs.append(f'{turn_info}')
                     
                     dones.append(0)
                     valid_action.append(1)
-                    is_search.append(0)
                 else:
                     next_obs.append(f'\nMy previous action is invalid. \
 If I want to search, I should put the query between <search> and </search>. \
 If I want to present thinking process, I should put the thinking process between <think> and </think>. \
 If I want to give the final answer, I should put the answer between <answer> and </answer>. \
-If I want to summarize, use <think_summary> and <information_summary>, if no <information> yet, <information_summary> is invalid. Let me try again.\n') 
+If I want to summarize, use <think_summary> and <information_summary>. Let me try again.\n') 
                     dones.append(0)
                     valid_action.append(0)
-                    is_search.append(0)
             
         assert len(search_results) == 0
             
-        return next_obs, dones, valid_action, is_search, action_ranges
+        return next_obs, dones, valid_action 
 
-    def postprocess_predictions(self, predictions: List[Any]) -> Tuple[List[int], List[bool], List[Optional[Tuple[int, int]]]]:
-        """
-        Process (text-based) predictions from llm into actions and validity flags.
-        
-        Args:
-            predictions: List of raw predictions
-            
-        Returns:
-            Tuple of (actions list, validity flags list)
-        """
-        actions = []
-        contents = []
-        action_ranges = []
-                
-        # Precompile a flexible pattern that tolerates whitespace/casing variations
-        tag_pattern = re.compile(
-            r'<\s*(search|answer|think|think_summary|information_summary)\b[^>]*>(.*?)</\s*\1\s*>',
-            re.IGNORECASE | re.DOTALL
-        )
-
-        for prediction in predictions:
-            if isinstance(prediction, str):  # for llm output
-                # Priority: answer action should be recognized first (ending signal)
-                answer_match = re.search(r'<\s*answer\b[^>]*>(.*?)</\s*answer\s*>', prediction, re.IGNORECASE | re.DOTALL)
-                if answer_match:
-                    content = answer_match.group(1).strip()
-                    action = 'answer'
-                    action_range = answer_match.span()
-                else:
-                    # Fallback to other actions
-                    match = tag_pattern.search(prediction)
-                    if match:
-                        content = match.group(2).strip()  # content between the tags
-                        action = match.group(1).lower()
-                        action_range = match.span()
-                        # Guard: treat <search> with blank/punctuation-only content as invalid
-                        if action == 'search':
-                            content_stripped = content.strip()
-                            if not content_stripped or not len(content_stripped) > 5:
-                                action = None
-                                content = ''
-                                action_range = None
-                    else:
-                        content = ''
-                        action = None
-                        action_range = None
-            else:
-                raise ValueError(f"Invalid prediction type: {type(prediction)}")
-            
-            actions.append(action)
-            contents.append(content)
-            action_ranges.append(action_range)
-            
-        return actions, contents, action_ranges
+    # postprocess_predictions is deprecated; parsing now occurs inside execute_predictions for single-source-of-truth.

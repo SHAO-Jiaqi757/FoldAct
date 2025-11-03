@@ -24,6 +24,7 @@ from verl import DataProto
 from verl.tools.schemas import TrajectoryComponent, TrajectoryFeedback
 from verl.utils.trajectory import get_components
 from verl.utils.reward_score import default_compute_score
+from verl.utils.event_ledger import EventLedger, EventType
 
 # Basic logger (console)
 logging.basicConfig(level=logging.INFO)
@@ -101,10 +102,10 @@ class HallucinationPenaltyRewardManager:
     def _get_hallucination_penalty_config(self):
         """Get configuration for hallucination penalty reward system"""
         return {
-            "information_penalty": -0.5,              # Penalty for <information> components (hallucination)
-            "information_summary_bonus": 0.3,           # Bonus for <information_summary> components with context
-            "information_summary_penalty": -0.3,      # Penalty for <information_summary> components without context
-            "format_bonus": 0.1,                      # Format reward: bonus when sequence ends with answer
+            "information_penalty": 0.0,              # Penalty for <information> components (hallucination)
+            "information_summary_bonus": 0.1,           # Bonus for <information_summary> components with context
+            "information_summary_penalty": -0.1,      # Penalty for <information_summary> components without context
+            "format_bonus": 0.1,                     # Bonus for proper format (sequence ends with answer)
             "enable_debug_logs": False,
             "reward_allocation_strategy": "component_based",
             "min_reward_value": -1.0,
@@ -142,8 +143,15 @@ class HallucinationPenaltyRewardManager:
     
     
     def analyze_trajectory(self, components: List[TrajectoryComponent], 
-                          ground_truth, question: str = None) -> TrajectoryFeedback:
-        """Analyze entire trajectory and calculate feedback"""
+                          ground_truth, question: str = None,
+                          event_ledger: Optional[EventLedger] = None,
+                          step_ids: Optional[torch.Tensor] = None) -> TrajectoryFeedback:
+        """
+        Analyze entire trajectory and calculate feedback.
+        
+        NEW: Accepts event_ledger for context-invariant reward computation.
+        NEW: Accepts step_ids to correctly map components to turns.
+        """
         logger.info(f"Analyzing trajectory with {len(components)} components")
         
         # Log to file
@@ -151,6 +159,8 @@ class HallucinationPenaltyRewardManager:
         self.file_logger.info(f"Ground truth: {ground_truth}")
         self.file_logger.info(f"Question: {question}")
         self.file_logger.info(f"Components count: {len(components)}")
+        if event_ledger:
+            self.file_logger.info(f"Event ledger: {len(event_ledger)} events")
         
         # Extract key information
         search_components = [c for c in components if c.component_type == "search"]
@@ -170,8 +180,8 @@ class HallucinationPenaltyRewardManager:
         self.file_logger.info(f"  Information summary components: {len(information_summary_components)}")
         self.file_logger.info(f"  Answer components: {len(answer_components)}")
         
-        # Analyze hallucination penalty and information summary rewards
-        hallucination_analysis = self._analyze_hallucination_penalty(components, question)
+        # Analyze hallucination penalty and information summary rewards (with ledger and step_ids)
+        hallucination_analysis = self._analyze_hallucination_penalty(components, question, event_ledger, step_ids)
         
         # Compute component scores
         answer_quality_score = self._score_answer_quality_simplified(answer_components, ground_truth)
@@ -227,8 +237,38 @@ class HallucinationPenaltyRewardManager:
             return "[turn" not in content  # Observations always include turn headers
         return self._contains_information_tag(component.content)
 
-    def _analyze_hallucination_penalty(self, components: List[TrajectoryComponent], question: str = None) -> Dict:
-        """Analyze hallucination penalty and information summary rewards"""
+    def _get_turn_id_from_component(self, component: TrajectoryComponent, 
+                                    step_ids: Optional[torch.Tensor]) -> int:
+        """
+        Get turn ID for a component from step_ids tensor.
+        
+        Args:
+            component: The component to get turn ID for
+            step_ids: Tensor mapping token indices to turn IDs
+        
+        Returns:
+            turn_id: The turn this component belongs to
+        """
+        if step_ids is not None:
+            # Get turn_id from step_ids using component's start token
+            start_idx = component.start_token_idx
+            if start_idx < len(step_ids):
+                return int(step_ids[start_idx].item() if hasattr(step_ids[start_idx], 'item') else step_ids[start_idx])
+        
+        # Fallback: use metadata or assume sequential
+        return component.metadata.get('turn_id', 0)
+    
+    def _analyze_hallucination_penalty(self, components: List[TrajectoryComponent], 
+                                      question: str = None,
+                                      event_ledger: Optional[EventLedger] = None,
+                                      step_ids: Optional[torch.Tensor] = None) -> Dict:
+        """
+        Analyze hallucination penalty and information summary rewards.
+        
+        NEW: Uses event ledger (full context) instead of visible components for evidence checking.
+        NEW: Uses step_ids to correctly map components to turns.
+        This ensures that rewards are based on true state, not on what context compression shows.
+        """
 
         observation_information_indices = []
         model_information_indices = []
@@ -250,32 +290,60 @@ class HallucinationPenaltyRewardManager:
                 if self._is_model_generated_information(component):
                     model_information_indices.append(idx)
 
-        summaries_with_context = 0
-        summaries_without_context = 0
+        summaries_with_evidence = 0
+        summaries_without_evidence = 0
         
-        for summary_idx in information_summary_indices:
-            has_prior_observation_info = any(info_idx < summary_idx for info_idx in observation_information_indices)
-            if has_prior_observation_info:
-                summaries_with_context += 1
-            else:
-                summaries_without_context += 1
+        # NEW: Use event ledger for ground truth evidence checking
+        if event_ledger is not None:
+            self.file_logger.info(f"[Event Ledger] Using ledger with {len(event_ledger)} events for evidence checking")
+            
+            for summary_idx in information_summary_indices:
+                summary_component = components[summary_idx]
+                # Get the turn_id using step_ids (CORRECT WAY)
+                turn_id = self._get_turn_id_from_component(summary_component, step_ids)
+                
+                # Check if there is environment evidence BEFORE this turn in the ledger
+                has_evidence = event_ledger.has_evidence_before_turn(turn_id)
+                
+                if has_evidence:
+                    summaries_with_evidence += 1
+                    self.file_logger.info(f"[Event Ledger] Summary at turn {turn_id} HAS evidence in ledger")
+                else:
+                    summaries_without_evidence += 1
+                    self.file_logger.info(f"[Event Ledger] Summary at turn {turn_id} has NO evidence in ledger")
+        else:
+            # FALLBACK: Use old method based on visible components (less accurate with compression)
+            self.file_logger.warning("[Event Ledger] No ledger provided, falling back to component-based checking (may be inaccurate with compression)")
+            
+            for summary_idx in information_summary_indices:
+                has_prior_observation_info = any(info_idx < summary_idx for info_idx in observation_information_indices)
+                if has_prior_observation_info:
+                    summaries_with_evidence += 1
+                else:
+                    summaries_without_evidence += 1
 
         information_penalty = self.config["information_penalty"] if model_information_indices else 0.0
         
-        # Reward information_summary if it exists, regardless of local observation context
-        # This handles the case where context window truncation has removed the original information
-        # but the model is still correctly producing summaries
+        # NEW: Reward/penalize based on whether evidence exists in ledger (ground truth)
         if len(information_summary_indices) > 0:
-            information_summary_bonus = self.config["information_summary_bonus"]
-            self.file_logger.info(f"Information summary bonus applied: {information_summary_bonus}")
+            if summaries_with_evidence > 0:
+                # Has evidence: give bonus
+                information_summary_bonus = self.config["information_summary_bonus"]
+                self.file_logger.info(f"[Reward] Information summary bonus: {information_summary_bonus} (evidence found in ledger)")
+            elif summaries_without_evidence > 0:
+                # No evidence: give penalty
+                information_summary_bonus = self.config["information_summary_penalty"]
+                self.file_logger.info(f"[Reward] Information summary penalty: {information_summary_bonus} (no evidence in ledger)")
+            else:
+                information_summary_bonus = 0.0
         else:
             information_summary_bonus = 0.0
         
         return {
             "information_penalty": information_penalty,
             "information_summary_bonus": information_summary_bonus,
-            "information_summary_with_context": summaries_with_context,
-            "information_summary_without_context": summaries_without_context,
+            "information_summary_with_evidence": summaries_with_evidence,
+            "information_summary_without_evidence": summaries_without_evidence,
             "model_information_indices": model_information_indices,
             "observation_information_indices": observation_information_indices,
         }
@@ -466,30 +534,30 @@ class HallucinationPenaltyRewardManager:
             pass
         
         # 1. Information summary reward/penalty based on context availability
+        # Only reward the FIRST information_summary component to avoid multiple rewards
         if component.component_type == "information_summary":
-            # Check if this summary has context (prior observation information)
-            has_context = any(info_idx < component_idx for info_idx in hallucination_meta.get("observation_information_indices", []))
+            bonus = hallucination_meta.get("information_summary_bonus", 0.0)
+            if bonus:
+                score += bonus
+            # Check if this is the first information_summary component
+            # is_first_info_summary = not any(
+            #     c.component_type == "information_summary" and c.start_token_idx < component.start_token_idx
+            #     for c in feedback.components
+            # )
             
-            if has_context:
-                # Reward when there's actual context
-                bonus = hallucination_meta.get("information_summary_bonus", 0.0)
-                if bonus:
-                    score += bonus
-                    try:
-                        debug_parts.append(f"information_summary_bonus=+{bonus:.3f}")
-                    except Exception:
-                        pass
-                    logger.debug(f"Rewarding information summary (has context): {score:.3f}")
-            else:
-                # Penalty when no context available (hallucination)
-                penalty = self.config.get("information_summary_penalty", -0.3)
-                score += penalty
-                try:
-                    debug_parts.append(f"information_summary_penalty={penalty:.3f}")
-                except Exception:
-                    pass
-                logger.debug(f"Penalizing information summary (no context): {score:.3f}")
-        
+            # if is_first_info_summary:
+            #     bonus = hallucination_meta.get("information_summary_bonus", 0.0)
+            #     if bonus:
+            #         score += bonus
+            #         try:
+            #             debug_parts.append(f"information_summary_bonus=+{bonus:.3f}")
+            #         except Exception:
+            #             pass
+            #         logger.debug(f"Rewarding information summary (has context): {score:.3f}")
+            # else:
+            #     # Skip subsequent information_summary components
+            #     logger.debug(f"Skipping subsequent information_summary component (already rewarded first one)")
+          
         # 2. Information components receive hallucination penalty when generated by the model
         elif self._is_model_generated_information(component):
             penalty = hallucination_meta.get("information_penalty", 0.0)
@@ -511,29 +579,30 @@ class HallucinationPenaltyRewardManager:
                 pass
             logger.debug(f"Rewarding answer quality: {score:.3f}")
             
-            # Format bonus for final answer
-            format_bonus = self.config["format_bonus"]
-            score += format_bonus
-            try:
-                debug_parts.append(f"format_bonus=+{format_bonus:.3f}")
-            except Exception:
-                pass
-            logger.debug(f"Rewarding format (final answer): {score:.3f}")
-        
-        # 4. Search components get neutral score (no penalty, no bonus)
-        elif component.component_type == "search":
-            # Neutral score for search components
-            pass
-        
-        # 5. Think components get neutral score
-        elif component.component_type == "think":
-            # Neutral score for think components
-            pass
+            # Add format bonus for final answer (if this is the last answer component)
+            # Check if this is the last answer component in the trajectory
+            answer_components = [c for c in feedback.components if c.component_type == "answer"]
+            is_last_answer = False
+            if answer_components:
+                # Sort by token index to find the last one
+                sorted_answer_components = sorted(answer_components, key=lambda x: x.start_token_idx)
+                is_last_answer = (component.start_token_idx == sorted_answer_components[-1].start_token_idx)
+            
+            if is_last_answer:
+                format_bonus = self.config.get("format_bonus", 0.1)
+                if format_bonus:
+                    score += format_bonus
+                    try:
+                        debug_parts.append(f"format_bonus=+{format_bonus:.3f}")
+                    except Exception:
+                        pass
+                    logger.debug(f"Rewarding proper format (sequence ends with answer): {score:.3f}")
+                    self.file_logger.info(f"Applied format bonus {format_bonus:.3f} for final answer component")
         
         
         # Emit a compact score breakdown line for this component
         try:
-            self.file_logger.info(
+            logger.debug(
                 f"Score breakdown for component {component_idx+1} ({component.component_type}): "
                 + "; ".join(debug_parts)
                 + f"; score={score:.3f}"
@@ -795,6 +864,39 @@ class HallucinationPenaltyRewardManager:
             response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
             ground_truth = data_item.non_tensor_batch.get("reward_model", {}).get("ground_truth", "")
 
+            # NEW: Extract event ledger from non_tensor_batch (PER-ITEM)
+            # Event ledgers are stored as numpy object array in non_tensor_batch['event_ledger']
+            # Each item in the batch has its corresponding ledger dict
+            event_ledger = None
+            if hasattr(data_item, 'non_tensor_batch') and 'event_ledger' in data_item.non_tensor_batch:
+                try:
+                    # Extract ledger dict for this specific item
+                    ledger_data = data_item.non_tensor_batch['event_ledger']
+                    
+                    # ledger_data should be a dict (from numpy object array element)
+                    if isinstance(ledger_data, dict):
+                        ledger_dict = ledger_data
+                    elif isinstance(ledger_data, (list, np.ndarray)) and len(ledger_data) > 0:
+                        # If it's an array/list, take the first element (single item case)
+                        ledger_dict = ledger_data[0] if isinstance(ledger_data, list) else ledger_data.tolist()[0]
+                    else:
+                        ledger_dict = None
+                    
+                    if ledger_dict:
+                        event_ledger = EventLedger.from_dict(ledger_dict)
+                        self.file_logger.info(f"[Event Ledger] Successfully loaded ledger with {len(event_ledger)} events")
+                        logger.info(f"[Event Ledger] Loaded ledger with {len(event_ledger)} events for item {item_index}")
+                    else:
+                        self.file_logger.warning(f"[Event Ledger] Invalid ledger data format: {type(ledger_data)}")
+                except Exception as e:
+                    logger.warning(f"[Event Ledger] Failed to load event ledger for item {item_index}: {e}")
+                    self.file_logger.warning(f"[Event Ledger] Failed to load event ledger: {e}")
+                    import traceback
+                    self.file_logger.warning(f"[Event Ledger] Traceback: {traceback.format_exc()}")
+            else:
+                self.file_logger.warning(f"[Event Ledger] No event ledger found in data item {item_index} (will use fallback method)")
+                logger.warning(f"[Event Ledger] No event ledger in non_tensor_batch for item {item_index}")
+
             # Robustly resolve data source with fallbacks
             data_source = data_item.non_tensor_batch.get(self.reward_fn_key, None)
             try:
@@ -866,8 +968,9 @@ class HallucinationPenaltyRewardManager:
                 self.tokenizer,
             )
             
-            # Analyze entire trajectory
-            feedback = self.analyze_trajectory(components, ground_truth, question)
+            # Analyze entire trajectory (with event ledger for context-invariant rewards and step_ids for turn mapping)
+            step_ids_tensor = data_item.batch.get("step_ids")
+            feedback = self.analyze_trajectory(components, ground_truth, question, event_ledger, step_ids_tensor)
             
             # Create dense reward tensor with no hard cap on length
             # Align reward length to the actual component spans to prevent clamping

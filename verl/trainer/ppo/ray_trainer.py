@@ -41,6 +41,7 @@ from tqdm import tqdm
 from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfig
 
 from verl import DataProto
+from verl.protocol import DataProtoConfig
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
@@ -716,7 +717,11 @@ class RayPPOTrainer:
             retriever_num_workers= self.config.retriever.num_workers ,
             retriever_rate_limit= self.config.retriever.rate_limit ,
             retriever_timeout = self.config.retriever.timeout ,
-            retriever_enable_global_rate_limit = self.config.retriever.enable_global_rate_limit         
+            retriever_enable_global_rate_limit = self.config.retriever.enable_global_rate_limit,
+            use_sliding = self.config.use_sliding,
+            full_context_ratio = self.config.full_context_ratio,
+            enable_kl_baseline = self.config.enable_kl_baseline,
+            enable_debug_logs = self.config.enable_debug_logs
         )
 
         #Agent config preparation
@@ -1212,6 +1217,10 @@ class RayPPOTrainer:
             retriever_timeout = self.config.retriever.timeout ,
             retriever_enable_global_rate_limit = self.config.retriever.enable_global_rate_limit,
             final_turn_do_search = getattr(self.config, 'final_turn_do_search', False),  
+            use_sliding = self.config.use_sliding,
+            full_context_ratio = self.config.full_context_ratio,
+            enable_kl_baseline = self.config.enable_kl_baseline,
+            enable_debug_logs = self.config.enable_debug_logs
         )
 
         generation_manager = LLMGenerationManager(
@@ -1283,8 +1292,42 @@ class RayPPOTrainer:
                                 final_gen_batch_output.batch[key] = final_gen_batch_output.batch[key].long()
 
                             with torch.no_grad():
-                                output = self.actor_rollout_wg.compute_log_prob(final_gen_batch_output)
-                                final_gen_batch_output = final_gen_batch_output.union(output)
+                                # Optional per-turn context log_prob computation
+                                use_per_turn = self.config.get("use_per_turn_training", False)
+                                if use_per_turn:
+                                    try:
+                                        from verl.utils.per_turn_training import PerTurnContextManager
+                                        def _orig_compute(dp: DataProto):
+                                            # Allow DP auto-padding so world_size chunking succeeds
+                                            dp.meta_info[DataProtoConfig.auto_padding_key] = True
+                                            return self.actor_rollout_wg.compute_log_prob(dp)
+                                        
+                                        # SELECTIVE PER-TURN TRAINING: Only use per-turn for final turns
+                                        # This reduces computational overhead while maintaining accuracy
+                                        use_selective_per_turn = self.config.get("use_selective_per_turn", True)
+                                        if use_selective_per_turn:
+                                            # Only use per-turn for the last 1-2 turns per trajectory
+                                            log_probs = PerTurnContextManager.compute_per_turn_log_probs_batched(
+                                                final_gen_batch_output, _orig_compute, 
+                                                use_per_turn_context=True, log_debug=False,
+                                                max_turns_per_traj=2  # Only last 2 turns
+                                            )
+                                        else:
+                                            # Use per-turn for all turns (original behavior)
+                                            log_probs = PerTurnContextManager.compute_per_turn_log_probs_batched(
+                                                final_gen_batch_output, _orig_compute, 
+                                                use_per_turn_context=True, log_debug=False
+                                            )
+                                        
+                                        # Ensure DataProto shape compatibility
+                                        final_gen_batch_output.batch['old_log_probs'] = log_probs
+                                    except Exception as e:
+                                        print(f"[Per-Turn Training] Fallback to original compute_log_prob due to: {e}")
+                                        output = self.actor_rollout_wg.compute_log_prob(final_gen_batch_output)
+                                        final_gen_batch_output = final_gen_batch_output.union(output)
+                                else:
+                                    output = self.actor_rollout_wg.compute_log_prob(final_gen_batch_output)
+                                    final_gen_batch_output = final_gen_batch_output.union(output)
                             # Use provided per-sample index as group id; mirror to traj_uid
                             batch.non_tensor_batch['uid'] = batch.non_tensor_batch['index'].copy()
                             batch.non_tensor_batch['traj_uid'] = batch.non_tensor_batch['uid'].copy()
