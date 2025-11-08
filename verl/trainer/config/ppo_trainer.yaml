@@ -120,7 +120,7 @@ actor_rollout_ref:
     limit_mm_per_prompt: {}
 
     # for vllm rollout
-    dtype: bfloat16 # should align with FSDP
+    dtype: float16 # should align with FSDP
     gpu_memory_utilization: 0.5
     ignore_eos: False
     enforce_eager: True
