@@ -372,6 +372,27 @@ class DataParallelPPOActor(BasePPOActor):
 
                     old_log_prob = data["old_log_probs"]
                     advantages = data["advantages"]
+                    
+                    # Align old_log_prob and advantages to current response_length
+                    if old_log_prob.size(1) != response_length:
+                        if old_log_prob.size(1) > response_length:
+                            # Truncate if old_log_prob is longer
+                            old_log_prob = old_log_prob[:, :response_length]
+                        else:
+                            # Pad with zeros if old_log_prob is shorter
+                            padding = torch.zeros(old_log_prob.size(0), response_length - old_log_prob.size(1), 
+                                                dtype=old_log_prob.dtype, device=old_log_prob.device)
+                            old_log_prob = torch.cat([old_log_prob, padding], dim=1)
+                    
+                    if advantages.size(1) != response_length:
+                        if advantages.size(1) > response_length:
+                            # Truncate if advantages is longer
+                            advantages = advantages[:, :response_length]
+                        else:
+                            # Pad with zeros if advantages is shorter
+                            padding = torch.zeros(advantages.size(0), response_length - advantages.size(1), 
+                                                dtype=advantages.dtype, device=advantages.device)
+                            advantages = torch.cat([advantages, padding], dim=1)
 
                     clip_ratio = self.config.clip_ratio
                     clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio

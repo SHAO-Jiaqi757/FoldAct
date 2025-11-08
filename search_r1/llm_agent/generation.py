@@ -398,6 +398,10 @@ class LLMGenerationManager:
             info_mask = torch.full(info.size(), pad_id, dtype=info.dtype, device=info.device) # information mask
             tensors_with_mask.append(info_mask)
             id_tensors.append(torch.full(info.size(), step, dtype=prompt_step_ids.dtype, device=prompt_step_ids.device))
+            #  Mark info tokens as ResponseType.information (3) for correct mask computation
+            # This ensures that information blocks are correctly identified and excluded from policy gradient updates
+            info_types = torch.full(info.size(), ResponseType.information.value, dtype=response_types.dtype, device=response_types.device)
+            type_tensors.append(info_types)
         
         concatenated = torch.cat(tensors, dim=1)
         concatenated_with_info = torch.cat(tensors_with_mask, dim=1)

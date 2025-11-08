@@ -74,7 +74,7 @@ class HallucinationPenaltyRewardManager:
     """Reward manager that penalizes <information> (hallucination) and rewards <information_summary> when context has <information>."""
     
     def __init__(self, tokenizer, num_examine=100, compute_score=None, reward_fn_key="data_source", 
-                 log_dir: Optional[str] = None):
+                 log_dir: Optional[str] = None, **kwargs):
         self.tokenizer = tokenizer
         self.num_examine = num_examine
         self.compute_score = compute_score or default_compute_score
@@ -89,6 +89,9 @@ class HallucinationPenaltyRewardManager:
         
         # Configuration for the new reward system
         self.config = self._get_hallucination_penalty_config()
+        # Override config with kwargs if provided
+        if kwargs:
+            self.config.update(kwargs)
 
         # In-memory caches
         self._cache_lock = threading.Lock()
@@ -97,13 +100,15 @@ class HallucinationPenaltyRewardManager:
         self._setup_logging()
         
         logger.info(f"HallucinationPenaltyRewardManager initialized.")
+        logger.info(f"Reward config: per_step_distribution={self.config.get('per_step_distribution', 'last_token')}")
         self.file_logger.info(f"Reward file path: {self.log_filename}")
+        self.file_logger.info(f"Reward config: per_step_distribution={self.config.get('per_step_distribution', 'last_token')}")
     
     def _get_hallucination_penalty_config(self):
         """Get configuration for hallucination penalty reward system"""
         return {
             "information_penalty": 0.0,              # Penalty for <information> components (hallucination)
-            "information_summary_bonus": 0.1,           # Bonus for <information_summary> components with context
+            "information_summary_bonus": 0.0,           # Bonus for <information_summary> components with context
             "information_summary_penalty": -0.1,      # Penalty for <information_summary> components without context
             "format_bonus": 0.1,                     # Bonus for proper format (sequence ends with answer)
             "enable_debug_logs": False,
@@ -112,7 +117,7 @@ class HallucinationPenaltyRewardManager:
             "max_reward_value": 2.0,
             "smooth_reward_transition": False,
             "step_level_allocation": True,
-            "per_step_distribution": "even",
+            "per_step_distribution": "last_token",  # Changed from "even" to "last_token" for stronger gradient signals
         }
     
     def _setup_logging(self):
@@ -434,7 +439,9 @@ class HallucinationPenaltyRewardManager:
             
             # Use hallucination penalty reward allocation strategy
             reward_tensor = self._allocate_rewards_hallucination_penalty(feedback, response_length)
-            self.file_logger.info("Used hallucination penalty reward allocation")
+            distribution_mode = self.config.get("per_step_distribution", "last_token")
+            self.file_logger.info(f"Used hallucination penalty reward allocation (per_step_distribution={distribution_mode})")
+            logger.info(f"Reward allocation: per_step_distribution={distribution_mode}")
             
             # Apply smooth transition
             if self.config["smooth_reward_transition"]:
@@ -515,8 +522,10 @@ class HallucinationPenaltyRewardManager:
                 reward_tensor[start_idx:end_idx] = final_score
             
             # Log to file
+            distribution_mode = self.config.get("per_step_distribution", "last_token")
+            reward_pos = f"pos {end_idx-1}" if distribution_mode == "last_token" else f"span {start_idx}-{end_idx}"
             self.file_logger.info(f"Component {i+1} ({component.component_type}): "
-                                f"final_score={final_score:.3f}, tokens={start_idx}-{end_idx}")
+                                f"final_score={final_score:.3f}, reward at {reward_pos}")
         
         return reward_tensor
     

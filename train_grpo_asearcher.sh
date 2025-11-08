@@ -24,9 +24,9 @@ export CUDA_LAUNCH_BLOCKING=1
 export TORCH_CUDA_ARCH_LIST="8.0;8.6"
 
 # Data Directories
-export DATA_DIR='/datapool/data/deepresearcher'
-export TRAIN_DATA_DIR='/datapool/data/deepresearcher'
-export TEST_DATA_DIR='/datapool/data/deepresearcher'
+export DATA_DIR='/datapool/data/ASearcher'
+export TRAIN_DATA_DIR='/datapool/data/ASearcher'
+export TEST_DATA_DIR='/datapool/data/ASearcher'
 
 # WandB Configuration
 WAND_PROJECT='search-agent-Context-Monitoring'
@@ -146,8 +146,8 @@ fi
 ################################################################################
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
-    data.train_files=$TRAIN_DATA_DIR/train_transformed.parquet \
-    data.val_files=$TEST_DATA_DIR/test_transformed.parquet \
+    data.train_files=$TRAIN_DATA_DIR/train.parquet \
+    data.val_files=$TEST_DATA_DIR/test.parquet \
     +enable_debug_logs=true \
     data.reward_fn_key=data_source \
     reward_model.reward_manager=hallucination_penalty \
@@ -257,7 +257,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     `# Enable sliding window: keep only the most recent 1 turn` \
     +use_sliding=true \
     `# KL-Aware Training: 10% full context, 90% compressed` \
-    +full_context_ratio=0.1 \
+    +full_context_ratio=0.0 \
     `# Enable KL baseline computation for compressed rollouts` \
     +enable_kl_baseline=false \
     \

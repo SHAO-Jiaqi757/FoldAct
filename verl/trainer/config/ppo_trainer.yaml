@@ -56,7 +56,7 @@ actor_rollout_ref:
     clip_ratio_high: 0.2
     clip_ratio_c: 3.0 # lower bound of the value for Dual-clip PPO from https://arxiv.org/pdf/1912.09729
     # DrGRPO-friendly aggregation to reduce length bias when using dense rewards
-    loss_agg_mode: "seq-mean-token-sum-norm" # options: "token-mean" / "seq-mean-token-sum" / "seq-mean-token-mean" / "seq-mean-token-sum-norm"
+    loss_agg_mode: "seq-mean-token-mean" # options: "token-mean" / "seq-mean-token-sum" / "seq-mean-token-mean" / "seq-mean-token-sum-norm"
     entropy_coeff: 0.001
     use_invalid_action_penalty: True
     invalid_action_penalty_coef: 0.1
@@ -326,7 +326,6 @@ do_search: true
 # Max multi-turn steps for the agent (required by GenerationConfig)
 max_turns: 2
 # Whether to run a final retrieval/search operation before producing the final answer
-final_turn_do_search: false
 
 # Retriever settings used by SearchTool; can be overridden via CLI
 retriever:
