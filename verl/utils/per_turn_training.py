@@ -296,7 +296,14 @@ class PerTurnContextManager:
         # Collect all sequence lengths for smart padding
         seq_lengths = []
         for turn_ctx in all_turns:
-            ctx_len = turn_ctx['input_ids'].size(0)
+            # Handle reference-based storage (memory optimized)
+            if 'input_ids_ref' in turn_ctx and 'attention_mask_ref' in turn_ctx:
+                item_idx = turn_ctx.get('item_idx', 0)
+                ctx_ids = turn_ctx['input_ids_ref'][item_idx]  # Extract specific item from batch
+                ctx_len = ctx_ids.size(0)
+            else:
+                # Fallback to old format (direct tensors)
+                ctx_len = turn_ctx['input_ids'].size(0)
             resp_len = turn_ctx['response'].size(0)
             seq_lengths.append(ctx_len + resp_len)
         
@@ -304,8 +311,15 @@ class PerTurnContextManager:
         batch_size = len(all_turns)
         
         # Pre-allocate tensors for efficiency
-        device = all_turns[0]['input_ids'].device
-        dtype = all_turns[0]['input_ids'].dtype
+        # Get device and dtype from first turn (handle both formats)
+        first_turn = all_turns[0]
+        if 'input_ids_ref' in first_turn and 'attention_mask_ref' in first_turn:
+            item_idx = first_turn.get('item_idx', 0)
+            device = first_turn['input_ids_ref'][item_idx].device
+            dtype = first_turn['input_ids_ref'][item_idx].dtype
+        else:
+            device = first_turn['input_ids'].device
+            dtype = first_turn['input_ids'].dtype
         
         batch_input_ids = torch.zeros(batch_size, max_seq_len, dtype=dtype, device=device)
         batch_attention_mask = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=device)
