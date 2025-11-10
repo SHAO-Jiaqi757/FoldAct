@@ -291,7 +291,7 @@ def compute_response_mask(data: DataProto):
             num_assistant_tokens = response_mask.sum().item()
             num_total_tokens = response_mask.numel()
             assistant_ratio = num_assistant_tokens / num_total_tokens if num_total_tokens > 0 else 0.0
-            logger.debug(
+            print(
                 f"[compute_response_mask] Assistant tokens: {num_assistant_tokens}/{num_total_tokens} "
                 f"({assistant_ratio*100:.1f}%) from responses_types"
             )
@@ -1459,19 +1459,29 @@ class RayPPOTrainer:
                                             )
                                         
                                         # Ensure DataProto shape compatibility
+                                        # CRITICAL FIX: Remove old_log_probs if it exists to avoid union conflict
+                                        if 'old_log_probs' in final_gen_batch_output.batch:
+                                            print(f"[Per-Turn Training] Removing existing old_log_probs before setting new one")
+                                            del final_gen_batch_output.batch['old_log_probs']
+                                        
                                         final_gen_batch_output.batch['old_log_probs'] = log_probs
                                         
                                         # CRITICAL FIX: Store valid_mask if available for use in loss calculation
                                         if hasattr(log_probs, 'valid_mask'):
                                             # Store valid_mask in meta_info for later access
                                             final_gen_batch_output.meta_info['per_turn_valid_mask'] = log_probs.valid_mask
-                                            logger.info(f"[Per-Turn Training] Stored valid_mask with shape {log_probs.valid_mask.shape} in meta_info")
+                                            print(f"[Per-Turn Training] Stored valid_mask with shape {log_probs.valid_mask.shape} in meta_info")
                                     except Exception as e:
                                         print(f"[Per-Turn Training] Fallback to original compute_log_prob due to: {e}")
                                         print(f"[Per-Turn Training] Exception type: {type(e).__name__}")
                                         import traceback
                                         print(f"[Per-Turn Training] Full traceback:")
                                         traceback.print_exc()
+                                        # CRITICAL FIX: Remove old_log_probs if it exists to avoid union conflict
+                                        if 'old_log_probs' in final_gen_batch_output.batch:
+                                            print(f"[Per-Turn Training] Removing existing old_log_probs before fallback compute_log_prob")
+                                            del final_gen_batch_output.batch['old_log_probs']
+                                        
                                         output = self.actor_rollout_wg.compute_log_prob(final_gen_batch_output)
                                         final_gen_batch_output = final_gen_batch_output.union(output)
                                 else:
