@@ -95,13 +95,73 @@ class DataParallelPPOActor(BasePPOActor):
 
             if self.use_remove_padding:
                 input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)  # input_ids_rmpad (total_nnz, ...)
+                total_nnz = input_ids_rmpad.size(0)
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+                
+                # Basic validation logging
+                attention_mask_sum = attention_mask.sum().item()
+                seq_valid_lengths = attention_mask.sum(dim=1)
+                num_zero_seq = (seq_valid_lengths == 0).sum().item()
+                if total_nnz == 0:
+                    logger.error(f"[DP Actor] CRITICAL: total_nnz is ZERO! batch_size={batch_size}, seqlen={seqlen}")
+                if attention_mask_sum != total_nnz:
+                    logger.warning(f"[DP Actor] attention_mask_sum ({attention_mask_sum}) != total_nnz ({total_nnz})")
 
                 # unpad the position_ids to align the rotary
                 if position_ids.dim() == 3:
                     position_ids_rmpad = index_first_axis(rearrange(position_ids, "c b s ... -> (b s) c ..."), indices).transpose(0, 1).unsqueeze(1)  # (3, bsz, seqlen) -> (3, 1, bsz * seqlen)
                 else:
                     position_ids_rmpad = index_first_axis(rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices).transpose(0, 1)
+                
+                # CRITICAL FIX: Reset position_ids to start from 0 for each sequence
+                # This is necessary because Flash Attention varlen mode uses position_ids == 0 to detect sequence boundaries
+                # Calculate sequence boundaries from attention_mask
+                seq_valid_lengths = attention_mask.sum(dim=1)  # [batch_size]
+                cu_seqlens = torch.cat([
+                    torch.tensor([0], device=position_ids_rmpad.device, dtype=torch.int32),
+                    torch.cumsum(seq_valid_lengths, dim=0, dtype=torch.int32)
+                ])  # [batch_size + 1]
+                
+                # Reset position_ids: for each sequence, subtract the starting position_id
+                if position_ids_rmpad.dim() == 2:
+                    # Standard case: (1, total_nnz)
+                    pos_ids_flat = position_ids_rmpad.flatten()
+                    for i in range(batch_size):
+                        start_idx = cu_seqlens[i].item()
+                        end_idx = cu_seqlens[i+1].item()
+                        if end_idx > start_idx:
+                            # Get the starting position_id for this sequence
+                            seq_start_pos = pos_ids_flat[start_idx].item()
+                            # Reset to start from 0
+                            pos_ids_flat[start_idx:end_idx] -= seq_start_pos
+                    position_ids_rmpad = pos_ids_flat.view(position_ids_rmpad.shape)
+                elif position_ids_rmpad.dim() == 3:
+                    # Qwen2VL mrope case: (3, 1, total_nnz)
+                    for c in range(position_ids_rmpad.size(0)):
+                        pos_ids_flat = position_ids_rmpad[c, 0, :].flatten()
+                        for i in range(batch_size):
+                            start_idx = cu_seqlens[i].item()
+                            end_idx = cu_seqlens[i+1].item()
+                            if end_idx > start_idx:
+                                # Get the starting position_id for this sequence
+                                seq_start_pos = pos_ids_flat[start_idx].item()
+                                # Reset to start from 0
+                                pos_ids_flat[start_idx:end_idx] -= seq_start_pos
+                        position_ids_rmpad[c, 0, :] = pos_ids_flat
+                
+                # Validate position_ids after reset - only log if there's an issue
+                if position_ids_rmpad.numel() > 0:
+                    pos_ids_flat = position_ids_rmpad.flatten()
+                    pos_ids_zero_count = (pos_ids_flat == 0).sum().item()
+                    
+                    if pos_ids_zero_count == 0:
+                        logger.error(f"[DP Actor] CRITICAL: No position_ids == 0 after reset! batch_size={batch_size}, shape={position_ids_rmpad.shape}")
+                    elif pos_ids_zero_count < batch_size:
+                        logger.warning(f"[DP Actor] position_ids zero_count ({pos_ids_zero_count}) < batch_size ({batch_size})")
+                    else:
+                        logger.debug(f"[DP Actor] position_ids reset OK: zero_count={pos_ids_zero_count}, batch_size={batch_size}")
+                else:
+                    logger.error(f"[DP Actor] CRITICAL: position_ids_rmpad is EMPTY!")
 
                 # for compute the log_prob
                 input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
@@ -127,6 +187,7 @@ class DataParallelPPOActor(BasePPOActor):
                         position_ids_rmpad=None,
                         sp_size=self.ulysses_sequence_parallel_size,
                     )
+                    logger.debug(f"[DP Actor] After Ulysses SP: pad_size={pad_size}")
 
                 input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
 
@@ -372,6 +433,31 @@ class DataParallelPPOActor(BasePPOActor):
 
                     old_log_prob = data["old_log_probs"]
                     advantages = data["advantages"]
+                    
+                    # CRITICAL FIX: Apply valid_mask if available (from per-turn training)
+                    # This masks out padding positions in old_log_prob
+                    if isinstance(data, DataProto) and 'per_turn_valid_mask' in data.meta_info:
+                        valid_mask = data.meta_info['per_turn_valid_mask']  # [num_traj, max_total_len]
+                        # Expand valid_mask to match old_log_prob shape if needed
+                        if valid_mask.shape != old_log_prob.shape:
+                            # Handle shape mismatch: valid_mask might be [num_traj, max_total_len]
+                            # while old_log_prob might be [num_traj, response_length] after alignment
+                            logger.warning(f"[DP Actor] Valid mask shape {valid_mask.shape} != old_log_prob shape {old_log_prob.shape}, "
+                                         f"attempting to align...")
+                            # If old_log_prob is shorter, truncate valid_mask
+                            if valid_mask.size(1) >= old_log_prob.size(1):
+                                valid_mask = valid_mask[:, :old_log_prob.size(1)]
+                            else:
+                                # If old_log_prob is longer, pad valid_mask with False
+                                pad_size = old_log_prob.size(1) - valid_mask.size(1)
+                                valid_mask = torch.cat([valid_mask, torch.zeros(valid_mask.size(0), pad_size, dtype=torch.bool, device=valid_mask.device)], dim=1)
+                        
+                        # Apply valid_mask to response_mask (intersection)
+                        if response_mask.shape == valid_mask.shape:
+                            response_mask = response_mask & valid_mask
+                            logger.debug(f"[DP Actor] Applied per-turn valid_mask: {valid_mask.sum().item()}/{valid_mask.numel()} positions valid")
+                        else:
+                            logger.warning(f"[DP Actor] Cannot apply valid_mask: response_mask shape {response_mask.shape} != valid_mask shape {valid_mask.shape}")
                     
                     # Align old_log_prob and advantages to current response_length
                     if old_log_prob.size(1) != response_length:

@@ -598,7 +598,7 @@ class HallucinationPenaltyRewardManager:
                 is_last_answer = (component.start_token_idx == sorted_answer_components[-1].start_token_idx)
             
             if is_last_answer:
-                format_bonus = self.config.get("format_bonus", 0.1)
+                format_bonus = self.config.get("format_bonus")
                 if format_bonus:
                     score += format_bonus
                     try:

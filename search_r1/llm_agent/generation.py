@@ -628,14 +628,34 @@ class LLMGenerationManager:
                 if active_mask[i]:
                     # Store reference to original tensor instead of cloning
                     # This reduces memory overhead significantly
+                    # CRITICAL FIX: Save context_start_position for correct position_ids in training
+                    # Get the starting position_id from the current position_ids
+                    current_position_ids = rollings.batch.get('position_ids', None)
+                    if current_position_ids is not None:
+                        # For Qwen2VL, position_ids might be (3, batch_size, seq_len) or (batch_size, seq_len)
+                        if current_position_ids.dim() == 3:
+                            # Qwen2VL mrope case: (3, batch_size, seq_len), use first channel
+                            context_start_position = current_position_ids[0, i, 0].item() if current_position_ids.size(2) > 0 else 0
+                        else:
+                            # Standard case: (batch_size, seq_len)
+                            context_start_position = current_position_ids[i, 0].item() if current_position_ids.size(1) > 0 else 0
+                    else:
+                        # Fallback: compute from attention_mask (cumulative sum)
+                        context_start_position = 0
+                        logger.warning(f"[Per-Turn Context] Turn {step}: position_ids not found, using context_start_position=0")
+                    
                     per_turn_contexts[i].append({
                         'turn_id': step,
                         'input_ids_ref': current_context_for_turn,  # Reference, not clone
                         'attention_mask_ref': current_attention_mask_for_turn,  # Reference, not clone
                         'item_idx': i,  # Index within the batch
                         'response_start_idx': current_context_for_turn[i].size(0),  # Where response will start
-                        'context_length': current_attention_mask_for_turn[i].sum().item()
+                        'context_length': current_attention_mask_for_turn[i].sum().item(),
+                        'context_start_position': context_start_position  # CRITICAL: Starting position_id for this context
                     })
+                    
+                    if step == 0 and i < 3:  # Log first few for debugging
+                        logger.info(f"[Per-Turn Context] Turn {step}, Traj {i}: context_start_position={context_start_position}, context_length={current_attention_mask_for_turn[i].sum().item()}")
             
             if step == 0 or step % 3 == 0:  # Log every 3 turns
                 avg_context_len = sum(current_attention_mask_for_turn[i].sum().item() 

@@ -1460,6 +1460,12 @@ class RayPPOTrainer:
                                         
                                         # Ensure DataProto shape compatibility
                                         final_gen_batch_output.batch['old_log_probs'] = log_probs
+                                        
+                                        # CRITICAL FIX: Store valid_mask if available for use in loss calculation
+                                        if hasattr(log_probs, 'valid_mask'):
+                                            # Store valid_mask in meta_info for later access
+                                            final_gen_batch_output.meta_info['per_turn_valid_mask'] = log_probs.valid_mask
+                                            logger.info(f"[Per-Turn Training] Stored valid_mask with shape {log_probs.valid_mask.shape} in meta_info")
                                     except Exception as e:
                                         print(f"[Per-Turn Training] Fallback to original compute_log_prob due to: {e}")
                                         print(f"[Per-Turn Training] Exception type: {type(e).__name__}")
