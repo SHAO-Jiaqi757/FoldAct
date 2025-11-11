@@ -109,7 +109,7 @@ class HallucinationPenaltyRewardManager:
         return {
             "information_penalty": 0.0,              # Penalty for <information> components (hallucination)
             "information_summary_bonus": 0.0,           # Bonus for <information_summary> components with context
-            "information_summary_penalty": -0.1,      # Penalty for <information_summary> components without context
+            "information_summary_ground_truth_bonus": 0.2,  # Bonus when summaries correctly echo ground-truth evidence
             "format_bonus": 0.1,                     # Bonus for proper format (sequence ends with answer)
             "enable_debug_logs": False,
             "reward_allocation_strategy": "component_based",
@@ -117,7 +117,7 @@ class HallucinationPenaltyRewardManager:
             "max_reward_value": 2.0,
             "smooth_reward_transition": False,
             "step_level_allocation": True,
-            "per_step_distribution": "last_token",  # Changed from "even" to "last_token" for stronger gradient signals
+            "per_step_distribution": "even",  # Changed from "even" to "last_token" for stronger gradient signals
         }
     
     def _setup_logging(self):
@@ -186,7 +186,13 @@ class HallucinationPenaltyRewardManager:
         self.file_logger.info(f"  Answer components: {len(answer_components)}")
         
         # Analyze hallucination penalty and information summary rewards (with ledger and step_ids)
-        hallucination_analysis = self._analyze_hallucination_penalty(components, question, event_ledger, step_ids)
+        hallucination_analysis = self._analyze_hallucination_penalty(
+            components,
+            question,
+            event_ledger,
+            step_ids,
+            ground_truth=ground_truth
+        )
         
         # Compute component scores
         answer_quality_score = self._score_answer_quality_simplified(answer_components, ground_truth)
@@ -266,7 +272,8 @@ class HallucinationPenaltyRewardManager:
     def _analyze_hallucination_penalty(self, components: List[TrajectoryComponent], 
                                       question: str = None,
                                       event_ledger: Optional[EventLedger] = None,
-                                      step_ids: Optional[torch.Tensor] = None) -> Dict:
+                                      step_ids: Optional[torch.Tensor] = None,
+                                      ground_truth: Optional[Any] = None) -> Dict:
         """
         Analyze hallucination penalty and information summary rewards.
         
@@ -278,6 +285,7 @@ class HallucinationPenaltyRewardManager:
         observation_information_indices = []
         model_information_indices = []
         information_summary_indices = []
+        information_summary_ground_truth_component_ids: List[int] = []
 
         # Optimize: single pass through components, cache results
         for idx, component in enumerate(components):
@@ -298,6 +306,15 @@ class HallucinationPenaltyRewardManager:
         summaries_with_evidence = 0
         summaries_without_evidence = 0
         
+        # Prepare normalized ground-truth strings for bonus computation
+        normalized_gt_parts: List[str] = []
+        if ground_truth is not None:
+            normalized_gt_parts = [
+                gt.lower()
+                for gt in self._extract_ground_truth_parts(ground_truth)
+                if isinstance(gt, str) and gt.strip()
+            ]
+
         # NEW: Use event ledger for ground truth evidence checking
         if event_ledger is not None:
             self.file_logger.info(f"[Event Ledger] Using ledger with {len(event_ledger)} events for evidence checking")
@@ -316,6 +333,28 @@ class HallucinationPenaltyRewardManager:
                 else:
                     summaries_without_evidence += 1
                     self.file_logger.info(f"[Event Ledger] Summary at turn {turn_id} has NO evidence in ledger")
+
+            # Ground-truth consistency reward: summary must echo evidence containing ground truth
+            if normalized_gt_parts and information_summary_indices:
+                ledger_evidence = [
+                    evidence.lower()
+                    for evidence in event_ledger.get_all_evidence()
+                    if isinstance(evidence, str)
+                ]
+                gt_present_in_evidence = {
+                    gt for gt in normalized_gt_parts
+                    if len(gt) >= 3 and any(gt in evidence for evidence in ledger_evidence)
+                }
+                if gt_present_in_evidence:
+                    for summary_idx in information_summary_indices:
+                        summary_component = components[summary_idx]
+                        summary_text = (summary_component.content or "").lower()
+                        if any(gt in summary_text for gt in gt_present_in_evidence):
+                            information_summary_ground_truth_component_ids.append(id(summary_component))
+                            self.file_logger.info(
+                                "[Reward] Information summary echoes ground truth present in evidence "
+                                f"(component_idx={summary_idx})"
+                            )
         else:
             # FALLBACK: Use old method based on visible components (less accurate with compression)
             self.file_logger.warning("[Event Ledger] No ledger provided, falling back to component-based checking (may be inaccurate with compression)")
@@ -335,14 +374,21 @@ class HallucinationPenaltyRewardManager:
                 # Has evidence: give bonus
                 information_summary_bonus = self.config["information_summary_bonus"]
                 self.file_logger.info(f"[Reward] Information summary bonus: {information_summary_bonus} (evidence found in ledger)")
-            elif summaries_without_evidence > 0:
-                # No evidence: give penalty
-                information_summary_bonus = self.config["information_summary_penalty"]
-                self.file_logger.info(f"[Reward] Information summary penalty: {information_summary_bonus} (no evidence in ledger)")
             else:
                 information_summary_bonus = 0.0
         else:
             information_summary_bonus = 0.0
+
+        information_summary_ground_truth_bonus = 0.0
+        if information_summary_ground_truth_component_ids:
+            information_summary_ground_truth_bonus = self.config.get(
+                "information_summary_ground_truth_bonus", 0.0
+            )
+            if information_summary_ground_truth_bonus:
+                self.file_logger.info(
+                    f"[Reward] Information summary ground-truth bonus: {information_summary_ground_truth_bonus} "
+                    f"(matches={len(information_summary_ground_truth_component_ids)})"
+                )
         
         return {
             "information_penalty": information_penalty,
@@ -351,10 +397,41 @@ class HallucinationPenaltyRewardManager:
             "information_summary_without_evidence": summaries_without_evidence,
             "model_information_indices": model_information_indices,
             "observation_information_indices": observation_information_indices,
+            "information_summary_ground_truth_bonus": information_summary_ground_truth_bonus,
+            "information_summary_ground_truth_component_ids": information_summary_ground_truth_component_ids,
         }
     
     
     
+    def _extract_ground_truth_parts(self, ground_truth) -> List[str]:
+        """Normalize ground truth into a list of candidate strings for matching."""
+        parts: List[str] = []
+        if isinstance(ground_truth, str):
+            # Process separator format
+            if "<|answer_split|>" in ground_truth:
+                parts = [gt.strip() for gt in ground_truth.split("<|answer_split|>")]
+            else:
+                parts = [ground_truth.strip()]
+        elif isinstance(ground_truth, dict):
+            # Extract answer list from common fields
+            candidate_keys = ["target", "targets", "answers", "answer", "labels"]
+            gt_values = []
+            for k in candidate_keys:
+                if k in ground_truth:
+                    v = ground_truth[k]
+                    if isinstance(v, (list, np.ndarray, set, tuple)):
+                        gt_values.extend(list(v))
+                    else:
+                        gt_values.append(v)
+            if not gt_values:
+                gt_values = [ground_truth]
+            parts = [str(gt).strip() for gt in gt_values]
+        elif isinstance(ground_truth, (list, np.ndarray, set, tuple)):
+            parts = [str(gt).strip() for gt in ground_truth]
+        else:
+            parts = [str(ground_truth).strip()]
+        return [p for p in parts if isinstance(p, str) and p.strip()]
+
     def _score_answer_quality_simplified(self, answer_components: List[TrajectoryComponent], 
                                        ground_truth) -> float:
         """Simplified answer quality score: only consider exact matches"""
@@ -371,31 +448,7 @@ class HallucinationPenaltyRewardManager:
             pass
         self.file_logger.debug(f"Scoring final answer: {final_answer[:100]}...")
         
-        # Process ground truth format
-        if isinstance(ground_truth, str):
-            # Process separator format
-            if "<|answer_split|>" in ground_truth:
-                gt_parts = [gt.strip() for gt in ground_truth.split("<|answer_split|>")]
-            else:
-                gt_parts = [ground_truth.strip()]
-        elif isinstance(ground_truth, dict):
-            # Extract answer list from common fields
-            candidate_keys = ["target", "targets", "answers", "answer", "labels"]
-            gt_values = []
-            for k in candidate_keys:
-                if k in ground_truth:
-                    v = ground_truth[k]
-                    if isinstance(v, (list, np.ndarray, set, tuple)):
-                        gt_values.extend(list(v))
-                    else:
-                        gt_values.append(v)
-            if not gt_values:
-                gt_values = [ground_truth]
-            gt_parts = [str(gt).strip() for gt in gt_values]
-        elif isinstance(ground_truth, (list, np.ndarray, set, tuple)):
-            gt_parts = [str(gt).strip() for gt in ground_truth]
-        else:
-            gt_parts = [str(ground_truth).strip()]
+        gt_parts = self._extract_ground_truth_parts(ground_truth)
         
         logger.debug(f"Ground truth parts: {gt_parts}")
         
@@ -536,6 +589,7 @@ class HallucinationPenaltyRewardManager:
         """Apply hallucination penalty rewards based on component type"""
         score = 0.0
         debug_parts = []
+        gt_component_id_set = set(hallucination_meta.get("information_summary_ground_truth_component_ids", []))
         
         try:
             debug_parts.append(f"base=0.0")
@@ -548,6 +602,22 @@ class HallucinationPenaltyRewardManager:
             bonus = hallucination_meta.get("information_summary_bonus", 0.0)
             if bonus:
                 score += bonus
+                try:
+                    debug_parts.append(f"information_summary_bonus=+{bonus:.3f}")
+                except Exception:
+                    pass
+
+            if gt_component_id_set and id(component) in gt_component_id_set:
+                gt_bonus = hallucination_meta.get("information_summary_ground_truth_bonus", 0.0)
+                if gt_bonus:
+                    score += gt_bonus
+                    try:
+                        debug_parts.append(f"ground_truth_bonus=+{gt_bonus:.3f}")
+                    except Exception:
+                        pass
+                    logger.debug(
+                        f"Rewarding information summary for correctly extracting ground truth: {score:.3f}"
+                    )
             # Check if this is the first information_summary component
             # is_first_info_summary = not any(
             #     c.component_type == "information_summary" and c.start_token_idx < component.start_token_idx
