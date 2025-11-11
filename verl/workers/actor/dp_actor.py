@@ -44,10 +44,62 @@ elif is_npu_available:
     from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
 
 
-__all__ = ["DataParallelPPOActor"]
+__all__ = ["DataParallelPPOActor", "align_per_turn_valid_mask"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def align_per_turn_valid_mask(
+    valid_mask: torch.Tensor,
+    target_tokens: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    Align (truncate/pad) the per-turn valid_mask to match the current response length.
+
+    Args:
+        valid_mask: Tensor of shape [batch, tokens] produced during per-turn log_prob compute.
+        target_tokens: Number of tokens in the current response slice.
+        device: Device of the response_mask we are aligning to.
+        dtype: Desired dtype (matches response_mask dtype to avoid implicit casts).
+
+    Returns:
+        Tensor of shape [batch, target_tokens] placed on `device` and cast to `dtype`.
+    """
+    if valid_mask is None:
+        return None
+
+    mask = valid_mask.to(device=device)
+    current_tokens = mask.size(1)
+
+    if current_tokens > target_tokens:
+        logger.debug(
+            "[DP Actor] Truncating per_turn_valid_mask from %d to %d tokens",
+            current_tokens,
+            target_tokens,
+        )
+        mask = mask[:, :target_tokens]
+    elif current_tokens < target_tokens:
+        pad_size = target_tokens - current_tokens
+        logger.debug(
+            "[DP Actor] Padding per_turn_valid_mask from %d to %d tokens (+%d)",
+            current_tokens,
+            target_tokens,
+            pad_size,
+        )
+        padding = torch.zeros(mask.size(0), pad_size, dtype=mask.dtype, device=device)
+        mask = torch.cat([mask, padding], dim=1)
+
+    mask = mask.to(dtype=dtype)
+    valid_ratio = mask.sum().item() / max(mask.numel(), 1)
+    logger.info(
+        "[DP Actor] per_turn_valid_mask aligned: shape=%s valid_ratio=%.4f",
+        tuple(mask.shape),
+        valid_ratio,
+    )
+    return mask
 
 
 class DataParallelPPOActor(BasePPOActor):
@@ -419,10 +471,16 @@ class DataParallelPPOActor(BasePPOActor):
 
                 for data in micro_batches:
                     # Support all hardwares
+                    device = get_torch_device().current_device()
+                    per_turn_valid_mask = None
                     if isinstance(data, DataProto):
-                        data = {**data.batch.to(get_torch_device().current_device()), **data.non_tensor_batch}
+                        tensor_batch = data.batch.to(device)
+                        per_turn_valid_mask = tensor_batch.get("per_turn_valid_mask")
+                        data = {**tensor_batch, **data.non_tensor_batch}
                     else:
-                        data = data.to(get_torch_device().current_device())  # actor device is cpu when using offload
+                        data = data.to(device)  # actor device is cpu when using offload
+                        if isinstance(data, dict):
+                            per_turn_valid_mask = data.get("per_turn_valid_mask")
                     responses = data["responses"]
                     response_length = responses.size(1)
                     attention_mask = data["attention_mask"]
@@ -436,28 +494,19 @@ class DataParallelPPOActor(BasePPOActor):
                     
                     # CRITICAL FIX: Apply valid_mask if available (from per-turn training)
                     # This masks out padding positions in old_log_prob
-                    if isinstance(data, DataProto) and 'per_turn_valid_mask' in data.meta_info:
-                        valid_mask = data.meta_info['per_turn_valid_mask']  # [num_traj, max_total_len]
-                        # Expand valid_mask to match old_log_prob shape if needed
-                        if valid_mask.shape != old_log_prob.shape:
-                            # Handle shape mismatch: valid_mask might be [num_traj, max_total_len]
-                            # while old_log_prob might be [num_traj, response_length] after alignment
-                            logger.warning(f"[DP Actor] Valid mask shape {valid_mask.shape} != old_log_prob shape {old_log_prob.shape}, "
-                                         f"attempting to align...")
-                            # If old_log_prob is shorter, truncate valid_mask
-                            if valid_mask.size(1) >= old_log_prob.size(1):
-                                valid_mask = valid_mask[:, :old_log_prob.size(1)]
-                            else:
-                                # If old_log_prob is longer, pad valid_mask with False
-                                pad_size = old_log_prob.size(1) - valid_mask.size(1)
-                                valid_mask = torch.cat([valid_mask, torch.zeros(valid_mask.size(0), pad_size, dtype=torch.bool, device=valid_mask.device)], dim=1)
-                        
-                        # Apply valid_mask to response_mask (intersection)
-                        if response_mask.shape == valid_mask.shape:
-                            response_mask = response_mask & valid_mask
-                            logger.debug(f"[DP Actor] Applied per-turn valid_mask: {valid_mask.sum().item()}/{valid_mask.numel()} positions valid")
-                        else:
-                            logger.warning(f"[DP Actor] Cannot apply valid_mask: response_mask shape {response_mask.shape} != valid_mask shape {valid_mask.shape}")
+                    if per_turn_valid_mask is None and isinstance(data, dict):
+                        per_turn_valid_mask = data.get("per_turn_valid_mask")
+                    if per_turn_valid_mask is not None:
+                        aligned_valid_mask = align_per_turn_valid_mask(
+                            valid_mask=per_turn_valid_mask,
+                            target_tokens=response_length,
+                            device=response_mask.device,
+                            dtype=response_mask.dtype,
+                        )
+                        response_mask = response_mask * aligned_valid_mask
+                        # Prevent downstream consumers from mistakenly reusing the stale tensor
+                        if isinstance(data, dict) and "per_turn_valid_mask" in data:
+                            del data["per_turn_valid_mask"]
                     
                     # Align old_log_prob and advantages to current response_length
                     if old_log_prob.size(1) != response_length:

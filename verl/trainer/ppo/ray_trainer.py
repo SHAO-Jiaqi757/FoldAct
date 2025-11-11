@@ -1468,9 +1468,17 @@ class RayPPOTrainer:
                                         
                                         # CRITICAL FIX: Store valid_mask if available for use in loss calculation
                                         if hasattr(log_probs, 'valid_mask'):
-                                            # Store valid_mask in meta_info for later access
-                                            final_gen_batch_output.meta_info['per_turn_valid_mask'] = log_probs.valid_mask
-                                            print(f"[Per-Turn Training] Stored valid_mask with shape {log_probs.valid_mask.shape} in meta_info")
+                                            valid_mask = log_probs.valid_mask
+                                            # Store valid_mask both in meta_info and batch for downstream access
+                                            final_gen_batch_output.meta_info['per_turn_valid_mask'] = valid_mask
+                                            final_gen_batch_output.batch['per_turn_valid_mask'] = valid_mask
+                                            valid_ratio = valid_mask.sum().item() / max(valid_mask.numel(), 1)
+                                            print(
+                                                "[Per-Turn Training] Stored valid_mask in batch/meta_info: "
+                                                "shape=%s valid_ratio=%.4f",
+                                                tuple(valid_mask.shape),
+                                                valid_ratio,
+                                            )
                                     except Exception as e:
                                         print(f"[Per-Turn Training] Fallback to original compute_log_prob due to: {e}")
                                         print(f"[Per-Turn Training] Exception type: {type(e).__name__}")
