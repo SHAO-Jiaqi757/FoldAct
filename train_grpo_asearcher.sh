@@ -68,7 +68,7 @@ echo "[INFO] Checkpoint contents:"
 ls -lh "$CHECKPOINT_DIR" | head -10
 
 # Experiment Name
-export EXPERIMENT_NAME=nq-search-agent-grpo-qwen2.5-3b-it-context-monitoring
+export EXPERIMENT_NAME=summary-reward-agent-gae-qwen2.5-3b-it-context-monitoring
 
 ################################################################################
 # vLLM Configuration
@@ -155,7 +155,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.val_batch_size=8 \
     data.max_prompt_length=3500 \
     data.max_response_length=1024 \
-    algorithm.adv_estimator=grpo \
+    algorithm.adv_estimator=gae \
     \
     `# ========== MODEL CONFIGURATION (from checkpoint) ==========` \
     `# Actor model uses the checkpoint for training` \
@@ -181,7 +181,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.actor.use_dynamic_bsz=true \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192 \
-    actor_rollout_ref.actor.fsdp_config.param_offload=true \
+    actor_rollout_ref.actor.fsdp_config.param_offload=false \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
     +actor_rollout_ref.actor.fsdp_config.grad_offload=true \
     \
@@ -191,7 +191,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.max_model_len=8192 \
     actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     actor_rollout_ref.rollout.enable_chunked_prefill=true \
     actor_rollout_ref.rollout.n_agent=1 \
     env.rollout.n=6 \
@@ -257,7 +257,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     `# Enable sliding window: keep only the most recent 1 turn` \
     +use_sliding=true \
     `# KL-Aware Training: 10% full context, 90% compressed` \
-    +full_context_ratio=0.0 \
+    +full_context_ratio=0.3 \
     `# Enable KL baseline computation for compressed rollouts` \
     +enable_kl_baseline=false \
     \

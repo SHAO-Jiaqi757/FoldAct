@@ -463,26 +463,27 @@ class LLMGenerationManager:
             then remove padding from output
         """
         # CRITICAL FIX: Check input length before generation - use simple truncation
-        input_ids = active_batch.batch['input_ids']
         max_model_len = 8192  # vLLM max_model_len
         max_allowed_prompt_len = max_model_len - 1000  # Leave room for response generation
-        
-        for i in range(input_ids.shape[0]):
-            prompt_len = input_ids[i].shape[0]
-            if prompt_len > max_allowed_prompt_len:
-                # Simple truncation: keep the most recent context
-                truncated_input = input_ids[i][-max_allowed_prompt_len:]
-                active_batch.batch['input_ids'][i] = truncated_input
-                
-                # Also truncate attention_mask if present
-                if 'attention_mask' in active_batch.batch:
-                    active_batch.batch['attention_mask'][i] = active_batch.batch['attention_mask'][i][-max_allowed_prompt_len:]
-                
-                # Truncate other related tensors if present
-                for key in ['responses', 'responses_with_info_mask', 'step_ids', 'responses_types']:
-                    if key in active_batch.batch and active_batch.batch[key].shape[1] > max_allowed_prompt_len:
-                        active_batch.batch[key][i] = active_batch.batch[key][i][-max_allowed_prompt_len:]
-                
+
+        # Detect whether any sample exceeds allowed length
+        need_truncation = any(
+            seq.shape[0] > max_allowed_prompt_len for seq in active_batch.batch['input_ids']
+        )
+
+        if need_truncation:
+            truncated_batch = {}
+            for key, tensor in active_batch.batch.items():
+                if tensor.ndim < 2:
+                    truncated_batch[key] = tensor
+                    continue
+                seq_len = tensor.shape[1]
+                if seq_len <= max_allowed_prompt_len:
+                    truncated_batch[key] = tensor.clone()
+                else:
+                    truncated_batch[key] = tensor[:, -max_allowed_prompt_len:].clone()
+
+            active_batch = DataProto.from_dict(truncated_batch)
         
         num_gpus = self.config.num_gpus
         if num_gpus <= 1:

@@ -111,6 +111,7 @@ class HallucinationPenaltyRewardManager:
             "information_summary_bonus": 0.0,           # Bonus for <information_summary> components with context
             "information_summary_ground_truth_bonus": 0.2,  # Bonus when summaries correctly echo ground-truth evidence
             "format_bonus": 0.1,                     # Bonus for proper format (sequence ends with answer)
+            "no_answer_penalty": -0.2,               # Penalty when the agent never produces an answer component
             "enable_debug_logs": False,
             "reward_allocation_strategy": "component_based",
             "min_reward_value": -1.0,
@@ -381,13 +382,13 @@ class HallucinationPenaltyRewardManager:
 
         information_summary_ground_truth_bonus = 0.0
         if information_summary_ground_truth_component_ids:
-            information_summary_ground_truth_bonus = self.config.get(
-                "information_summary_ground_truth_bonus", 0.0
-            )
-            if information_summary_ground_truth_bonus:
+            total_bonus = float(self.config.get("information_summary_ground_truth_bonus", 0.0) or 0.0)
+            if total_bonus:
+                information_summary_ground_truth_bonus = total_bonus / len(information_summary_ground_truth_component_ids)
                 self.file_logger.info(
-                    f"[Reward] Information summary ground-truth bonus: {information_summary_ground_truth_bonus} "
-                    f"(matches={len(information_summary_ground_truth_component_ids)})"
+                    "[Reward] Information summary ground-truth bonus per component: "
+                    f"{information_summary_ground_truth_bonus:.3f} "
+                    f"(matches={len(information_summary_ground_truth_component_ids)}, total={total_bonus:.3f})"
                 )
         
         return {
@@ -527,7 +528,6 @@ class HallucinationPenaltyRewardManager:
         
         # Get hallucination analysis results
         hallucination_meta = getattr(feedback, '_hallucination_analysis', {})
-        
         # Sort components by token positions
         sorted_components = sorted(feedback.components, key=lambda x: x.start_token_idx)
 
@@ -580,6 +580,18 @@ class HallucinationPenaltyRewardManager:
             self.file_logger.info(f"Component {i+1} ({component.component_type}): "
                                 f"final_score={final_score:.3f}, reward at {reward_pos}")
         
+        # Apply no-answer penalty if trajectory never produced an answer component
+        if response_length > 0 and not any(c.component_type == "answer" for c in feedback.components):
+            no_answer_penalty = float(self.config.get("no_answer_penalty", 0.0) or 0.0)
+            if no_answer_penalty != 0.0:
+                penalty_position = response_length - 1
+                reward_tensor[penalty_position] += no_answer_penalty
+                logger.info(f"Applied no_answer_penalty={no_answer_penalty:.3f} at token {penalty_position}")
+                self.file_logger.info(
+                    f"Applied no_answer_penalty={no_answer_penalty:.3f} at token {penalty_position} "
+                    f"(missing answer component)"
+                )
+        
         return reward_tensor
     
     def _apply_hallucination_penalty_rewards(self, component: TrajectoryComponent, 
@@ -597,7 +609,6 @@ class HallucinationPenaltyRewardManager:
             pass
         
         # 1. Information summary reward/penalty based on context availability
-        # Only reward the FIRST information_summary component to avoid multiple rewards
         if component.component_type == "information_summary":
             bonus = hallucination_meta.get("information_summary_bonus", 0.0)
             if bonus:
@@ -618,24 +629,6 @@ class HallucinationPenaltyRewardManager:
                     logger.debug(
                         f"Rewarding information summary for correctly extracting ground truth: {score:.3f}"
                     )
-            # Check if this is the first information_summary component
-            # is_first_info_summary = not any(
-            #     c.component_type == "information_summary" and c.start_token_idx < component.start_token_idx
-            #     for c in feedback.components
-            # )
-            
-            # if is_first_info_summary:
-            #     bonus = hallucination_meta.get("information_summary_bonus", 0.0)
-            #     if bonus:
-            #         score += bonus
-            #         try:
-            #             debug_parts.append(f"information_summary_bonus=+{bonus:.3f}")
-            #         except Exception:
-            #             pass
-            #         logger.debug(f"Rewarding information summary (has context): {score:.3f}")
-            # else:
-            #     # Skip subsequent information_summary components
-            #     logger.debug(f"Skipping subsequent information_summary component (already rewarded first one)")
           
         # 2. Information components receive hallucination penalty when generated by the model
         elif self._is_model_generated_information(component):
@@ -659,11 +652,9 @@ class HallucinationPenaltyRewardManager:
             logger.debug(f"Rewarding answer quality: {score:.3f}")
             
             # Add format bonus for final answer (if this is the last answer component)
-            # Check if this is the last answer component in the trajectory
             answer_components = [c for c in feedback.components if c.component_type == "answer"]
             is_last_answer = False
             if answer_components:
-                # Sort by token index to find the last one
                 sorted_answer_components = sorted(answer_components, key=lambda x: x.start_token_idx)
                 is_last_answer = (component.start_token_idx == sorted_answer_components[-1].start_token_idx)
             
@@ -677,8 +668,6 @@ class HallucinationPenaltyRewardManager:
                         pass
                     logger.debug(f"Rewarding proper format (sequence ends with answer): {score:.3f}")
                     self.file_logger.info(f"Applied format bonus {format_bonus:.3f} for final answer component")
-        
-        
         # Emit a compact score breakdown line for this component
         try:
             logger.debug(
