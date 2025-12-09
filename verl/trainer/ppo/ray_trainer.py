@@ -1428,6 +1428,36 @@ class RayPPOTrainer:
                                 initial_input_ids=first_input_ids,
                             )
 
+                            # HYPOTHESIS VERIFICATION: Check the fingerprint after serialization
+                            # Use standard Python logging to avoid conflict with Tracking logger
+                            import logging
+                            verification_logger = logging.getLogger(__name__)
+                            
+                            if 'mask_sums_fingerprint' in final_gen_batch_output.non_tensor_batch:
+                                verification_logger.critical("[VERIFICATION] 'mask_sums_fingerprint' received. Checking integrity...")
+                                original_sums = final_gen_batch_output.non_tensor_batch['mask_sums_fingerprint']
+                                received_contexts = final_gen_batch_output.non_tensor_batch.get('per_turn_contexts', [])
+                                
+                                corruption_found = False
+                                for traj_idx, (orig_traj_sums, recv_traj_ctx) in enumerate(zip(original_sums, received_contexts)):
+                                    for turn_idx, (orig_sum, recv_turn) in enumerate(zip(orig_traj_sums, recv_traj_ctx)):
+                                        if 'attention_mask' in recv_turn:
+                                            recv_sum = recv_turn['attention_mask'].sum().item()
+                                            if orig_sum != recv_sum:
+                                                verification_logger.error(
+                                                    f"[VERIFICATION FAILED] CORRUPTION DETECTED in Traj {traj_idx}, Turn {turn_idx}: "
+                                                    f"Original mask sum was {orig_sum}, but received sum is {recv_sum}."
+                                                )
+                                                corruption_found = True
+                                        else:
+                                            verification_logger.warning(f"[VERIFICATION] Missing 'attention_mask' in received turn {turn_idx} of trajectory {traj_idx}.")
+                                
+                                if not corruption_found:
+                                    verification_logger.critical("[VERIFICATION PASSED] All attention_mask sums match. No corruption detected during serialization.")
+                                else:
+                                    # Give a clear overall signal that the problem is confirmed
+                                    verification_logger.error("[VERIFICATION CONCLUSION] Serialization corruption is CONFIRMED as the root cause.")
+
                             for key in final_gen_batch_output.batch.keys():
                                 final_gen_batch_output.batch[key] = final_gen_batch_output.batch[key].long()
 
@@ -1463,6 +1493,47 @@ class RayPPOTrainer:
                                         if 'old_log_probs' in final_gen_batch_output.batch:
                                             print(f"[Per-Turn Training] Removing existing old_log_probs before setting new one")
                                             del final_gen_batch_output.batch['old_log_probs']
+                                        
+                                        # CRITICAL FIX: Align old_log_prob length with responses length
+                                        # Per-turn training computes old_log_prob for all turns (may be longer than max_response_length)
+                                        # But responses are truncated to max_response_length, so we need to truncate old_log_prob too
+                                        responses_shape = final_gen_batch_output.batch.get('responses', torch.empty(0)).shape
+                                        if len(responses_shape) == 2:
+                                            max_response_length = responses_shape[1]
+                                            if log_probs.shape[1] > max_response_length:
+                                                print(f"[Per-Turn Training] Truncating old_log_prob from {log_probs.shape[1]} to {max_response_length} "
+                                                      f"to match responses length")
+                                                log_probs = log_probs[:, :max_response_length]
+                                                # Also update valid_mask if it exists
+                                                if hasattr(log_probs, 'valid_mask'):
+                                                    log_probs.valid_mask = log_probs.valid_mask[:, :max_response_length]
+                                            elif log_probs.shape[1] < max_response_length:
+                                                print(f"[Per-Turn Training] Padding old_log_prob from {log_probs.shape[1]} to {max_response_length} "
+                                                      f"to match responses length")
+                                                pad_size = max_response_length - log_probs.shape[1]
+                                                padding = torch.zeros(log_probs.shape[0], pad_size, 
+                                                                      dtype=log_probs.dtype, device=log_probs.device)
+                                                log_probs = torch.cat([log_probs, padding], dim=1)
+                                                # Update valid_mask if it exists
+                                                if hasattr(log_probs, 'valid_mask'):
+                                                    pad_mask = torch.zeros(log_probs.shape[0], pad_size, 
+                                                                          dtype=log_probs.valid_mask.dtype, device=log_probs.device)
+                                                    log_probs.valid_mask = torch.cat([log_probs.valid_mask, pad_mask], dim=1)
+                                        
+                                        # DIAGNOSIS: Check log_probs before storing
+                                        if isinstance(log_probs, torch.Tensor):
+                                            log_probs_zero_count = (log_probs == 0.0).sum().item()
+                                            log_probs_total = log_probs.numel()
+                                            log_probs_zero_ratio = log_probs_zero_count / log_probs_total if log_probs_total > 0 else 0.0
+                                            log_probs_mean = log_probs.mean().item() if log_probs.numel() > 0 else 0.0
+                                            log_probs_std = log_probs.std().item() if log_probs.numel() > 0 else 0.0
+                                            
+                                            if log_probs_zero_ratio > 0.9:  # More than 90% zeros
+                                                print(f"[Per-Turn Training] CRITICAL: log_probs has {log_probs_zero_ratio*100:.1f}% zeros! "
+                                                      f"shape={log_probs.shape}, mean={log_probs_mean:.6f}, std={log_probs_std:.6f}")
+                                            
+                                            print(f"[Per-Turn Training] Storing log_probs: shape={log_probs.shape}, "
+                                                  f"zero_ratio={log_probs_zero_ratio*100:.1f}%, mean={log_probs_mean:.6f}, std={log_probs_std:.6f}")
                                         
                                         final_gen_batch_output.batch['old_log_probs'] = log_probs
                                         

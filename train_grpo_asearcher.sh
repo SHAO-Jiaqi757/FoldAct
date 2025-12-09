@@ -184,6 +184,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.param_offload=false \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
     +actor_rollout_ref.actor.fsdp_config.grad_offload=true \
+    +actor_rollout_ref.actor.dtype=float16 \
     \
     `# ========== ROLLOUT CONFIGURATION (vLLM Sync) ==========` \
     actor_rollout_ref.rollout.dtype=float16 \
@@ -202,6 +203,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=8192 \
     \
     `# ========== REFERENCE MODEL CONFIGURATION ==========` \
+    +actor_rollout_ref.ref.dtype=float16 \
     +actor_rollout_ref.ref.model.path=$BASE_MODEL \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=true \
@@ -237,7 +239,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     algorithm.no_think_rl=false \
     \
     `# ========== RETRIEVER CONFIGURATION ==========` \
-    +retriever.url="http://10.201.8.114:8000/retrieve" \
+    +retriever.url="http://10.200.14.82:5000/retrieve" \
     retriever.num_workers=5 \
     retriever.rate_limit=120 \
     retriever.timeout=30 \

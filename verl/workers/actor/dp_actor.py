@@ -21,7 +21,7 @@ import itertools
 import logging
 import os
 from typing import Tuple
-
+from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -123,6 +123,11 @@ class DataParallelPPOActor(BasePPOActor):
             else verl_F.entropy_from_logits
         )
         self.device_name = get_device_name()
+        assert self.config.dtype in ["float16", "bfloat16", "float32"]
+        if self.config.dtype == "float16":
+            self.scalar = ShardedGradScaler(growth_interval=400)
+        else:
+            self.scalar = None
 
     def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -135,8 +140,9 @@ class DataParallelPPOActor(BasePPOActor):
         if "multi_modal_inputs" in micro_batch:
             for key in micro_batch["multi_modal_inputs"][0].keys():
                 multi_modal_inputs[key] = torch.cat([inputs[key] for inputs in micro_batch["multi_modal_inputs"]], dim=0)
-
-        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+        from verl.utils.torch_dtypes import PrecisionType
+        torch_dtype = PrecisionType.to_dtype(self.config.dtype)
+        with torch.autocast(device_type=self.device_name, dtype=torch_dtype):
             input_ids = micro_batch["input_ids"]
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch["attention_mask"]
@@ -346,6 +352,8 @@ class DataParallelPPOActor(BasePPOActor):
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
 
+        if self.scalar is not None:
+            self.scalar.unscale_(self.actor_optimizer)
         if isinstance(self.actor_module, FSDP):
             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
         elif isinstance(self.actor_module, FSDPModule):
@@ -354,11 +362,15 @@ class DataParallelPPOActor(BasePPOActor):
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
 
         # if grad_norm is not finite, skip the update
-        if not torch.isfinite(grad_norm):
-            print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
-            self.actor_optimizer.zero_grad()
-        else:
-            self.actor_optimizer.step()
+        if self.scalar is not None:
+            self.scalar.step(self.actor_optimizer)
+            self.scalar.update()
+        else: 
+            if not torch.isfinite(grad_norm):
+                print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
+                self.actor_optimizer.zero_grad()
+            else:
+                self.actor_optimizer.step()
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -509,15 +521,36 @@ class DataParallelPPOActor(BasePPOActor):
                             del data["per_turn_valid_mask"]
                     
                     # Align old_log_prob and advantages to current response_length
+                    old_log_prob_original_length = old_log_prob.size(1)
                     if old_log_prob.size(1) != response_length:
                         if old_log_prob.size(1) > response_length:
                             # Truncate if old_log_prob is longer
                             old_log_prob = old_log_prob[:, :response_length]
                         else:
                             # Pad with zeros if old_log_prob is shorter
-                            padding = torch.zeros(old_log_prob.size(0), response_length - old_log_prob.size(1), 
+                            pad_size = response_length - old_log_prob.size(1)
+                            logger.warning(
+                                f"[DP Actor] OLD_LOG_PROB ALIGNMENT: Padding old_log_prob from {old_log_prob.size(1)} to {response_length} "
+                                f"(+{pad_size} zeros, batch_idx={batch_idx}, epoch={epoch})"
+                            )
+                            padding = torch.zeros(old_log_prob.size(0), pad_size, 
                                                 dtype=old_log_prob.dtype, device=old_log_prob.device)
                             old_log_prob = torch.cat([old_log_prob, padding], dim=1)
+                            
+                            # CRITICAL: Update response_mask to mask out the padded positions
+                            # The padded positions should not contribute to loss
+                            if response_mask.size(1) == response_length:
+                                # Mask out the padded positions (set to 0)
+                                response_mask[:, old_log_prob_original_length:] = 0
+                                logger.warning(
+                                    f"[DP Actor] OLD_LOG_PROB ALIGNMENT: Updated response_mask to mask out {pad_size} padded positions"
+                                )
+                            else:
+                                logger.error(
+                                    f"[DP Actor] OLD_LOG_PROB ALIGNMENT: response_mask size mismatch! "
+                                    f"response_mask.shape={response_mask.shape}, response_length={response_length}"
+                                )
+                    
                     
                     if advantages.size(1) != response_length:
                         if advantages.size(1) > response_length:
@@ -577,7 +610,12 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
                     else:
                         loss = policy_loss / self.gradient_accumulation
-                    loss.backward()
+                    
+                    # Use scaler.scale() if using mixed precision training
+                    if self.scalar is not None:
+                        self.scalar.scale(loss).backward()
+                    else:
+                        loss.backward()
 
                     data = {
                         "actor/pg_loss": pg_loss.detach().item(),

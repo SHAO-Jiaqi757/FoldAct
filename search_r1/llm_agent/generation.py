@@ -536,7 +536,7 @@ class LLMGenerationManager:
         padded_output.batch = trimmed_batch
         return padded_output
     
-    def run_llm_loop(self, gen_batch, initial_input_ids: torch.Tensor) -> Tuple[Dict, Dict]:
+    def run_llm_loop(self, gen_batch, initial_input_ids: torch.Tensor) -> DataProto:
         """Run main LLM generation loop with optional sliding window context management."""
         
         original_left_side = {'input_ids': initial_input_ids[:, -self.config.max_start_length:]}
@@ -620,16 +620,39 @@ class LLMGenerationManager:
             # ========== SAVE PER-TURN CONTEXT (BEFORE GENERATION) ==========
             # This is the context that the model will actually see for this turn
             # We save it BEFORE generation to ensure we capture the exact state
-            current_context_for_turn = rollings.batch['input_ids'].clone()
-            current_attention_mask_for_turn = rollings.batch.get('attention_mask', 
-                self.tensor_fn.create_attention_mask(current_context_for_turn)).clone()
             
-            # Save context for each active trajectory (MEMORY OPTIMIZED)
+            # Save context for each active trajectory (ROBUST SELF-CONTAINED DATA)
             for i in range(batch_size):
                 if active_mask[i]:
-                    # Store reference to original tensor instead of cloning
-                    # This reduces memory overhead significantly
-                    # CRITICAL FIX: Save context_start_position for correct position_ids in training
+                    # ROOT CAUSE ANALYSIS: An active trajectory's mask might still be all padding.
+                    # We must validate the content of the mask AND input_ids BEFORE saving the context.
+                    current_mask = rollings.batch['attention_mask'][i]
+                    current_input_ids = rollings.batch['input_ids'][i]
+                    mask_sum = current_mask.sum().item()
+                    
+                    # Check if input_ids contains real tokens (not just padding)
+                    # Exclude both 0 and padding token (151643)
+                    real_tokens = ((current_input_ids != 0) & (current_input_ids != 151643)).sum().item()
+                    padding_tokens = (current_input_ids == 151643).sum().item()
+
+                    if mask_sum == 0:
+                        logger.warning(
+                            f"[Per-Turn Context] Turn {step}, Traj {i}: SKIPPING context save. "
+                            f"Trajectory is marked 'active', but its attention mask sum is 0. "
+                            f"This is the source of downstream errors."
+                        )
+                        continue  # Do not save this invalid context
+                    
+                    # CRITICAL: Also check if input_ids contains only padding tokens
+                    if real_tokens == 0:
+                        logger.warning(
+                            f"[Per-Turn Context] Turn {step}, Traj {i}: SKIPPING context save. "
+                            f"input_ids contains NO real tokens (only padding). "
+                            f"real_tokens=0, padding_tokens={padding_tokens}, mask_sum={mask_sum}. "
+                            f"This will cause zero log_probs downstream."
+                        )
+                        continue  # Do not save this invalid context
+
                     # Get the starting position_id from the current position_ids
                     current_position_ids = rollings.batch.get('position_ids', None)
                     if current_position_ids is not None:
@@ -641,25 +664,35 @@ class LLMGenerationManager:
                             # Standard case: (batch_size, seq_len)
                             context_start_position = current_position_ids[i, 0].item() if current_position_ids.size(1) > 0 else 0
                     else:
-                        # Fallback: compute from attention_mask (cumulative sum)
                         context_start_position = 0
                         logger.warning(f"[Per-Turn Context] Turn {step}: position_ids not found, using context_start_position=0")
                     
+                    # CRITICAL REFACTOR: Clone individual tensors instead of referencing the whole batch
+                    input_ids_clone = rollings.batch['input_ids'][i].clone()
+                    attention_mask_clone = current_mask.clone()
+                    
+                    # INTEGRITY CHECK: "Timestamp" the mask sum at the moment of creation
+                    mask_sum_at_creation = mask_sum # Use the sum we already computed
+                    
                     per_turn_contexts[i].append({
                         'turn_id': step,
-                        'input_ids_ref': current_context_for_turn,  # Reference, not clone
-                        'attention_mask_ref': current_attention_mask_for_turn,  # Reference, not clone
-                        'item_idx': i,  # Index within the batch
-                        'response_start_idx': current_context_for_turn[i].size(0),  # Where response will start
-                        'context_length': current_attention_mask_for_turn[i].sum().item(),
-                        'context_start_position': context_start_position  # CRITICAL: Starting position_id for this context
+                        'input_ids': input_ids_clone,  # Self-contained tensor
+                        'attention_mask': attention_mask_clone,  # Self-contained tensor
+                        'context_length': mask_sum, # Use pre-computed sum
+                        'context_start_position': context_start_position,
+                        'mask_sum_at_creation': mask_sum_at_creation # Store for downstream verification
                     })
                     
-                    if step == 0 and i < 3:  # Log first few for debugging
-                        logger.info(f"[Per-Turn Context] Turn {step}, Traj {i}: context_start_position={context_start_position}, context_length={current_attention_mask_for_turn[i].sum().item()}")
+                    # DEBUGGING: Log the shape of the saved context for the first few turns/trajectories
+                    if step < 2 and i < 3:
+                        logger.warning(
+                            f"[Per-Turn Context DEBUG] Turn {step}, Traj {i}: Saved self-contained context. "
+                            f"input_ids shape: {input_ids_clone.shape}, "
+                            f"attention_mask sum: {attention_mask_clone.sum().item()}"
+                        )
             
             if step == 0 or step % 3 == 0:  # Log every 3 turns
-                avg_context_len = sum(current_attention_mask_for_turn[i].sum().item() 
+                avg_context_len = sum(rollings.batch['attention_mask'][i].sum().item() 
                                      for i in range(batch_size) if active_mask[i]) / max(active_mask.sum().item(), 1)
                 logger.info(f"[Per-Turn Context] Turn {step}: Saved context for {active_mask.sum().item()} trajectories (avg len: {avg_context_len:.0f})")
                 
@@ -684,8 +717,8 @@ class LLMGenerationManager:
                     turn_ctx = per_turn_contexts[i][-1]
                     turn_ctx['response'] = responses_ids[i].clone()
                     turn_ctx['response_length'] = self.tensor_fn.create_attention_mask(responses_ids[i]).sum().item()
-                    # Assertions to ensure integrity of per-turn saved data
-                    assert 'input_ids_ref' in turn_ctx and 'attention_mask_ref' in turn_ctx, "Per-turn context references missing"
+                    # Assertions to ensure integrity of per-turn saved data (UPDATED FOR SELF-CONTAINED DATA)
+                    assert 'input_ids' in turn_ctx and 'attention_mask' in turn_ctx, "Per-turn context (self-contained) missing"
                     assert isinstance(turn_ctx['response_length'], (int, float)), "response_length must be numeric"
                
             # Execute in environment and process observations
@@ -1012,6 +1045,16 @@ class LLMGenerationManager:
         total_turns = sum(len(contexts) for contexts in per_turn_contexts)
         logger.info(f"[Per-Turn Context] Saved {total_turns} turn contexts across {batch_size} trajectories")
         
+        # HYPOTHESIS VERIFICATION: Add a "fingerprint" of the attention_mask sums BEFORE serialization
+        try:
+            mask_sums_fingerprint = []
+            for traj_contexts in per_turn_contexts:
+                traj_sums = [turn['attention_mask'].sum().item() for turn in traj_contexts]
+                mask_sums_fingerprint.append(traj_sums)
+            meta_info['mask_sums_fingerprint'] = mask_sums_fingerprint
+            logger.critical("[VERIFICATION] Added 'mask_sums_fingerprint' to meta_info for serialization check.")
+        except Exception as e:
+            logger.error(f"[VERIFICATION] Failed to create mask_sums_fingerprint: {e}")
 
         
         # Context Length Monitoring: Add statistics for WandB tracking
@@ -1083,7 +1126,14 @@ class LLMGenerationManager:
         
         print("ACTIVE_TRAJ_NUM:", active_num_list)
         
-        return self._compose_final_output(original_left_side, original_right_side, meta_info)
+        # Compose final output using _compose_final_output
+        # The fingerprint has been added to meta_info above
+        final_output = self._compose_final_output(
+            left_side=original_left_side,
+            right_side=original_right_side,
+            meta_info=meta_info
+        )
+        return final_output
 
     def _build_action_types(self,
                             responses_ids: torch.Tensor,
@@ -1269,6 +1319,15 @@ class LLMGenerationManager:
             )
             total_contexts = sum(len(contexts) for contexts in meta_info['per_turn_contexts'])
             logger.info(f"[Per-Turn Context] Added {total_contexts} turn contexts to non_tensor_batch for {len(meta_info['per_turn_contexts'])} trajectories")
+        
+        # HYPOTHESIS VERIFICATION: Add mask_sums_fingerprint to non_tensor_batch for verification
+        if 'mask_sums_fingerprint' in meta_info:
+            import numpy as np
+            final_output.non_tensor_batch['mask_sums_fingerprint'] = np.array(
+                meta_info['mask_sums_fingerprint'],
+                dtype=object
+            )
+            logger.critical("[VERIFICATION] Added 'mask_sums_fingerprint' to non_tensor_batch for serialization check.")
         
         return final_output
 

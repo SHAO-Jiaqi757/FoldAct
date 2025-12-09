@@ -201,8 +201,9 @@ class ActorRolloutRefWorker(Worker):
         self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code)
 
         torch_dtype = fsdp_config.get("model_dtype", None)
+        vllm_dtype = PrecisionType.to_dtype(self.config.rollout.dtype)
         if torch_dtype is None:
-            torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
+            torch_dtype = torch.float32 if self._is_actor else vllm_dtype
         else:
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
@@ -246,7 +247,7 @@ class ActorRolloutRefWorker(Worker):
             if use_liger:
                 from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
 
-                _apply_liger_kernel_to_instance(model=actor_module)
+                _apply_liger_kernel_to_instance(model=actor_module, fused_linear_cross_entropy=False)
 
             apply_monkey_patch(
                 model=actor_module,
@@ -282,11 +283,11 @@ class ActorRolloutRefWorker(Worker):
         # We wrap FSDP for rollout as well
         mixed_precision_config = fsdp_config.get("mixed_precision", None)
         if mixed_precision_config is not None:
-            param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "fp16"))
+            param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "bf16"))
             reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get("reduce_dtype", "fp32"))
             buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get("buffer_dtype", "fp32"))
         else:
-            param_dtype = torch.float16
+            param_dtype = PrecisionType.to_dtype(self.config.actor.get("dtype", "float16"))
             reduce_dtype = torch.float32
             buffer_dtype = torch.float32
 
@@ -354,11 +355,16 @@ class ActorRolloutRefWorker(Worker):
         if role == "actor" and optim_config is not None:
             from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
+            betas = optim_config.get("betas", (0.9, 0.95))
+            eps = optim_config.get("eps", 1e-15)
+            weight_decay = optim_config.get("weight_decay", 1e-2)
+
             actor_optimizer = optim.AdamW(
                 actor_module_fsdp.parameters(),
                 lr=optim_config.lr,
-                betas=optim_config.get("betas", (0.9, 0.999)),
-                weight_decay=optim_config.get("weight_decay", 1e-2),
+                betas=betas,
+                eps=eps,
+                weight_decay=weight_decay,
             )
 
             total_steps = optim_config.get("total_training_steps", 0)
@@ -592,6 +598,11 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
+        output = self._update_actor(data)
+        get_torch_device().empty_cache()
+        return output
+        
+    def _update_actor(self, data: DataProto):
         log_gpu_memory_usage("update_actor started", logger=logger)
         # Support all hardwares
         data = data.to(get_torch_device().current_device())
@@ -936,11 +947,11 @@ class CriticWorker(Worker):
         fsdp_config = self.config.model.fsdp_config
         mixed_precision_config = fsdp_config.get("mixed_precision", None)
         if mixed_precision_config is not None:
-            param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "fp16"))
+            param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "bf16"))
             reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get("reduce_dtype", "fp32"))
             buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get("buffer_dtype", "fp32"))
         else:
-            param_dtype = torch.float16
+            param_dtype = torch.bfloat16
             reduce_dtype = torch.float32
             buffer_dtype = torch.float32
 
