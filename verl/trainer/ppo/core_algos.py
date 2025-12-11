@@ -19,11 +19,14 @@ implement PPO
 """
 
 from collections import defaultdict
+import logging
 
 import numpy as np
 import torch
 
 import verl.utils.torch_functional as verl_F
+
+logger = logging.getLogger(__name__)
 
 
 class AdaptiveKLController:
@@ -451,6 +454,8 @@ def compute_policy_loss(
     cliprange_high: float | None = None,
     clip_ratio_c: float | None = None,
     loss_agg_mode: str = "token-mean",
+    enable_tracing: bool = False,
+    trace_step: int = None,
 ):
     """Compute PPO policy loss with optional asymmetric clipping and dual-clip.
 
@@ -476,10 +481,55 @@ def compute_policy_loss(
     mask = response_mask if response_mask is not None else eos_mask
     assert mask is not None, "Either response_mask or eos_mask must be provided"
 
+    # CRITICAL FIX: Remove positions where old_log_prob=0 (or close to 0) from the mask
+    # These are padding positions from per-turn training or other sources
+    # Including them in loss calculation causes ratio explosion
+    # When old_log_prob=0, ratio=exp(new_log_prob-0)=exp(new_log_prob) can be huge (e.g., exp(10)=22026)
+    is_invalid = (old_log_prob == 0.0) | (old_log_prob > -1e-6)  # Also catch very small negative values
+    original_mask_count = mask.sum().item()
+    mask = mask * (~is_invalid).float()
+    filtered_mask_count = mask.sum().item()
+
+    if enable_tracing and (original_mask_count - filtered_mask_count) > 0:
+        logger.warning(
+            f"[PG_LOSS_TRACE] step={trace_step}: Filtered out {original_mask_count - filtered_mask_count}/{original_mask_count} "
+            f"({(original_mask_count - filtered_mask_count)*100/original_mask_count:.1f}%) positions with old_log_prob=0 from the mask"
+        )
+
     # Ratios and approximate KL
     negative_approx_kl = log_prob - old_log_prob
-    ratio = torch.exp(negative_approx_kl)
-    ppo_kl = verl_F.masked_mean(-negative_approx_kl, mask)
+    
+    # CRITICAL FIX: Prevent ratio explosion from padding positions
+    # When old_log_prob is 0 (padding), log_prob can be much larger, causing ratio = exp(kl) to explode
+    # Strategy 1: Clamp negative_approx_kl to reasonable range
+    # Previous: exp(10) ≈ 22026 (too large, causes huge loss)
+    # New: exp(3) ≈ 20 (more conservative, prevents extreme updates)
+    negative_approx_kl_clamped = torch.clamp(negative_approx_kl, min=-3.0, max=3.0)
+    
+    # Strategy 2: For padding positions (old_log_prob == 0), set ratio to 1.0 (no policy change)
+    # This is safer than relying on mask alone, as mask might not catch all padding cases
+    is_padding = (old_log_prob == 0.0)
+    ratio = torch.exp(negative_approx_kl_clamped)
+    ratio = torch.where(is_padding, torch.ones_like(ratio), ratio)
+    
+    # Use original negative_approx_kl for KL computation (for monitoring)
+    # But mask out padding positions for accurate KL calculation
+    negative_approx_kl_for_kl = torch.where(is_padding, torch.zeros_like(negative_approx_kl), negative_approx_kl)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl_for_kl, mask)
+
+    # Tracing: log key diagnostics only when enabled
+    if enable_tracing:
+        # Check for problematic cases (zero old_log_prob in valid positions)
+        zero_old_log_prob_count = ((old_log_prob == 0) & mask.bool()).sum().item()
+        total_valid = mask.sum().item()
+        if zero_old_log_prob_count > 0:
+            logger.warning(f"[PG_LOSS_TRACE] step={trace_step}: {zero_old_log_prob_count}/{total_valid} valid tokens have old_log_prob=0")
+        
+        # Check ratio statistics after clamping (only if suspicious)
+        ratio_max = ratio[mask.bool()].max().item() if mask.sum() > 0 else 0.0
+        ratio_min = ratio[mask.bool()].min().item() if mask.sum() > 0 else 0.0
+        if ratio_max > 100 or ratio_min < 0.01:
+            logger.warning(f"[PG_LOSS_TRACE] step={trace_step}: ratio range=[{ratio_min:.4f}, {ratio_max:.4f}], ppo_kl={ppo_kl.item():.4f}")
 
     # Clipping ranges (asymmetric if provided)
     low = 1.0 - (cliprange_low if cliprange_low is not None else cliprange)
@@ -506,6 +556,9 @@ def compute_policy_loss(
     # Aggregations
     pg_loss = agg_loss(loss_mat=final_loss_mat, loss_mask=mask, loss_agg_mode=loss_agg_mode)
     pg_clipfrac = verl_F.masked_mean((loss2 > loss1).to(base_loss.dtype), mask)
+
+    if enable_tracing and (not torch.isfinite(pg_loss) or abs(pg_loss.item()) > 1000):
+        logger.warning(f"[PG_LOSS_TRACE] step={trace_step}: pg_loss={pg_loss.item():.6f}, pg_clipfrac={pg_clipfrac.item():.4f}, pg_clipfrac_lower={pg_clipfrac_lower.item():.4f}")
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 

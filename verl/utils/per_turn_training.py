@@ -267,7 +267,10 @@ def _map_results_to_trajectories(
     ]
 
     # Use pad_sequence again for robust final padding. It now receives a list of 1D tensors.
-    final_log_probs = pad_sequence(per_traj_log_probs, batch_first=True, padding_value=0.0)
+    # CRITICAL FIX: Use -1e8 instead of 0.0 as padding value
+    # This prevents confusion between "real log_prob=0" and "padding"
+    # When old_log_prob=0, ratio=exp(new_log_prob) can explode (e.g., exp(10)=22026)
+    final_log_probs = pad_sequence(per_traj_log_probs, batch_first=True, padding_value=-1e8)
 
     return final_log_probs
 

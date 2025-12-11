@@ -21,11 +21,14 @@ import itertools
 import logging
 import os
 from typing import Tuple
+from contextlib import nullcontext
+import numpy as np
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
+from verl.utils import torch_dtypes
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, kl_penalty
@@ -136,6 +139,38 @@ class DataParallelPPOActor(BasePPOActor):
             log_probs: # (bs, response_len)
         """
         response_length = micro_batch["responses"].size(-1)
+        
+        # DEBUG: Log input shapes and response_length
+        input_ids = micro_batch["input_ids"]
+        responses = micro_batch["responses"]
+        attention_mask = micro_batch["attention_mask"]
+        
+        if logger.isEnabledFor(logging.WARNING):
+            # Log for first micro_batch only (to avoid spam)
+            if not hasattr(self, '_debug_logged_forward'):
+                self._debug_logged_forward = True
+                logger.warning(
+                    f"[DP Actor] DEBUG _forward_micro_batch: "
+                    f"input_ids.shape={input_ids.shape}, "
+                    f"responses.shape={responses.shape}, "
+                    f"response_length={response_length}, "
+                    f"attention_mask non-zero={(attention_mask.sum(dim=1) > 0).sum().item()}/{input_ids.size(0)}"
+                )
+                
+                # Check alignment for first sample
+                if input_ids.size(0) > 0:
+                    seq_len = input_ids.size(1)
+                    resp_from_input = input_ids[0, -response_length:]
+                    resp_given = responses[0]
+                    match = torch.equal(resp_from_input, resp_given)
+                    resp_from_input_non_zero = (resp_from_input != 0).sum().item()
+                    resp_given_non_zero = (resp_given != 0).sum().item()
+                    logger.warning(
+                        f"[DP Actor] DEBUG Alignment check (sample 0): "
+                        f"input_ids[-{response_length}:] vs responses match={match}, "
+                        f"resp_from_input non-zero={resp_from_input_non_zero}/{response_length}, "
+                        f"resp_given non-zero={resp_given_non_zero}/{response_length}"
+                    )
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch:
             for key in micro_batch["multi_modal_inputs"][0].keys():
@@ -146,6 +181,42 @@ class DataParallelPPOActor(BasePPOActor):
             input_ids = micro_batch["input_ids"]
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch["attention_mask"]
+
+            # DIAGNOSIS: Check for all-zero attention masks
+            if logger.isEnabledFor(logging.WARNING):
+                zero_mask_rows = (attention_mask.sum(dim=1) == 0)
+                if zero_mask_rows.any():
+                    num_zero_rows = zero_mask_rows.sum().item()
+                    logger.error(
+                        f"[DP Actor] CRITICAL: Found {num_zero_rows}/{batch_size} rows with all-zero attention_mask in micro_batch! "
+                        f"This will result in zero log_probs."
+                    )
+                    
+                    # Show which rows and their input_ids/responses
+                    zero_row_indices = zero_mask_rows.nonzero(as_tuple=True)[0]
+                    logger.error(f"[DP Actor] Zero attention_mask row indices: {zero_row_indices.tolist()}")
+                    
+                    for idx in zero_row_indices[:3]:  # Show first 3
+                        row_idx = idx.item()
+                        input_ids_nonzero = (input_ids[row_idx] != 0).sum().item()
+                        resp_nonzero = (responses[row_idx] != 0).sum().item()
+                        logger.error(f"[DP Actor] Row {row_idx}: input_ids non-zero={input_ids_nonzero}/{input_ids.shape[1]}, "
+                                   f"responses non-zero={resp_nonzero}/{responses.shape[1]}")
+                        
+                        if input_ids_nonzero > 0:
+                            # Show actual token IDs
+                            nonzero_input_ids = input_ids[row_idx][input_ids[row_idx] != 0]
+                            logger.error(f"[DP Actor] Row {row_idx} input_ids: {nonzero_input_ids.tolist()}")
+                            logger.error(f"[DP Actor] Row {row_idx} input_ids: {nonzero_input_ids.tolist()}")
+                        else:
+                            logger.error(f"[DP Actor] Row {row_idx} input_ids is ENTIRELY ZERO!")
+                        
+                        if resp_nonzero > 0:
+                            nonzero_resp = responses[row_idx][responses[row_idx] != 0]
+                            logger.error(f"[DP Actor] Row {row_idx} responses: {nonzero_resp.tolist()}")
+                        else:
+                            logger.error(f"[DP Actor] Row {row_idx} responses is ENTIRELY ZERO!")
+
             position_ids = micro_batch["position_ids"]
             entropy = None
             if position_ids.dim() == 3:  # qwen2vl mrope
@@ -346,6 +417,101 @@ class DataParallelPPOActor(BasePPOActor):
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     if calculate_entropy:
                         entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+            
+            # DEBUG: Check log_probs output
+            if logger.isEnabledFor(logging.WARNING):
+                if not hasattr(self, '_debug_logged_logprobs'):
+                    self._debug_logged_logprobs = True
+                    log_probs_zero_count = (log_probs == 0.0).sum().item()
+                    log_probs_total = log_probs.numel()
+                    log_probs_zero_ratio = log_probs_zero_count / log_probs_total if log_probs_total > 0 else 0.0
+                    
+                    # Distinguish between padding zeros and valid position zeros
+                    # Use attention_mask to identify valid positions (non-padding)
+                    # Note: attention_mask shape is (batch_size, seq_len), log_probs shape is (batch_size, response_length)
+                    # We need to extract the response portion from attention_mask
+                    full_attention_mask = micro_batch.get("attention_mask", None)
+                    if full_attention_mask is not None:
+                        # Extract response portion: last response_length positions
+                        if full_attention_mask.size(1) >= response_length:
+                            response_mask = full_attention_mask[:, -response_length:]
+                            if response_mask.shape == log_probs.shape:
+                                valid_positions = response_mask.bool()
+                                valid_zero_count = ((log_probs == 0.0) & valid_positions).sum().item()
+                                valid_total = valid_positions.sum().item()
+                                valid_zero_ratio = valid_zero_count / valid_total if valid_total > 0 else 0.0
+                                padding_zero_count = ((log_probs == 0.0) & ~valid_positions).sum().item()
+                                padding_total = (~valid_positions).sum().item()
+                                
+                                logger.warning(
+                                    f"[DP Actor] DEBUG log_probs output: "
+                                    f"shape={log_probs.shape}, "
+                                    f"total_zero={log_probs_zero_count}/{log_probs_total} ({log_probs_zero_ratio*100:.1f}%), "
+                                    f"valid_zero={valid_zero_count}/{valid_total} ({valid_zero_ratio*100:.1f}%), "
+                                    f"padding_zero={padding_zero_count}/{padding_total}, "
+                                    f"mean={log_probs.mean().item():.6f}, std={log_probs.std().item():.6f}"
+                                )
+                            else:
+                                logger.warning(
+                                    f"[DP Actor] DEBUG log_probs output: "
+                                    f"shape={log_probs.shape}, "
+                                    f"zero_count={log_probs_zero_count}/{log_probs_total} ({log_probs_zero_ratio*100:.1f}%), "
+                                    f"mean={log_probs.mean().item():.6f}, std={log_probs.std().item():.6f} "
+                                    f"(response_mask shape mismatch: {response_mask.shape} vs {log_probs.shape})"
+                                )
+                        else:
+                            logger.warning(
+                                f"[DP Actor] DEBUG log_probs output: "
+                                f"shape={log_probs.shape}, "
+                                f"zero_count={log_probs_zero_count}/{log_probs_total} ({log_probs_zero_ratio*100:.1f}%), "
+                                f"mean={log_probs.mean().item():.6f}, std={log_probs.std().item():.6f} "
+                                f"(attention_mask seq_len={full_attention_mask.size(1)} < response_length={response_length})"
+                            )
+                    else:
+                        logger.warning(
+                            f"[DP Actor] DEBUG log_probs output: "
+                            f"shape={log_probs.shape}, "
+                            f"zero_count={log_probs_zero_count}/{log_probs_total} ({log_probs_zero_ratio*100:.1f}%), "
+                            f"mean={log_probs.mean().item():.6f}, std={log_probs.std().item():.6f} "
+                            f"(no attention_mask in micro_batch)"
+                        )
+                    
+                    # Check first sample
+                    if log_probs.size(0) > 0:
+                        sample_log_prob = log_probs[0]
+                        sample_zero_count = (sample_log_prob == 0.0).sum().item()
+                        sample_zero_ratio = sample_zero_count / sample_log_prob.numel()
+                        
+                        # Check valid positions for first sample
+                        if full_attention_mask is not None and full_attention_mask.size(1) >= response_length:
+                            sample_response_mask = full_attention_mask[0, -response_length:]
+                            if sample_response_mask.shape == sample_log_prob.shape:
+                                sample_valid_positions = sample_response_mask.bool()
+                                sample_valid_zero_count = ((sample_log_prob == 0.0) & sample_valid_positions).sum().item()
+                                sample_valid_total = sample_valid_positions.sum().item()
+                                sample_valid_zero_ratio = sample_valid_zero_count / sample_valid_total if sample_valid_total > 0 else 0.0
+                                
+                                logger.warning(
+                                    f"[DP Actor] DEBUG Sample 0 log_prob: "
+                                    f"total_zero_ratio={sample_zero_ratio*100:.1f}%, "
+                                    f"valid_zero_ratio={sample_valid_zero_ratio*100:.1f}%, "
+                                    f"mean={sample_log_prob.mean().item():.6f}, "
+                                    f"min={sample_log_prob.min().item():.6f}, max={sample_log_prob.max().item():.6f}"
+                                )
+                            else:
+                                logger.warning(
+                                    f"[DP Actor] DEBUG Sample 0 log_prob: "
+                                    f"zero_ratio={sample_zero_ratio*100:.1f}%, "
+                                    f"mean={sample_log_prob.mean().item():.6f}, "
+                                    f"min={sample_log_prob.min().item():.6f}, max={sample_log_prob.max().item():.6f}"
+                                )
+                        else:
+                            logger.warning(
+                                f"[DP Actor] DEBUG Sample 0 log_prob: "
+                                f"zero_ratio={sample_zero_ratio*100:.1f}%, "
+                                f"mean={sample_log_prob.mean().item():.6f}, "
+                                f"min={sample_log_prob.min().item():.6f}, max={sample_log_prob.max().item():.6f}"
+                            )
 
             return entropy, log_probs
 
@@ -502,6 +668,15 @@ class DataParallelPPOActor(BasePPOActor):
                         response_mask = attention_mask[:, -response_length:]
 
                     old_log_prob = data["old_log_probs"]
+                    
+                    # DIAGNOSIS: Only log if there's a mismatch (check after actual extraction)
+                    if logger.isEnabledFor(logging.WARNING):
+                        old_log_prob_shape = old_log_prob.shape
+                        if len(old_log_prob_shape) == 0 or (len(old_log_prob_shape) == 2 and old_log_prob_shape[1] != response_length):
+                            logger.warning(
+                                f"[DP Actor] RESPONSE LENGTH MISMATCH: response_length={response_length}, "
+                                f"old_log_prob_shape={old_log_prob_shape}, responses_shape={responses.shape}"
+                            )
                     advantages = data["advantages"]
                     
                     # CRITICAL FIX: Apply valid_mask if available (from per-turn training)
@@ -525,7 +700,15 @@ class DataParallelPPOActor(BasePPOActor):
                     if old_log_prob.size(1) != response_length:
                         if old_log_prob.size(1) > response_length:
                             # Truncate if old_log_prob is longer
+                            # CRITICAL: This happens when per-turn training computed old_log_prob for all turns
+                            # but training uses compressed responses (max_response_length)
+                            truncate_size = old_log_prob.size(1) - response_length
+                            logger.warning(
+                                f"[DP Actor] OLD_LOG_PROB ALIGNMENT: Truncating old_log_prob from {old_log_prob.size(1)} to {response_length} "
+                                f"(removing {truncate_size} tokens, batch_idx={batch_idx}, epoch={epoch})"
+                            )
                             old_log_prob = old_log_prob[:, :response_length]
+                            # Note: response_mask is already aligned to response_length, no need to update
                         else:
                             # Pad with zeros if old_log_prob is shorter
                             pad_size = response_length - old_log_prob.size(1)
@@ -551,6 +734,17 @@ class DataParallelPPOActor(BasePPOActor):
                                     f"response_mask.shape={response_mask.shape}, response_length={response_length}"
                                 )
                     
+                    # Diagnostic: Only log if there's a critical issue (>90% zeros in valid positions)
+                    if logger.isEnabledFor(logging.ERROR):
+                        valid_zero_count = ((old_log_prob == 0.0) & (response_mask.bool())).sum().item()
+                        valid_total = response_mask.sum().item()
+                        valid_zero_ratio = valid_zero_count / valid_total if valid_total > 0 else 0.0
+                        
+                        if valid_zero_ratio > 0.9:
+                            logger.error(
+                                f"[DP Actor] CRITICAL: {valid_zero_ratio*100:.1f}% of VALID positions have zero old_log_prob! "
+                                f"original_length={old_log_prob_original_length}, response_length={response_length}"
+                            )
                     
                     if advantages.size(1) != response_length:
                         if advantages.size(1) > response_length:
@@ -575,6 +769,14 @@ class DataParallelPPOActor(BasePPOActor):
                         calculate_entropy = True
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
 
+                    # Enable tracing if enable_debug_logs is set (check config, meta_info, or env var)
+                    enable_tracing = (
+                        self.config.get("enable_debug_logs", False) or
+                        data.meta_info.get("enable_debug_logs", False) if hasattr(data, 'meta_info') else False or
+                        os.getenv("VERL_ENABLE_PG_TRACE", "false").lower() == "true"
+                    )
+                    trace_step = epoch * len(dataloader) + batch_idx
+                    
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
@@ -585,7 +787,28 @@ class DataParallelPPOActor(BasePPOActor):
                         cliprange_high=clip_ratio_high,
                         clip_ratio_c=clip_ratio_c,
                         loss_agg_mode=loss_agg_mode,
+                        enable_tracing=enable_tracing,
+                        trace_step=trace_step,
                     )
+                    
+                    # Auto-enable tracing if pg_loss is suspiciously large (even if not explicitly enabled)
+                    pg_loss_val = pg_loss.detach().item()
+                    if not enable_tracing and (abs(pg_loss_val) > 1000 or not torch.isfinite(pg_loss)):
+                        logger.warning(f"[PG_LOSS_TRACE] Auto-enabling tracing due to large pg_loss: {pg_loss_val:.6f}")
+                        # Recompute with tracing enabled
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            cliprange=clip_ratio,
+                            cliprange_low=clip_ratio_low,
+                            cliprange_high=clip_ratio_high,
+                            clip_ratio_c=clip_ratio_c,
+                            loss_agg_mode=loss_agg_mode,
+                            enable_tracing=True,
+                            trace_step=trace_step,
+                        )
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
