@@ -32,7 +32,9 @@ export TEST_DATA_DIR='/datapool/data/ASearcher'
 WAND_PROJECT='search-agent-Context-Monitoring'
 
 # Ray Configuration
-export RAY_TMPDIR=/mnt/ray_tmp
+# Use user-writable directory instead of /mnt/ray_tmp (permission issues)
+RAY_TMPDIR=/mnt/ray_tmp
+export RAY_TMPDIR
 
 ################################################################################
 # MODEL CONFIGURATION - Initialize from Checkpoint
@@ -68,7 +70,7 @@ echo "[INFO] Checkpoint contents:"
 ls -lh "$CHECKPOINT_DIR" | head -10
 
 # Experiment Name
-export EXPERIMENT_NAME=summary-reward-agent-gae-qwen2.5-3b-it-context-monitoring
+export EXPERIMENT_NAME=per-turn-only-agent-gae-qwen2.5-3b-it-context-monitoring
 
 ################################################################################
 # vLLM Configuration
@@ -168,13 +170,23 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.trust_remote_code=true \
     \
     `# ========== ACTOR OPTIMIZATION ==========` \
-    actor_rollout_ref.actor.optim.lr=1e-6 \
+    `# Reduced LR for stability (was 1e-6, now 3e-7 to prevent pg_loss explosion)` \
+    actor_rollout_ref.actor.optim.lr=3e-7 \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.285 \
+    `# Stronger gradient clipping to prevent NaN (was default 1.0, now 0.5)` \
+    actor_rollout_ref.actor.grad_clip=0.5 \
     actor_rollout_ref.actor.use_torch_compile=false \
     actor_rollout_ref.actor.use_kl_loss=true \
-    actor_rollout_ref.actor.kl_loss_coef=0.001 \
+    `# Increased KL coef for stability (was 0.001, now 0.01 to stabilize ppo_kl)` \
+    actor_rollout_ref.actor.kl_loss_coef=0.01 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.state_masking=true \
+    `# Tighter clip ratios to prevent large policy updates` \
+    actor_rollout_ref.actor.clip_ratio=0.2 \
+    actor_rollout_ref.actor.clip_ratio_low=0.2 \
+    actor_rollout_ref.actor.clip_ratio_high=0.2 \
+    `# Increased dual-clip lower bound for negative advantages (was 3.0, now 5.0)` \
+    actor_rollout_ref.actor.clip_ratio_c=5.0 \
     \
     `# ========== ACTOR FSDP & BATCH SIZE ==========` \
     actor_rollout_ref.actor.ppo_mini_batch_size=128 \
@@ -187,12 +199,12 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.actor.dtype=float16 \
     \
     `# ========== ROLLOUT CONFIGURATION (vLLM Sync) ==========` \
-    actor_rollout_ref.rollout.dtype=float16 \
+    ++actor_rollout_ref.rollout.dtype=float16 \
     actor_rollout_ref.rollout.temperature=0.7 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.max_model_len=8192 \
     actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
     actor_rollout_ref.rollout.enable_chunked_prefill=true \
     actor_rollout_ref.rollout.n_agent=1 \
     env.rollout.n=6 \
@@ -203,8 +215,8 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=8192 \
     \
     `# ========== REFERENCE MODEL CONFIGURATION ==========` \
-    +actor_rollout_ref.ref.dtype=float16 \
     +actor_rollout_ref.ref.model.path=$BASE_MODEL \
+    +actor_rollout_ref.ref.dtype=float16 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=true \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=8192 \
@@ -225,6 +237,8 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.resume_mode=enable \
     +trainer.val_only=false \
     ++trainer.val_before_train=false \
+    +trainer.enable_experiment_logging=true \
+    +trainer.experiment_log_dir=logs/paper_experiments \
     trainer.default_hdfs_dir=null \
     trainer.default_local_dir=verl_checkpoints/$EXPERIMENT_NAME \
     trainer.max_actor_ckpt_to_keep=2 \
