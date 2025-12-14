@@ -200,14 +200,6 @@ class HallucinationPenaltyRewardManager:
         
         logger.info(f"Component scores - Answer: {answer_quality_score:.3f}")
         
-        # Log scoring results to file
-        self.file_logger.info(f"Component scores:")
-        self.file_logger.info(f"  Answer quality: {answer_quality_score:.3f}")
-        
-        
-        logger.info(f"Hallucination analysis - Information penalty: {hallucination_analysis['information_penalty']:.3f}, "
-                   f"Information summary bonus: {hallucination_analysis['information_summary_bonus']:.3f}")
-        
         # Log penalty information to file
         self.file_logger.info(f"Penalty analysis:")
         self.file_logger.info(f"  Information penalty: {hallucination_analysis['information_penalty']:.3f}")
@@ -507,9 +499,6 @@ class HallucinationPenaltyRewardManager:
                                         self.config["min_reward_value"], 
                                         self.config["max_reward_value"])
             
-            # Log reward tensor statistics
-            self._log_reward_statistics(reward_tensor)
-            
             # Log reward tensor details to file
             self._log_reward_tensor_details(reward_tensor, feedback)
             
@@ -695,19 +684,6 @@ class HallucinationPenaltyRewardManager:
             smoothed[i] = reward_tensor[start_idx:end_idx].mean()
         
         return smoothed
-    
-    def _log_reward_statistics(self, reward_tensor: torch.Tensor):
-        """Log reward tensor statistics"""
-        non_zero_rewards = reward_tensor[reward_tensor != 0]
-        if len(non_zero_rewards) > 0:
-            logger.info(f"Reward tensor created - Shape: {reward_tensor.shape}, "
-                       f"Non-zero rewards: {len(non_zero_rewards)}, "
-                       f"Min: {non_zero_rewards.min().item():.3f}, "
-                       f"Max: {non_zero_rewards.max().item():.3f}, "
-                       f"Mean: {non_zero_rewards.mean().item():.3f}, "
-                       f"Std: {non_zero_rewards.std().item():.3f}")
-        else:
-            logger.warning("No non-zero rewards in tensor")
     
     def _log_reward_tensor_details(self, reward_tensor: torch.Tensor, feedback: TrajectoryFeedback):
         """Log reward tensor details to file"""
@@ -929,7 +905,7 @@ class HallucinationPenaltyRewardManager:
                 valid_response_ids = valid_response_ids.flatten()
             
             # Decode response
-            response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+            # response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
             ground_truth = data_item.non_tensor_batch.get("reward_model", {}).get("ground_truth", "")
 
             # NEW: Extract event ledger from non_tensor_batch (PER-ITEM)
@@ -1016,16 +992,16 @@ class HallucinationPenaltyRewardManager:
                             question = first_content["content"]
 
             
-            logger.info(f"Data source: {data_source}")
-            logger.info(f"Ground truth: {ground_truth}")
-            logger.info(f"Question: {question}")
-            logger.info(f"Response: {response_str}")
+            # logger.info(f"Data source: {data_source}")
+            # logger.info(f"Ground truth: {ground_truth}")
+            # logger.info(f"Question: {question}")
+            # logger.info(f"Response: {response_str}")
             
-            # Log to file
-            self.file_logger.info(f"Data source: {data_source}")
-            self.file_logger.info(f"Ground truth: {ground_truth}")
-            self.file_logger.info(f"Question: {question}")
-            self.file_logger.info(f"Response: {response_str}")
+            # # Log to file
+            # self.file_logger.info(f"Data source: {data_source}")
+            # self.file_logger.info(f"Ground truth: {ground_truth}")
+            # self.file_logger.info(f"Question: {question}")
+            # self.file_logger.info(f"Response: {response_str}")
             
             # Parse trajectory components
             components = get_components(
@@ -1055,7 +1031,7 @@ class HallucinationPenaltyRewardManager:
             dense_reward = self.create_dense_reward_tensor(feedback, target_length)
             
             # Print analysis summary
-            self._print_analysis_summary(data_source, item_index, response_str, ground_truth, components, feedback, dense_reward)
+            # self._print_analysis_summary(data_source, item_index, response_str, ground_truth, components, feedback, dense_reward)
             
             self.file_logger.info(f"Item {item_index+1} processing completed successfully")
             

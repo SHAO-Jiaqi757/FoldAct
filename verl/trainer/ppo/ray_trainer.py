@@ -21,6 +21,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import logging
 import os
+import random
 import time
 import uuid
 from collections import defaultdict
@@ -68,6 +69,9 @@ from verl.workers.rollout.async_server import AsyncLLMServerManager
 from gigpo import core_gigpo
 
 from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
+from verl.utils.full_context_builder import FullContextBuilder
+from verl.utils.full_context_consistency import build_full_context_batch_from_ledgers
+from verl.utils.experimental import collect_response_texts
 
 WorkerType = Type[Worker]
 
@@ -265,9 +269,18 @@ def compute_response_mask(data: DataProto):
         
         # Ensure shape matches
         if responses_types.shape != responses.shape:
-            raise ValueError(
-                f"responses_types shape {responses_types.shape} != responses shape {responses.shape}"
+            logger.warning(
+                f"[compute_response_mask] responses_types shape {responses_types.shape} != responses shape {responses.shape}. "
+                f"Attempting to align shapes..."
             )
+            # Try to align shapes: truncate or pad if needed
+            if responses_types.size(1) > responses.size(1):
+                responses_types = responses_types[:, -responses.size(1):]
+                logger.debug(f"[compute_response_mask] Truncated responses_types to match responses length")
+            elif responses_types.size(1) < responses.size(1):
+                pad_size = responses.size(1) - responses_types.size(1)
+                responses_types = torch.nn.functional.pad(responses_types, (0, pad_size), value=0)
+                logger.debug(f"[compute_response_mask] Padded responses_types to match responses length")
         
         # ResponseType values:
         # think = 0, search = 1, answer = 2 (assistant tokens - include)
@@ -604,6 +617,27 @@ class RayPPOTrainer:
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
+        # CRITICAL FIX: Read from actor config, not top-level config
+        # Training script sets: +actor_rollout_ref.actor.use_full_context_supervision=true
+        self.use_full_context_supervision = bool(
+            self.config.actor_rollout_ref.actor.get("use_full_context_supervision", False) or
+            self.config.get("use_full_context_supervision", False)  # Fallback for backward compatibility
+        )
+        self.full_context_builder = None
+        self.full_context_monitor_sample_size = 0
+        self.full_context_monitor_interval = 0
+        if self.use_full_context_supervision:
+            max_ctx_len = int(self.config.data.get("max_prompt_length", 4096)) + int(self.config.data.get("max_response_length", 512))
+            self.full_context_builder = FullContextBuilder(tokenizer=self.tokenizer, max_context_length=max_ctx_len)
+            interval = int(self.config.trainer.get("full_context_consistency_interval", 100))
+            sample_size = int(self.config.trainer.get("full_context_consistency_sample_size", 4))
+            self.full_context_monitor_sample_size = sample_size
+            self.full_context_monitor_interval = interval
+            # Use consistency_loss_weight from actor config to determine if training should be enabled
+            # If weight > 0, enable training; if weight = 0, monitoring only
+            consistency_loss_weight = float(self.config.actor_rollout_ref.actor.get("consistency_loss_weight", 0.0))
+            self.full_context_monitor_apply_grad = (consistency_loss_weight > 0)
+
     def _validate_config(self):
         config = self.config
         # number of GPUs total
@@ -716,6 +750,27 @@ class RayPPOTrainer:
             assert config.algorithm.adv_estimator in [AdvantageEstimator.GRPO], "only GRPO is tested for multi-turn with tool"
 
         print("[validate_config] All configuration checks passed successfully!")
+
+        # Initialize experiment logger if enabled
+        self.experiment_logger = None
+        if self.config.trainer.get('enable_experiment_logging', False):
+            try:
+                from verl.utils.experiment_logger import ExperimentLogger
+                
+                self.experiment_logger = ExperimentLogger(
+                    log_dir=self.config.trainer.get('experiment_log_dir', 'logs/paper_experiments'),
+                    experiment_name=self.config.trainer.get('experiment_name', 'default')
+                )
+                print(
+                    f"[Trainer] Experiment logging enabled: "
+                    f"{self.config.trainer.get('experiment_name')} -> "
+                    f"{self.config.trainer.get('experiment_log_dir')}"
+                )
+            except Exception as e:
+                print(f"[Trainer] Failed to initialize experiment logger: {e}")
+                import traceback
+                traceback.print_exc()
+                self.experiment_logger = None
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler):
         """
@@ -1270,6 +1325,179 @@ class RayPPOTrainer:
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
+    def _sample_full_context_indices(self, batch_size: int) -> list[int]:
+        sample_size = getattr(self, "full_context_monitor_sample_size", 0)
+        if sample_size <= 0 or batch_size <= 0:
+            return []
+        sample_size = min(sample_size, batch_size)
+        return random.sample(range(batch_size), sample_size)
+
+    def _build_full_context_batch(self, batch: DataProto, event_ledgers_np, indices: list[int]) -> Optional[DataProto]:
+        if self.full_context_builder is None or not indices:
+            return None
+        if "responses" not in batch.batch or "input_ids" not in batch.batch or "attention_mask" not in batch.batch:
+            return None
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        prompts_tensor = None
+        if "prompts" in batch.batch.keys():
+            prompts_tensor = batch.batch["prompts"].cpu()
+        return build_full_context_batch_from_ledgers(
+            batch=batch,
+            event_ledgers_array=event_ledgers_np,
+            indices=indices,
+            builder=self.full_context_builder,
+            pad_token_id=pad_id,
+            tokenizer=self.tokenizer,
+            prompts_tensor=prompts_tensor,
+        )
+
+    def _maybe_log_full_context_consistency(self, batch: DataProto):
+        # DEBUG: Add comprehensive logging to identify why consistency loss is zero
+        # Always log on first call to help debug
+        if not hasattr(self, '_consistency_debug_logged'):
+            logger.info(f"[ConsistencyDebug] Initial check: use_full_context_supervision={self.use_full_context_supervision}, "
+                       f"interval={getattr(self, 'full_context_monitor_interval', 'NOT_SET')}, "
+                       f"apply_grad={getattr(self, 'full_context_monitor_apply_grad', 'NOT_SET')}, "
+                       f"global_steps={self.global_steps}")
+            self._consistency_debug_logged = True
+        
+        if not self.use_full_context_supervision:
+            logger.warning(f"[ConsistencyDebug] Step {self.global_steps}: use_full_context_supervision=False, skipping consistency loss")
+            return
+        interval = getattr(self, "full_context_monitor_interval", 0)
+        if interval <= 0 or (self.global_steps % interval) != 0:
+            logger.warning(f"[ConsistencyDebug] Step {self.global_steps}: Interval check failed (interval={interval}, global_steps={self.global_steps}, remainder={self.global_steps % interval if interval > 0 else 'N/A'})")
+            return
+        if "old_log_probs" not in batch.batch:
+            logger.warning(f"[ConsistencyDebug] Step {self.global_steps}: old_log_probs not in batch, skipping consistency loss")
+            return
+        # CRITICAL: Compute response_mask if not available (needed for consistency check)
+        # This allows calling _maybe_log_full_context_consistency before compute_advantage
+        if "response_mask" not in batch.batch:
+            batch.batch["response_mask"] = compute_response_mask(batch)
+        event_ledgers_np = batch.non_tensor_batch.get("event_ledger")
+        if event_ledgers_np is None:
+            logger.warning(f"[ConsistencyDebug] Step {self.global_steps}: event_ledger not in non_tensor_batch, skipping consistency loss. Available keys: {list(batch.non_tensor_batch.keys())}")
+            return
+        indices = self._sample_full_context_indices(batch.batch["old_log_probs"].size(0))
+        if not indices:
+            logger.warning(f"[ConsistencyDebug] Step {self.global_steps}: No indices sampled (sample_size={self.full_context_monitor_sample_size}, batch_size={batch.batch['old_log_probs'].size(0)})")
+            return
+        full_dp = self._build_full_context_batch(batch, event_ledgers_np, indices)
+        if full_dp is None:
+            logger.warning(f"[ConsistencyDebug] Step {self.global_steps}: Failed to build full context batch for indices={indices}")
+            return
+        try:
+            # CRITICAL FIX: Ensure temperature matches batch's temperature to avoid union conflict
+            # full_dp.meta_info has temperature=1.0, but compute_log_prob may return different temperature
+            # Copy temperature from batch to ensure consistency
+            if "temperature" in batch.meta_info:
+                full_dp.meta_info["temperature"] = batch.meta_info["temperature"]
+            
+            output = self.actor_rollout_wg.compute_log_prob(full_dp)
+            # CRITICAL FIX: Remove temperature from output.meta_info before union to avoid conflict
+            # The temperature should come from full_dp (which we just set above)
+            if "temperature" in output.meta_info:
+                output.meta_info.pop("temperature")
+            full_dp = full_dp.union(output)
+        except Exception as e:
+            logger.error(f"[ConsistencyMonitor] Failed to compute full-context log_probs: {e}")
+            import traceback
+            logger.error(f"[ConsistencyMonitor] Traceback: {traceback.format_exc()}")
+            return
+
+        full_log_probs = full_dp.batch.get("old_log_probs")
+        if full_log_probs is None:
+            return
+        compressed = batch.batch["old_log_probs"][indices].to(full_log_probs.device)
+        response_mask = batch.batch["response_mask"][indices].to(full_log_probs.device)
+        min_len = min(full_log_probs.size(1), compressed.size(1), response_mask.size(1))
+        if min_len <= 0:
+            return
+        full_log_probs = full_log_probs[:, :min_len]
+        compressed = compressed[:, :min_len]
+        mask = response_mask[:, :min_len].float()
+        denom = torch.clamp(mask.sum(), min=1.0)
+        diff = torch.abs(full_log_probs - compressed)
+        mean_diff = (diff * mask).sum() / denom
+        mean_value = float(mean_diff.detach().cpu().item())
+        if self.experiment_logger:
+            self.experiment_logger.log_stability_metrics(
+                step=self.global_steps,
+                metrics={"consistency_logprob_diff": mean_value},
+            )
+        # Inject full context batch for training if weight > 0 (monitoring only if weight = 0)
+        if self.full_context_monitor_apply_grad:
+            # Save full context input_ids for training (to compute logits with current policy)
+            logger.info(f"[ConsistencyDebug] Step {self.global_steps}: Injecting full_context_input_ids for {len(indices)} samples (indices={indices})")
+            self._inject_full_context_batch(batch, indices, full_dp)
+            # DIAGNOSTIC: Verify injection succeeded
+            if 'full_context_input_ids' in batch.batch:
+                logger.info(f"[ConsistencyDebug] Step {self.global_steps}: ✓ Injected full_context_input_ids: "
+                          f"shape={batch.batch['full_context_input_ids'].shape}, "
+                          f"indices={indices}, num_selected={len(indices)}")
+                # Check if injected data is valid (non-zero)
+                valid_rows = batch.batch['full_context_input_ids'].abs().sum(dim=1) > 0
+                num_valid = valid_rows.sum().item()
+                logger.info(f"[ConsistencyDebug] Step {self.global_steps}: Valid rows in full_context_input_ids: {num_valid}/{batch.batch['full_context_input_ids'].size(0)}")
+            else:
+                logger.error(f"[ConsistencyDebug] Step {self.global_steps}: ✗ Failed to inject full_context_input_ids! "
+                           f"Available keys: {list(batch.batch.keys())}")
+        else:
+            logger.warning(f"[ConsistencyDebug] Step {self.global_steps}: full_context_monitor_apply_grad=False (consistency_loss_weight might be 0 or not set)")
+
+    def _inject_full_context_batch(self, batch: DataProto, indices: list[int], full_dp: DataProto):
+        """
+        Inject full context batch for consistency loss computation.
+        
+        Instead of using old_log_probs (from old policy), we save the full context
+        input_ids so that dp_actor can compute logits with the current policy.
+        
+        Args:
+            batch: Original batch with compressed context
+            indices: Sample indices selected for full context computation
+            full_dp: Full context DataProto with input_ids, attention_mask, etc.
+        """
+        if "input_ids" not in full_dp.batch:
+            return
+        
+        # Save full context input_ids and attention_mask for selected samples
+        full_input_ids = full_dp.batch["input_ids"]  # [num_selected, full_seq_len]
+        full_attention_mask = full_dp.batch.get("attention_mask")
+        
+        # Create tensors matching batch size, filled with zeros (padding)
+        batch_size = batch.batch["input_ids"].size(0)
+        device = batch.batch["input_ids"].device
+        max_full_len = full_input_ids.size(1)
+        
+        # Initialize with zeros (will be filled for selected indices)
+        full_context_input_ids = torch.zeros(
+            batch_size, max_full_len,
+            dtype=full_input_ids.dtype,
+            device=device
+        )
+        
+        if full_attention_mask is not None:
+            full_context_attention_mask = torch.zeros(
+                batch_size, max_full_len,
+                dtype=full_attention_mask.dtype,
+                device=device
+            )
+        else:
+            full_context_attention_mask = None
+        
+        # Fill in the selected samples
+        idx_tensor = torch.tensor(indices, device=device, dtype=torch.long)
+        full_context_input_ids[idx_tensor] = full_input_ids.to(device)
+        if full_context_attention_mask is not None:
+            full_context_attention_mask[idx_tensor] = full_attention_mask.to(device)
+        
+        # Save indices for dp_actor to know which samples to process
+        batch.batch["full_context_input_ids"] = full_context_input_ids
+        if full_context_attention_mask is not None:
+            batch.batch["full_context_attention_mask"] = full_context_attention_mask
+        batch.batch["full_context_indices"] = idx_tensor
+
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen"):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch["attention_mask"]
@@ -1322,6 +1550,22 @@ class RayPPOTrainer:
             
             # Add debug logging after Wandb logging
             print(f"DEBUG: Metrics logged to Wandb")
+            
+            # Log initial task metrics
+            if self.experiment_logger:
+                try:
+                    task_metrics_payload = {
+                        'success_rate': float(val_metrics.get('test/success_rate', 0.0) or 0.0),
+                        'avg_reward': float(val_metrics.get('test/avg_reward', 0.0) or 0.0),
+                        'avg_turns_to_success': float(val_metrics.get('test/avg_turns', 0.0) or 0.0),
+                    }
+                    self.experiment_logger.log_task_metrics(
+                        epoch=0,
+                        step=self.global_steps,
+                        metrics=task_metrics_payload,
+                    )
+                except Exception as e:
+                    print(f"[Trainer] Error logging initial task metrics: {e}")
             
             if self.config.trainer.get("val_only", False):
                 return
@@ -1399,6 +1643,8 @@ class RayPPOTrainer:
                 print(f"{'*'*40}")
 
                 with _timer("step", timing_raw):
+                    generation_for_logging = None
+                    final_gen_batch_output = None
                     # generate a batch
                     if not self.config.do_search:
                         if not self.async_rollout_mode:
@@ -1408,6 +1654,8 @@ class RayPPOTrainer:
                             self.async_rollout_manager.wake_up()
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
                             self.async_rollout_manager.sleep()
+
+                        generation_for_logging = gen_batch_output
 
                         # Assign unique IDs per original prompt; also set traj_uid for compatibility
                         batch.non_tensor_batch['uid'] = np.array(
@@ -1573,6 +1821,24 @@ class RayPPOTrainer:
                             # repeat to align with repeated responses in rollout
                             batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                             batch = batch.union(final_gen_batch_output)
+                            
+                            # DIAGNOSTIC: Check if responses_types is preserved after union
+                            if 'responses_types' in final_gen_batch_output.batch:
+                                print(f"[Trainer] ✓ responses_types found in final_gen_batch_output: "
+                                          f"shape={final_gen_batch_output.batch['responses_types'].shape}")
+                            else:
+                                logger.warning(f"[Trainer] ✗ responses_types NOT found in final_gen_batch_output! "
+                                             f"Available keys: {list(final_gen_batch_output.batch.keys())}")
+                            
+                            if 'responses_types' in batch.batch:
+                                print(f"[Trainer] ✓ responses_types preserved after union: "
+                                          f"shape={batch.batch['responses_types'].shape}")
+                            else:
+                                logger.warning(f"[Trainer] ✗ responses_types lost after union! "
+                                             f"Available keys: {list(batch.batch.keys())}")
+
+                        # NOTE: _maybe_log_full_context_consistency is now called AFTER compute_advantage
+                        # to ensure response_mask exists before injecting full_context_input_ids
 
                         # if not self.async_rollout_mode:
                         #     gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
@@ -1677,6 +1943,15 @@ class RayPPOTrainer:
                     #             }
                     #         )
                     self._balance_batch(batch, metrics=metrics)
+                    
+                    # DIAGNOSTIC: Check full_context_input_ids after balance_batch
+                    if 'full_context_input_ids' in batch.batch:
+                        print(f"[Trainer] ✓ full_context_input_ids after balance_batch: "
+                                  f"shape={batch.batch['full_context_input_ids'].shape}")
+                    else:
+                        print(f"[Trainer] ⚠️ full_context_input_ids NOT found after balance_batch. "
+                              f"This is normal - it will be injected after compute_advantage. "
+                              f"Available keys: {list(batch.batch.keys())[:10]}...")
 
                     # compute global_valid tokens
                     batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
@@ -1759,6 +2034,16 @@ class RayPPOTrainer:
                             # step_advantage_w=self.config.algorithm.gigpo.step_advantage_w,
                             # gigpo_mode=self.config.algorithm.gigpo.mode,
                         )
+                        
+                        # CRITICAL: Call _maybe_log_full_context_consistency AFTER compute_advantage
+                        # This ensures old_log_probs and response_mask exist before injecting full_context_input_ids
+                        # full_context_input_ids will be preserved during subsequent operations (reorder, etc.)
+                        self._maybe_log_full_context_consistency(batch)
+                        
+                        # DIAGNOSTIC: Verify full_context_input_ids was injected
+                        if 'full_context_input_ids' in batch.batch:
+                            print(f"[Trainer] ✓ full_context_input_ids injected after compute_advantage: "
+                                  f"shape={batch.batch['full_context_input_ids'].shape}")
 
                         # ==================== Responses & Mask Check (After compute_advantage) ====================
                         # At this point, response_mask has been computed inside compute_advantage
@@ -1787,6 +2072,40 @@ class RayPPOTrainer:
                                 traceback.print_exc()
                         # ========================================================================
 
+                        generation_for_logging = final_gen_batch_output if 'final_gen_batch_output' in locals() else None
+
+                    # Log summary distribution (configurable interval, default every step now)
+                    if self.experiment_logger and generation_for_logging is not None:
+                        try:
+                            summaries = collect_response_texts(
+                                data_proto=generation_for_logging,
+                                tokenizer=self.tokenizer,
+                                max_samples=200,
+                                include_all_turns=False,
+                            )
+
+                            if summaries:
+                                self.experiment_logger.log_summary_distribution(
+                                    step=self.global_steps,
+                                    summaries=summaries,
+                                    tokenizer=self.tokenizer,
+                                    save_full_data=False,
+                                )
+
+                                self.experiment_logger.log_shift_metrics(
+                                    step=self.global_steps,
+                                    current_summaries=summaries,
+                                    tokenizer=self.tokenizer,
+                                    compute_info_preservation=False,
+                                    full_contexts=None,
+                                )
+                            else:
+                                print(f"[Trainer] No decoded responses available for summary logging at step {self.global_steps}")
+                        except Exception as e:
+                            print(f"[Trainer] Error logging summary distribution: {e}")
+                            import traceback
+                            traceback.print_exc()
+
                         # ==================== Gradient Flow Debug Check ====================
                         # Comprehensive gradient flow diagnostics
                         # Controlled by environment variable GRADIENT_FLOW_CHECK_FREQ (default: 1)
@@ -1813,7 +2132,7 @@ class RayPPOTrainer:
                                 model=model_for_grad_check,
                                 check_loss_history=loss_history if len(loss_history) > 0 else None,
                                 sample_indices=[0, 1, 2] if batch.batch["responses"].shape[0] >= 3 else [0],
-                                verbose=True
+                                verbose=False
                             )
                             
                             # Store results for later analysis
@@ -1858,13 +2177,35 @@ class RayPPOTrainer:
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)
                         
+                        # Log stability metrics
+                        if self.experiment_logger:
+                            try:
+                                stability_metrics = {}
+                                metric_mapping = [
+                                    ("actor/pg_loss", "pg_loss"),
+                                    ("actor/pg_clipfrac", "clipfrac"),
+                                    ("actor/ppo_kl", "approx_kl"),
+                                    ("actor/grad_norm", "grad_norm"),
+                                ]
+                                for source_key, target_key in metric_mapping:
+                                    if source_key in actor_output_metrics:
+                                        stability_metrics[target_key] = float(actor_output_metrics[source_key])
+
+                                if stability_metrics:
+                                    self.experiment_logger.log_stability_metrics(
+                                        step=self.global_steps,
+                                        metrics=stability_metrics,
+                                    )
+                            except Exception as e:
+                                print(f"[Trainer] Error logging stability metrics: {e}")
+                        
                         # ==================== Track Loss History for Gradient Flow Debug ====================
                         # Track actor loss and average response length for stability analysis
-                        if 'training/actor_loss' in metrics and 'response_mask' in batch.batch:
+                        if 'actor/pg_loss' in metrics and 'response_mask' in batch.batch:
                             if not hasattr(self, '_loss_history'):
                                 self._loss_history = []
                             
-                            actor_loss_value = metrics['training/actor_loss']
+                            actor_loss_value = metrics['actor/pg_loss']
                             response_mask = batch.batch['response_mask']
                             
                             # Calculate average response length per sample
@@ -1903,6 +2244,7 @@ class RayPPOTrainer:
                             val_metrics: dict = self._validate()
                         metrics.update(val_metrics)
 
+
                     if self.config.trainer.save_freq > 0 and \
                             self.global_steps % self.config.trainer.save_freq == 0:
                         print(f"\n[CHECKPOINT] Triggering checkpoint save at step {self.global_steps}")
@@ -1937,8 +2279,8 @@ class RayPPOTrainer:
                 print(f"[TRAINING] Completed step {self.global_steps}/{self.total_training_steps}")
                 if 'training/loss' in metrics:
                     print(f"[TRAINING] Loss: {metrics['training/loss']:.6f}")
-                if 'training/actor_loss' in metrics:
-                    print(f"[TRAINING] Actor Loss: {metrics['training/actor_loss']:.6f}")
+                if 'actor/pg_loss' in metrics:
+                    print(f"[TRAINING] Actor Loss: {metrics['actor/pg_loss']:.6f}")
                 if 'training/throughput_tokens_per_gpu_per_sec' in metrics:
                     print(f"[TRAINING] Throughput: {metrics['training/throughput_tokens_per_gpu_per_sec']:.2f} tokens/gpu/sec")
                 print(f"{'*'*40}\n")
@@ -1952,6 +2294,14 @@ class RayPPOTrainer:
                         val_metrics = self._validate()
                         pprint(f'Final validation metrics: {val_metrics}')
                         logger.log(data=val_metrics, step=self.global_steps)
+                    # Close experiment logger
+                    if self.experiment_logger:
+                        try:
+                            self.experiment_logger.close()
+                            print("[Trainer] Experiment logger closed")
+                        except Exception as e:
+                            print(f"[Trainer] Error closing experiment logger: {e}")
+                    
                     return
     
     def _create_loss_mask(self, batch, metrics):

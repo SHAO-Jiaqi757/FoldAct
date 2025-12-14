@@ -531,7 +531,7 @@ class DataParallelPPOActor(BasePPOActor):
         if self.scalar is not None:
             self.scalar.step(self.actor_optimizer)
             self.scalar.update()
-        else: 
+        else:
             if not torch.isfinite(grad_norm):
                 print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
                 self.actor_optimizer.zero_grad()
@@ -651,6 +651,7 @@ class DataParallelPPOActor(BasePPOActor):
                     # Support all hardwares
                     device = get_torch_device().current_device()
                     per_turn_valid_mask = None
+                    aligned_valid_mask = None
                     if isinstance(data, DataProto):
                         tensor_batch = data.batch.to(device)
                         per_turn_valid_mask = tensor_batch.get("per_turn_valid_mask")
@@ -694,6 +695,8 @@ class DataParallelPPOActor(BasePPOActor):
                         # Prevent downstream consumers from mistakenly reusing the stale tensor
                         if isinstance(data, dict) and "per_turn_valid_mask" in data:
                             del data["per_turn_valid_mask"]
+                    else:
+                        aligned_valid_mask = None
                     
                     # Align old_log_prob and advantages to current response_length
                     old_log_prob_original_length = old_log_prob.size(1)
@@ -777,19 +780,53 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     trace_step = epoch * len(dataloader) + batch_idx
                     
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        cliprange=clip_ratio,
-                        cliprange_low=clip_ratio_low,
-                        cliprange_high=clip_ratio_high,
-                        clip_ratio_c=clip_ratio_c,
-                        loss_agg_mode=loss_agg_mode,
-                        enable_tracing=enable_tracing,
-                        trace_step=trace_step,
-                    )
+                    # Check if using Per-Turn + Summary method
+                    use_per_turn_summary = self.config.get('use_per_turn_summary', False)
+                    
+                    if use_per_turn_summary:
+                        # Use Per-Turn + Summary loss
+                        from verl.trainer.ppo.per_turn_summary_algos import compute_per_turn_summary_loss_wrapper
+                        
+                        pg_loss, loss_metrics = compute_per_turn_summary_loss_wrapper(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            responses=responses,
+                            tokenizer=self.tokenizer,
+                            config=self.config,
+                            per_turn_valid_mask=aligned_valid_mask,
+                        )
+                        
+                        # Extract metrics for compatibility with standard PPO logging
+                        pg_clipfrac = torch.tensor(loss_metrics.get('pg_clipfrac', 0.0), device=pg_loss.device)
+                        ppo_kl = torch.tensor(loss_metrics.get('ppo_kl', 0.0), device=pg_loss.device)
+                        pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
+                        
+                        # Log additional Per-Turn + Summary metrics
+                        if logger.isEnabledFor(logging.INFO):
+                            logger.info(
+                                f"[Per-Turn+Summary] summary_loss={loss_metrics['summary_loss']:.4f}, "
+                                f"action_loss={loss_metrics['action_loss']:.4f}, "
+                                f"consistency_loss={loss_metrics['consistency_loss']:.4f}, "
+                                f"summary_tokens={loss_metrics['summary_token_count']}, "
+                                f"action_tokens={loss_metrics['action_token_count']}"
+                            )
+                    else:
+                        # Use standard PPO loss
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            cliprange=clip_ratio,
+                            cliprange_low=clip_ratio_low,
+                            cliprange_high=clip_ratio_high,
+                            clip_ratio_c=clip_ratio_c,
+                            loss_agg_mode=loss_agg_mode,
+                            enable_tracing=enable_tracing,
+                            trace_step=trace_step,
+                        )
                     
                     # Auto-enable tracing if pg_loss is suspiciously large (even if not explicitly enabled)
                     pg_loss_val = pg_loss.detach().item()
@@ -808,7 +845,7 @@ class DataParallelPPOActor(BasePPOActor):
                             loss_agg_mode=loss_agg_mode,
                             enable_tracing=True,
                             trace_step=trace_step,
-                        )
+                    )
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)

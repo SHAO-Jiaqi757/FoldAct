@@ -562,7 +562,12 @@ class ActorRolloutRefWorker(Worker):
             with open_dict(self.config.actor):
                 self.config.actor.use_remove_padding = use_remove_padding
                 self.config.actor.use_fused_kernels = use_fused_kernels
-            self.actor = DataParallelPPOActor(config=self.config.actor, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer)
+            self.actor = DataParallelPPOActor(
+                config=self.config.actor,
+                actor_module=self.actor_module_fsdp,
+                actor_optimizer=self.actor_optimizer,
+                tokenizer=self.tokenizer,
+            )
 
         if self._is_rollout:
             self.rollout, self.rollout_sharding_manager = self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
@@ -584,7 +589,7 @@ class ActorRolloutRefWorker(Worker):
             with open_dict(self.config.ref):
                 self.config.ref.use_remove_padding = use_remove_padding
                 self.config.ref.use_fused_kernels = use_fused_kernels
-            self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
+            self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp, tokenizer=self.tokenizer)
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
@@ -700,6 +705,15 @@ class ActorRolloutRefWorker(Worker):
             tensors = {"old_log_probs": output}
             if entropys is not None:
                 tensors["entropys"] = entropys
+            # CRITICAL: Preserve responses_types from input data if available
+            # This is essential for correct response mask computation in training
+            if "responses_types" in data.batch:
+                tensors["responses_types"] = data.batch["responses_types"]
+            # CRITICAL: Preserve full_context_input_ids and related fields if available
+            # These are needed for consistency loss computation in dp_actor
+            for key in ["full_context_input_ids", "full_context_attention_mask", "full_context_indices"]:
+                if key in data.batch:
+                    tensors[key] = data.batch[key]
             output = DataProto.from_dict(
                 tensors=tensors,
                 meta_info={"temperature": self.config.rollout.temperature},

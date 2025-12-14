@@ -1294,6 +1294,10 @@ class LLMGenerationManager:
             final_output['attention_mask']
         )
         
+        # Also preserve step_ids if available (used for debugging and validation)
+        if 'step_ids' in right_side:
+            final_output['step_ids'] = right_side['step_ids']
+        
         final_output = DataProto.from_dict(final_output)
         final_output.meta_info.update(meta_info)
         
