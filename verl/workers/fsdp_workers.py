@@ -711,7 +711,7 @@ class ActorRolloutRefWorker(Worker):
                 tensors["responses_types"] = data.batch["responses_types"]
             # CRITICAL: Preserve full_context_input_ids and related fields if available
             # These are needed for consistency loss computation in dp_actor
-            for key in ["full_context_input_ids", "full_context_attention_mask", "full_context_indices"]:
+            for key in ["full_context_input_ids", "full_context_attention_mask", "full_context_indices", "full_context_log_probs"]:
                 if key in data.batch:
                     tensors[key] = data.batch[key]
             output = DataProto.from_dict(

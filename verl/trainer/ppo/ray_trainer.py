@@ -1408,11 +1408,29 @@ class RayPPOTrainer:
 
         full_log_probs = full_dp.batch.get("old_log_probs")
         if full_log_probs is None:
+            logger.error(
+                f"[ConsistencyDebug] Step {self.global_steps}: CRITICAL: full_dp.batch.get('old_log_probs') returned None! "
+                "This means compute_log_prob failed or returned empty result. "
+                "Cannot inject full_context_log_probs. Consistency loss will be skipped."
+            )
             return
+        
+        # Validate full_log_probs shape matches indices
+        if full_log_probs.size(0) != len(indices):
+            logger.error(
+                f"[ConsistencyDebug] Step {self.global_steps}: CRITICAL: Shape mismatch! "
+                f"full_log_probs.shape[0]={full_log_probs.size(0)} but len(indices)={len(indices)}. "
+                "Cannot inject full_context_log_probs. Consistency loss will be skipped."
+            )
+            return
+        
         compressed = batch.batch["old_log_probs"][indices].to(full_log_probs.device)
         response_mask = batch.batch["response_mask"][indices].to(full_log_probs.device)
         min_len = min(full_log_probs.size(1), compressed.size(1), response_mask.size(1))
         if min_len <= 0:
+            logger.warning(
+                f"[ConsistencyDebug] Step {self.global_steps}: min_len={min_len} <= 0, skipping consistency monitoring"
+            )
             return
         full_log_probs = full_log_probs[:, :min_len]
         compressed = compressed[:, :min_len]
@@ -1428,9 +1446,28 @@ class RayPPOTrainer:
             )
         # Inject full context batch for training if weight > 0 (monitoring only if weight = 0)
         if self.full_context_monitor_apply_grad:
-            # Save full context input_ids for training (to compute logits with current policy)
-            logger.info(f"[ConsistencyDebug] Step {self.global_steps}: Injecting full_context_input_ids for {len(indices)} samples (indices={indices})")
-            self._inject_full_context_batch(batch, indices, full_dp)
+            # ROBUST SOLUTION: Always inject pre-computed full context log_probs
+            # This completely avoids activation offload state issues by never doing extra forward passes during training
+            logger.info(
+                f"[ConsistencyDebug] Step {self.global_steps}: Injecting full_context data for {len(indices)} samples "
+                f"(indices={indices}, full_log_probs.shape={full_log_probs.shape})"
+            )
+            self._inject_full_context_batch(batch, indices, full_dp, full_log_probs)
+            
+            # CRITICAL: Verify injection succeeded
+            if 'full_context_log_probs' not in batch.batch:
+                logger.error(
+                    f"[ConsistencyDebug] Step {self.global_steps}: CRITICAL: Failed to inject full_context_log_probs! "
+                    "This will cause activation offload state corruption if dp_actor tries to compute it. "
+                    f"Available keys: {list(batch.batch.keys())}"
+                )
+            else:
+                injected_log_probs = batch.batch['full_context_log_probs']
+                valid_rows = (injected_log_probs.abs().sum(dim=1) > 0).sum().item()
+                logger.info(
+                    f"[ConsistencyDebug] Step {self.global_steps}: ✓ Successfully injected full_context_log_probs: "
+                    f"shape={injected_log_probs.shape}, valid_rows={valid_rows}/{injected_log_probs.size(0)}"
+                )
             # DIAGNOSTIC: Verify injection succeeded
             if 'full_context_input_ids' in batch.batch:
                 logger.info(f"[ConsistencyDebug] Step {self.global_steps}: ✓ Injected full_context_input_ids: "
@@ -1446,17 +1483,18 @@ class RayPPOTrainer:
         else:
             logger.warning(f"[ConsistencyDebug] Step {self.global_steps}: full_context_monitor_apply_grad=False (consistency_loss_weight might be 0 or not set)")
 
-    def _inject_full_context_batch(self, batch: DataProto, indices: list[int], full_dp: DataProto):
+    def _inject_full_context_batch(self, batch: DataProto, indices: list[int], full_dp: DataProto, full_log_probs: torch.Tensor = None):
         """
         Inject full context batch for consistency loss computation.
         
-        Instead of using old_log_probs (from old policy), we save the full context
-        input_ids so that dp_actor can compute logits with the current policy.
+        ELEGANT SOLUTION: Pass pre-computed full context log_probs to avoid extra forward pass.
+        This prevents activation offload state issues by not doing forward pass during training.
         
         Args:
             batch: Original batch with compressed context
             indices: Sample indices selected for full context computation
             full_dp: Full context DataProto with input_ids, attention_mask, etc.
+            full_log_probs: Pre-computed log_probs for full context (if None, will compute in dp_actor)
         """
         if "input_ids" not in full_dp.batch:
             return
@@ -1504,6 +1542,19 @@ class RayPPOTrainer:
         )
         full_context_indices[idx_tensor] = idx_tensor  # Mark selected indices
         batch.batch["full_context_indices"] = full_context_indices
+        
+        # ELEGANT SOLUTION: Inject pre-computed full context log_probs to avoid extra forward pass
+        # This prevents activation offload state issues
+        if full_log_probs is not None:
+            # Create tensor matching batch size, filled with zeros (padding)
+            full_context_log_probs = torch.zeros(
+                batch_size, full_log_probs.size(1),
+                dtype=full_log_probs.dtype,
+                device=device
+            )
+            full_context_log_probs[idx_tensor] = full_log_probs.to(device)
+            batch.batch["full_context_log_probs"] = full_context_log_probs
+            logger.info(f"[ConsistencyDebug] Step {self.global_steps}: Injected pre-computed full_context_log_probs: shape={full_context_log_probs.shape}")
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen"):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""

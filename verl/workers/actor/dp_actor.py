@@ -176,98 +176,87 @@ class DataParallelPPOActor(BasePPOActor):
             # Try getattr as last resort
             return getattr(container, field, None)
 
-        full_context_input_ids = _safe_get(data, "full_context_input_ids")
-        if full_context_input_ids is None:
-            if self.config.get("use_full_context_supervision", False):
-                # Log more details to help debug
-                if not self._warned_missing_full_context:
-                    logger.warning(
-                        "[DP Actor] full_context_input_ids not found; consistency loss skipped. "
-                        "Possible reasons:\n"
-                        "  1. full_context_consistency_interval not reached (default=100, only runs every 100 steps)\n"
-                        "  2. Event ledgers missing in batch\n"
-                        "  3. No indices sampled for full context computation\n"
-                        "  4. Full context batch build failed\n"
-                        "  5. full_context_monitor_apply_grad=False (check consistency_loss_weight > 0)\n"
-                        "To debug: Check logs for [ConsistencyDebug] messages."
-                    )
-                    self._warned_missing_full_context = True
-                else:
-                    # Log periodically even after warning to track when it happens
-                    import random
-                    if random.random() < 0.01:  # Log 1% of the time to avoid spam
-                        logger.debug(f"[DP Actor] full_context_input_ids still missing (step might not match interval)")
-            return None
-        else:
-            self._warned_missing_full_context = False
-            # Log when we successfully find full_context_input_ids
-            logger.debug(f"[DP Actor] Found full_context_input_ids: shape={full_context_input_ids.shape}")
-
-        full_context_attention_mask = _safe_get(data, "full_context_attention_mask")
-
-        if full_context_attention_mask is not None:
-            valid_rows = full_context_attention_mask.sum(dim=1) > 0
-        else:
-            valid_rows = full_context_input_ids.abs().sum(dim=1) > 0
-
-        if not torch.any(valid_rows):
-            return None
-
-        device = responses.device
-        selected_inputs = full_context_input_ids[valid_rows].to(device)
-        selected_mask = None
-        if full_context_attention_mask is not None:
-            selected_mask = full_context_attention_mask[valid_rows].to(device)
-
-        selected_log_prob = log_prob_compressed[valid_rows]
-        selected_responses = responses[valid_rows]
-        selected_response_mask = response_mask[valid_rows]
-
-        seq_len = selected_inputs.size(1)
-        position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(selected_inputs.size(0), -1)
-
-        from verl.utils.torch_dtypes import PrecisionType
-
-        with torch.no_grad():
-            autocast_dtype = PrecisionType.to_dtype(self.config.dtype)
-            with torch.autocast(device_type=self.device_name, dtype=autocast_dtype):
-                outputs = self.actor_module(
-                    input_ids=selected_inputs,
-                    attention_mask=selected_mask,
-                    position_ids=position_ids,
-                    use_cache=False,
-                )
-                if not hasattr(outputs, "logits"):
-                    return None
-                logits = outputs.logits / max(temperature, 1e-8)
-
-        response_length = selected_responses.size(1)
-        if logits.size(1) >= response_length:
-            logits = logits[:, -response_length:, :]
-        else:
-            pad = response_length - logits.size(1)
-            logits = torch.nn.functional.pad(logits, (0, 0, pad, 0), value=0.0)
-
-        log_probs_full = logprobs_from_logits(
-            logits=logits,
-            labels=selected_responses,
-            inplace_backward=False,
-        ).detach().to(selected_log_prob.dtype)
-
-        consistency_loss = compute_consistency_loss_from_log_probs(
-            log_probs_compressed=selected_log_prob,
-            log_probs_full=log_probs_full,
-            response_mask=selected_response_mask,
-        )
-        if True:
+        # ROBUST SOLUTION: Only use pre-computed full context log_probs
+        # This completely avoids activation offload state issues by never doing extra forward passes during training
+        full_context_log_probs = _safe_get(data, "full_context_log_probs")
+        
+        if full_context_log_probs is not None:
+            # Use pre-computed log_probs (computed in trainer using compute_log_prob)
+            # This is the robust solution that completely avoids activation offload state issues
+            logger.debug(f"[DP Actor] Using pre-computed full_context_log_probs: shape={full_context_log_probs.shape}")
+            
+            # Extract valid rows (samples that have full context)
+            full_context_indices = _safe_get(data, "full_context_indices")
+            if full_context_indices is not None:
+                # Use indices to identify which samples have full context
+                valid_rows = full_context_indices >= 0
+            else:
+                # Fallback: check if log_probs are non-zero
+                valid_rows = full_context_log_probs.abs().sum(dim=1) > 0
+            
+            if not torch.any(valid_rows):
+                return None
+            
+            selected_log_prob = log_prob_compressed[valid_rows]
+            selected_log_prob_full = full_context_log_probs[valid_rows].to(selected_log_prob.device)
+            selected_response_mask = response_mask[valid_rows]
+            
+            # Align lengths if needed
+            min_len = min(selected_log_prob.size(1), selected_log_prob_full.size(1), selected_response_mask.size(1))
+            if min_len <= 0:
+                return None
+            
+            selected_log_prob = selected_log_prob[:, :min_len]
+            selected_log_prob_full = selected_log_prob_full[:, :min_len]
+            selected_response_mask = selected_response_mask[:, :min_len]
+            
+            consistency_loss = compute_consistency_loss_from_log_probs(
+                log_probs_compressed=selected_log_prob,
+                log_probs_full=selected_log_prob_full,
+                response_mask=selected_response_mask,
+            )
+            
             logger.info(
-                "[Consistency] Applied full-context supervision to %d samples "
+                "[Consistency] Using pre-computed full-context log_probs for %d samples "
                 "(tokens=%d) -> loss=%.6f",
-                selected_inputs.size(0),
+                valid_rows.sum().item(),
                 int(selected_response_mask.sum().item()),
                 float(consistency_loss.detach().cpu().item()),
             )
-        return consistency_loss
+            return consistency_loss
+        
+        # CRITICAL: Do NOT fallback to computing log_probs during training
+        # This would break activation offload state machine (offloaded_group_count exceeds layer_window_map keys)
+        # Instead, log error and return None - the trainer should always provide pre-computed log_probs
+        if self.config.get("use_full_context_supervision", False):
+            if not self._warned_missing_full_context:
+                logger.error(
+                    "[DP Actor] CRITICAL: full_context_log_probs not found! "
+                    "This should never happen if trainer correctly injects pre-computed log_probs. "
+                    "Consistency loss will be skipped to avoid activation offload state corruption.\n"
+                    "Possible causes:\n"
+                    "  1. Trainer's _inject_full_context_batch was not called\n"
+                    "  2. full_log_probs was None when injecting (check trainer logs)\n"
+                    "  3. Data was lost during transfer from trainer to dp_actor\n"
+                    "  4. full_context_consistency_interval not reached\n"
+                    "  5. Event ledgers missing in batch\n"
+                    "  6. No indices sampled for full context computation\n"
+                    "To debug: Check logs for [ConsistencyDebug] messages in trainer."
+                )
+                self._warned_missing_full_context = True
+            else:
+                # Log periodically to track when this happens
+                import random
+                if random.random() < 0.05:  # Log 5% of the time
+                    logger.warning(
+                        "[DP Actor] full_context_log_probs still missing! "
+                        "This indicates a bug in the trainer's injection logic. "
+                        "Check [ConsistencyDebug] logs in trainer."
+                    )
+        
+        # Return None instead of attempting to compute (which would break activation offload)
+        return None
+
 
     def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -708,7 +697,7 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("responses_types")
         # CRITICAL: Preserve full_context_input_ids and related fields if available
         # These are needed for consistency loss computation
-        for key in ["full_context_input_ids", "full_context_attention_mask", "full_context_indices"]:
+        for key in ["full_context_input_ids", "full_context_attention_mask", "full_context_indices", "full_context_log_probs"]:
             if key in data.batch:
                 select_keys.append(key)
         batch = data.select(batch_keys=select_keys).batch
@@ -780,8 +769,9 @@ class DataParallelPPOActor(BasePPOActor):
             data.batch["responses_types"] = rt_val
         if has_responses_types:
             select_keys.append("responses_types")
-        # Include full-context tensors if trainer injected them
-        for key in ["full_context_input_ids", "full_context_attention_mask", "full_context_indices"]:
+        # CRITICAL: Include full-context tensors if trainer injected them
+        # This includes full_context_log_probs which is pre-computed to avoid activation offload issues
+        for key in ["full_context_input_ids", "full_context_attention_mask", "full_context_indices", "full_context_log_probs"]:
             if key in data.batch.keys():
                 select_keys.append(key)
         if multi_turn:
