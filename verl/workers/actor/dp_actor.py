@@ -20,7 +20,7 @@ Single Process Actor
 import itertools
 import logging
 import os
-from typing import Tuple
+from typing import Tuple, Optional
 from contextlib import nullcontext
 import numpy as np
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
@@ -32,6 +32,7 @@ from verl.utils import torch_dtypes
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, kl_penalty
+from verl.trainer.ppo.per_turn_summary_algos import compute_consistency_loss_from_log_probs
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.device import get_device_name, get_torch_device, is_cuda_available, is_npu_available
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -106,11 +107,14 @@ def align_per_turn_valid_mask(
 
 
 class DataParallelPPOActor(BasePPOActor):
-    def __init__(self, config, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None):
+    def __init__(self, config, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None, tokenizer=None):
         """When optimizer is None, it is Reference Policy"""
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+        self.tokenizer = tokenizer  # Store tokenizer for summary mask extraction
+        self._warned_missing_responses_types = False
+        self._warned_missing_full_context = False
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
         print(f"Actor use_remove_padding={self.use_remove_padding}")
@@ -131,6 +135,139 @@ class DataParallelPPOActor(BasePPOActor):
             self.scalar = ShardedGradScaler(growth_interval=400)
         else:
             self.scalar = None
+
+    def _compute_consistency_loss_from_full_context(
+        self,
+        data: dict,
+        log_prob_compressed: torch.Tensor,
+        responses: torch.Tensor,
+        response_mask: torch.Tensor,
+        temperature: float,
+    ) -> Optional[torch.Tensor]:
+        """
+        Compute log-prob consistency loss using injected full-context sequences.
+        Returns None if no samples require supervision.
+        """
+        # Convert TensorDict to dict if needed (for compatibility)
+        if not isinstance(data, dict) and hasattr(data, "keys") and hasattr(data, "__getitem__"):
+            try:
+                # Try to convert TensorDict to dict
+                data = {k: data[k] for k in data.keys()}
+            except Exception:
+                # If conversion fails, keep data as-is (it might be a TensorDict)
+                pass
+        
+        def _safe_get(container, field):
+            # Try dict first
+            if isinstance(container, dict):
+                return container.get(field)
+            # Try TensorDict (supports 'in' operator and dict-like access)
+            if field in container:
+                try:
+                    return container[field]
+                except (KeyError, TypeError):
+                    return None
+            # Try get() method (for objects with get method)
+            if hasattr(container, "get"):
+                try:
+                    return container.get(field, None)
+                except (KeyError, TypeError):
+                    return None
+            # Try getattr as last resort
+            return getattr(container, field, None)
+
+        full_context_input_ids = _safe_get(data, "full_context_input_ids")
+        if full_context_input_ids is None:
+            if self.config.get("use_full_context_supervision", False):
+                # Log more details to help debug
+                if not self._warned_missing_full_context:
+                    logger.warning(
+                        "[DP Actor] full_context_input_ids not found; consistency loss skipped. "
+                        "Possible reasons:\n"
+                        "  1. full_context_consistency_interval not reached (default=100, only runs every 100 steps)\n"
+                        "  2. Event ledgers missing in batch\n"
+                        "  3. No indices sampled for full context computation\n"
+                        "  4. Full context batch build failed\n"
+                        "  5. full_context_monitor_apply_grad=False (check consistency_loss_weight > 0)\n"
+                        "To debug: Check logs for [ConsistencyDebug] messages."
+                    )
+                    self._warned_missing_full_context = True
+                else:
+                    # Log periodically even after warning to track when it happens
+                    import random
+                    if random.random() < 0.01:  # Log 1% of the time to avoid spam
+                        logger.debug(f"[DP Actor] full_context_input_ids still missing (step might not match interval)")
+            return None
+        else:
+            self._warned_missing_full_context = False
+            # Log when we successfully find full_context_input_ids
+            logger.debug(f"[DP Actor] Found full_context_input_ids: shape={full_context_input_ids.shape}")
+
+        full_context_attention_mask = _safe_get(data, "full_context_attention_mask")
+
+        if full_context_attention_mask is not None:
+            valid_rows = full_context_attention_mask.sum(dim=1) > 0
+        else:
+            valid_rows = full_context_input_ids.abs().sum(dim=1) > 0
+
+        if not torch.any(valid_rows):
+            return None
+
+        device = responses.device
+        selected_inputs = full_context_input_ids[valid_rows].to(device)
+        selected_mask = None
+        if full_context_attention_mask is not None:
+            selected_mask = full_context_attention_mask[valid_rows].to(device)
+
+        selected_log_prob = log_prob_compressed[valid_rows]
+        selected_responses = responses[valid_rows]
+        selected_response_mask = response_mask[valid_rows]
+
+        seq_len = selected_inputs.size(1)
+        position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(selected_inputs.size(0), -1)
+
+        from verl.utils.torch_dtypes import PrecisionType
+
+        with torch.no_grad():
+            autocast_dtype = PrecisionType.to_dtype(self.config.dtype)
+            with torch.autocast(device_type=self.device_name, dtype=autocast_dtype):
+                outputs = self.actor_module(
+                    input_ids=selected_inputs,
+                    attention_mask=selected_mask,
+                    position_ids=position_ids,
+                    use_cache=False,
+                )
+                if not hasattr(outputs, "logits"):
+                    return None
+                logits = outputs.logits / max(temperature, 1e-8)
+
+        response_length = selected_responses.size(1)
+        if logits.size(1) >= response_length:
+            logits = logits[:, -response_length:, :]
+        else:
+            pad = response_length - logits.size(1)
+            logits = torch.nn.functional.pad(logits, (0, 0, pad, 0), value=0.0)
+
+        log_probs_full = logprobs_from_logits(
+            logits=logits,
+            labels=selected_responses,
+            inplace_backward=False,
+        ).detach().to(selected_log_prob.dtype)
+
+        consistency_loss = compute_consistency_loss_from_log_probs(
+            log_probs_compressed=selected_log_prob,
+            log_probs_full=log_probs_full,
+            response_mask=selected_response_mask,
+        )
+        if True:
+            logger.info(
+                "[Consistency] Applied full-context supervision to %d samples "
+                "(tokens=%d) -> loss=%.6f",
+                selected_inputs.size(0),
+                int(selected_response_mask.sum().item()),
+                float(consistency_loss.detach().cpu().item()),
+            )
+        return consistency_loss
 
     def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -566,6 +703,14 @@ class DataParallelPPOActor(BasePPOActor):
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+        # CRITICAL: Preserve responses_types if available (needed for summary mask computation)
+        if "responses_types" in data.batch:
+            select_keys.append("responses_types")
+        # CRITICAL: Preserve full_context_input_ids and related fields if available
+        # These are needed for consistency loss computation
+        for key in ["full_context_input_ids", "full_context_attention_mask", "full_context_indices"]:
+            if key in data.batch:
+                select_keys.append(key)
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -612,6 +757,33 @@ class DataParallelPPOActor(BasePPOActor):
         multi_turn = data.meta_info.get("multi_turn", False)
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
+        extra_keys = []
+        for key in ["consistency_weight"]:
+            if key in data.batch.keys():
+                extra_keys.append(key)
+        select_keys.extend(extra_keys)
+        # Add responses_types if available (for optimized summary mask extraction)
+        has_responses_types = (
+            "responses_types" in data.batch.keys() or
+            "responses_types" in data.non_tensor_batch.keys()
+        )
+        if "responses_types" in data.non_tensor_batch.keys():
+            rt_val = data.non_tensor_batch.pop("responses_types")
+            if isinstance(rt_val, torch.Tensor):
+                pass
+            else:
+                import numpy as np
+                if isinstance(rt_val, np.ndarray):
+                    rt_val = torch.from_numpy(rt_val)
+                else:
+                    rt_val = torch.tensor(rt_val)
+            data.batch["responses_types"] = rt_val
+        if has_responses_types:
+            select_keys.append("responses_types")
+        # Include full-context tensors if trainer injected them
+        for key in ["full_context_input_ids", "full_context_attention_mask", "full_context_indices"]:
+            if key in data.batch.keys():
+                select_keys.append(key)
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
@@ -770,8 +942,34 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
-
+                    
+                    # Check if we need logits for consistency loss
+                    # Only needed if BOTH use_per_turn_summary AND use_full_context_supervision are enabled
+                    use_per_turn_summary = self.config.get('use_per_turn_summary', False)
+                    use_full_context_supervision = self.config.get('use_full_context_supervision', False)
+                    
+                    # Forward pass: get log_probs (no need for logits!)
+                    forward_result = self._forward_micro_batch(
+                        micro_batch=data, 
+                        temperature=temperature, 
+                        calculate_entropy=calculate_entropy)
+                    
+                    entropy, log_prob = forward_result
+                    
+                    # Initialize consistency loss (will be computed only if needed)
+                    consistency_loss_value = torch.tensor(0.0, device=log_prob.device, dtype=log_prob.dtype)
+                    if use_full_context_supervision:
+                        full_context_loss = self._compute_consistency_loss_from_full_context(
+                            data=data,
+                            log_prob_compressed=log_prob,
+                            responses=responses,
+                            response_mask=response_mask,
+                            temperature=temperature,
+                        )
+                        if full_context_loss is not None:
+                            consistency_loss_value = full_context_loss
+                    
+                
                     # Enable tracing if enable_debug_logs is set (check config, meta_info, or env var)
                     enable_tracing = (
                         self.config.get("enable_debug_logs", False) or
@@ -780,12 +978,58 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     trace_step = epoch * len(dataloader) + batch_idx
                     
-                    # Check if using Per-Turn + Summary method
-                    use_per_turn_summary = self.config.get('use_per_turn_summary', False)
-                    
+                    # use_per_turn_summary already checked above
                     if use_per_turn_summary:
                         # Use Per-Turn + Summary loss
                         from verl.trainer.ppo.per_turn_summary_algos import compute_per_turn_summary_loss_wrapper
+                        
+                        # Get responses_types from data if available (for optimized summary mask extraction)
+                        responses_types = None
+                        if isinstance(data, dict) and "responses_types" in data:
+                            responses_types = data["responses_types"]
+                        elif hasattr(data, 'batch') and 'responses_types' in data.batch:
+                            # DataProto case
+                            responses_types = data.batch['responses_types']
+                        elif 'responses_types' in data:
+                            # TensorDict case (data is a TensorDict, not a DataProto)
+                            # TensorDict supports 'in' operator and dict-like access
+                            responses_types = data['responses_types']
+                        if responses_types is not None:
+                            if responses_types.device != responses.device:
+                                responses_types = responses_types.to(responses.device)
+                            # Align to response window if needed
+                            if responses_types.shape != responses.shape:
+                                if responses_types.size(1) > responses.size(1):
+                                    responses_types = responses_types[:, -responses.size(1):]
+                                elif responses_types.size(1) < responses.size(1):
+                                    # Pad if shorter
+                                    pad_size = responses.size(1) - responses_types.size(1)
+                                    responses_types = torch.nn.functional.pad(
+                                        responses_types, (0, pad_size), value=0
+                                    )
+                            # Log debug info if enabled
+                            enable_debug = (
+                                self.config.get("enable_debug_logs", False) or
+                                (isinstance(data, dict) and data.get("enable_debug_logs", False))
+                            )
+                            if enable_debug:
+                                unique_types = responses_types.unique().tolist()
+                                type_counts = {
+                                    t: (responses_types == t).sum().item() 
+                                    for t in unique_types
+                                }
+                                logger.info(f"[DP Actor] Using responses_types for summary mask:")
+                                logger.info(f"  Shape: {responses_types.shape}")
+                                logger.info(f"  Unique types: {unique_types}")
+                                logger.info(f"  Type counts: {type_counts}")
+                            else:
+                                logger.debug(f"[DP Actor] Using responses_types for summary mask: shape={responses_types.shape}")
+                        else:
+                            if not self._warned_missing_responses_types:
+                                logger.warning(
+                                    "[DP Actor] responses_types not found in batch; falling back to tokenizer-based summary mask."
+                                )
+                                self._warned_missing_responses_types = True
                         
                         pg_loss, loss_metrics = compute_per_turn_summary_loss_wrapper(
                             old_log_prob=old_log_prob,
@@ -796,6 +1040,8 @@ class DataParallelPPOActor(BasePPOActor):
                             tokenizer=self.tokenizer,
                             config=self.config,
                             per_turn_valid_mask=aligned_valid_mask,
+                            consistency_loss=consistency_loss_value,  # Pass pre-computed consistency loss (scalar)
+                            responses_types=responses_types,  # Pass pre-computed types for optimization
                         )
                         
                         # Extract metrics for compatibility with standard PPO logging
@@ -827,25 +1073,27 @@ class DataParallelPPOActor(BasePPOActor):
                             enable_tracing=enable_tracing,
                             trace_step=trace_step,
                         )
-                    
-                    # Auto-enable tracing if pg_loss is suspiciously large (even if not explicitly enabled)
-                    pg_loss_val = pg_loss.detach().item()
-                    if not enable_tracing and (abs(pg_loss_val) > 1000 or not torch.isfinite(pg_loss)):
-                        logger.warning(f"[PG_LOSS_TRACE] Auto-enabling tracing due to large pg_loss: {pg_loss_val:.6f}")
-                        # Recompute with tracing enabled
-                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
-                            old_log_prob=old_log_prob,
-                            log_prob=log_prob,
-                            advantages=advantages,
-                            response_mask=response_mask,
-                            cliprange=clip_ratio,
-                            cliprange_low=clip_ratio_low,
-                            cliprange_high=clip_ratio_high,
-                            clip_ratio_c=clip_ratio_c,
-                            loss_agg_mode=loss_agg_mode,
-                            enable_tracing=True,
-                            trace_step=trace_step,
-                    )
+                        
+                        # Auto-enable tracing if pg_loss is suspiciously large (only for standard PPO, not per-turn summary)
+                        # CRITICAL: Only check and recompute if using standard PPO loss (not per-turn summary)
+                        # Per-turn summary loss already includes all components and should not be recomputed
+                        pg_loss_val = pg_loss.detach().item()
+                        if not enable_tracing and (abs(pg_loss_val) > 1000 or not torch.isfinite(pg_loss)):
+                            logger.warning(f"[PG_LOSS_TRACE] Auto-enabling tracing due to large pg_loss: {pg_loss_val:.6f}")
+                            # Recompute with tracing enabled
+                            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                advantages=advantages,
+                                response_mask=response_mask,
+                                cliprange=clip_ratio,
+                                cliprange_low=clip_ratio_low,
+                                cliprange_high=clip_ratio_high,
+                                clip_ratio_c=clip_ratio_c,
+                                loss_agg_mode=loss_agg_mode,
+                                enable_tracing=True,
+                                trace_step=trace_step,
+                            )
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)

@@ -158,7 +158,6 @@ class HallucinationPenaltyRewardManager:
         NEW: Accepts event_ledger for context-invariant reward computation.
         NEW: Accepts step_ids to correctly map components to turns.
         """
-        logger.info(f"Analyzing trajectory with {len(components)} components")
         
         # Log to file
         self.file_logger.info(f"=== TRAJECTORY ANALYSIS ===")
@@ -174,10 +173,10 @@ class HallucinationPenaltyRewardManager:
         information_summary_components = [c for c in components if c.component_type == "information_summary"]
         answer_components = [c for c in components if c.component_type == "answer"]
         
-        logger.debug(f"Component breakdown: search={len(search_components)}, "
-                    f"information={len(information_components)}, "
-                    f"information_summary={len(information_summary_components)}, "
-                    f"answer={len(answer_components)}")
+        # logger.debug(f"Component breakdown: search={len(search_components)}, "
+        #             f"information={len(information_components)}, "
+        #             f"information_summary={len(information_summary_components)}, "
+        #             f"answer={len(answer_components)}")
         
         # Log component distribution to file
         self.file_logger.info(f"Component breakdown:")
@@ -929,11 +928,9 @@ class HallucinationPenaltyRewardManager:
                     if ledger_dict:
                         event_ledger = EventLedger.from_dict(ledger_dict)
                         self.file_logger.info(f"[Event Ledger] Successfully loaded ledger with {len(event_ledger)} events")
-                        logger.info(f"[Event Ledger] Loaded ledger with {len(event_ledger)} events for item {item_index}")
                     else:
                         self.file_logger.warning(f"[Event Ledger] Invalid ledger data format: {type(ledger_data)}")
                 except Exception as e:
-                    logger.warning(f"[Event Ledger] Failed to load event ledger for item {item_index}: {e}")
                     self.file_logger.warning(f"[Event Ledger] Failed to load event ledger: {e}")
                     import traceback
                     self.file_logger.warning(f"[Event Ledger] Traceback: {traceback.format_exc()}")

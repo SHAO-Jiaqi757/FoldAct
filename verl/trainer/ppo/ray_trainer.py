@@ -1494,9 +1494,16 @@ class RayPPOTrainer:
         
         # Save indices for dp_actor to know which samples to process
         batch.batch["full_context_input_ids"] = full_context_input_ids
-        if full_context_attention_mask is not None:
+        if full_attention_mask is not None:
             batch.batch["full_context_attention_mask"] = full_context_attention_mask
-        batch.batch["full_context_indices"] = idx_tensor
+        
+        # CRITICAL FIX: Create full_context_indices with batch_size shape
+        # Use -1 to mark non-selected samples, and original index for selected samples
+        full_context_indices = torch.full(
+            (batch_size,), -1, dtype=torch.long, device=device
+        )
+        full_context_indices[idx_tensor] = idx_tensor  # Mark selected indices
+        batch.batch["full_context_indices"] = full_context_indices
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen"):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
