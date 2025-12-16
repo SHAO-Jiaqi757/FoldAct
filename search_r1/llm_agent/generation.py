@@ -194,45 +194,45 @@ class LLMGenerationManager:
                     f"(response_len={response_len}, obs_len={obs_len})"
                 )
 
-        # Find last info index
+        # ============================================================================
+        # STEP 1: Find the last turn that has information (search backwards)
+        # ============================================================================
         last_info_idx = -1
         for i in range(len(turn_history) - 1, -1, -1):
             if has_info_flags[i]:
                 last_info_idx = i
                 break
 
+        # ============================================================================
+        # STEP 2: Select which turns to keep (unified strategy)
+        # ============================================================================
         if last_info_idx == -1:
-            # No info yet → keep all context
+            # No information turns found → keep all turns
             selected_turns = turn_history
             if getattr(self.config, 'enable_debug_logs', False):
                 print(f"[CONTEXT SUMMARY] No <information> found in history → keeping ALL turns")
         else:
-            # Check if all turns from start to last_info_idx are info turns
-            all_are_info_turns = all(has_info_flags[i] for i in range(last_info_idx + 1))
+            # Unified strategy: Try to find summary first, fallback to contiguous non-info turns
+            # Step 1: Search backwards from last_info_idx for the most recent summary turn
+            most_recent_summary_idx = None
+            for i in range(last_info_idx, -1, -1):
+                if self._check_turn_has_summary(turn_history[i]):
+                    most_recent_summary_idx = i
+                    break
             
-            if all_are_info_turns:
-                # Special case: All turns are info turns
-                # Check if the last info turn has summary
-                last_turn_has_summary = self._check_turn_has_summary(turn_history[last_info_idx])
-                
-                if last_turn_has_summary:
-                    # Last turn has summary → can safely keep only the last turn
-                    selected_turns = turn_history[last_info_idx:last_info_idx + 1]
-                    if getattr(self.config, 'enable_debug_logs', False):
-                        print(f"[CONTEXT SUMMARY] All turns are info turns, last turn has summary → keeping only last turn [{last_info_idx}]")
-                else:
-                    # Last turn has no summary → no extra processing, keep only the last turn (original behavior)
-                    selected_turns = turn_history[last_info_idx:last_info_idx + 1]
-                    if getattr(self.config, 'enable_debug_logs', False):
-                        print(f"[CONTEXT SUMMARY] All turns are info turns, last turn has NO summary → keeping only last turn [{last_info_idx}] (no extra processing)")
-            else:
-                # Normal case: Include contiguous non-info turns immediately before the last info turn
-                start_idx = last_info_idx
-                while start_idx - 1 >= 0 and not has_info_flags[start_idx - 1]:
-                    start_idx -= 1
-                selected_turns = turn_history[start_idx:last_info_idx + 1]
+            if most_recent_summary_idx is not None:
+                # Found summary → keep from summary turn to last info turn
+                selected_turns = turn_history[most_recent_summary_idx:last_info_idx + 1]
                 if getattr(self.config, 'enable_debug_logs', False):
-                    print(f"[CONTEXT SUMMARY] Using block turns [{start_idx}..{last_info_idx}] (non-info before last info + last info)")
+                    if most_recent_summary_idx == last_info_idx:
+                        print(f"[CONTEXT SUMMARY] Keeping only last turn [{last_info_idx}] (has summary)")
+                    else:
+                        print(f"[CONTEXT SUMMARY] Keeping from summary turn [{most_recent_summary_idx}] to last turn [{last_info_idx}]")
+            else:
+                # No summary found → keep all turns (no compression)
+                selected_turns = turn_history
+                if getattr(self.config, 'enable_debug_logs', False):
+                    print(f"[CONTEXT SUMMARY] No summary found → keeping ALL turns")
         
         # CRITICAL FIX: Add length check to prevent exceeding max_model_len
         max_allowed_length = 7000  # Leave room for response generation (8192 - 1000 = 7192, use 7000 for safety)
