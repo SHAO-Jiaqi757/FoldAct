@@ -107,7 +107,7 @@ class HallucinationPenaltyRewardManager:
     def _get_hallucination_penalty_config(self):
         """Get configuration for hallucination penalty reward system"""
         return {
-            "information_penalty": 0.0,              # Penalty for <information> components (hallucination)
+            "information_penalty": -0.1,              # Penalty for <information> components (hallucination)
             "information_summary_bonus": 0.0,           # Bonus for <information_summary> components with context
             "information_summary_ground_truth_bonus": 0.2,  # Bonus when summaries correctly echo ground-truth evidence
             "format_bonus": 0.1,                     # Bonus for proper format (sequence ends with answer)
@@ -278,6 +278,7 @@ class HallucinationPenaltyRewardManager:
         model_information_indices = []
         information_summary_indices = []
         information_summary_ground_truth_component_ids: List[int] = []
+        information_summary_without_evidence_component_ids: List[int] = []
 
         # Optimize: single pass through components, cache results
         for idx, component in enumerate(components):
@@ -324,7 +325,8 @@ class HallucinationPenaltyRewardManager:
                     self.file_logger.info(f"[Event Ledger] Summary at turn {turn_id} HAS evidence in ledger")
                 else:
                     summaries_without_evidence += 1
-                    self.file_logger.info(f"[Event Ledger] Summary at turn {turn_id} has NO evidence in ledger")
+                    information_summary_without_evidence_component_ids.append(id(summary_component))
+                    self.file_logger.info(f"[Event Ledger] Summary at turn {turn_id} has NO evidence in ledger - will apply information_penalty")
 
             # Ground-truth consistency reward: summary must echo evidence containing ground truth
             if normalized_gt_parts and information_summary_indices:
@@ -352,13 +354,17 @@ class HallucinationPenaltyRewardManager:
             self.file_logger.warning("[Event Ledger] No ledger provided, falling back to component-based checking (may be inaccurate with compression)")
             
             for summary_idx in information_summary_indices:
+                summary_component = components[summary_idx]
                 has_prior_observation_info = any(info_idx < summary_idx for info_idx in observation_information_indices)
                 if has_prior_observation_info:
                     summaries_with_evidence += 1
                 else:
                     summaries_without_evidence += 1
+                    information_summary_without_evidence_component_ids.append(id(summary_component))
+                    self.file_logger.info(f"[Fallback] Summary at component {summary_idx} has NO evidence - will apply information_penalty")
 
-        information_penalty = self.config["information_penalty"] if model_information_indices else 0.0
+        # Apply information_penalty if there are model-generated information OR information_summary without evidence
+        information_penalty = self.config["information_penalty"] if (model_information_indices or information_summary_without_evidence_component_ids) else 0.0
         
         # NEW: Reward/penalize based on whether evidence exists in ledger (ground truth)
         if len(information_summary_indices) > 0:
@@ -391,6 +397,7 @@ class HallucinationPenaltyRewardManager:
             "observation_information_indices": observation_information_indices,
             "information_summary_ground_truth_bonus": information_summary_ground_truth_bonus,
             "information_summary_ground_truth_component_ids": information_summary_ground_truth_component_ids,
+            "information_summary_without_evidence_component_ids": information_summary_without_evidence_component_ids,
         }
     
     
@@ -598,13 +605,28 @@ class HallucinationPenaltyRewardManager:
         
         # 1. Information summary reward/penalty based on context availability
         if component.component_type == "information_summary":
-            bonus = hallucination_meta.get("information_summary_bonus", 0.0)
-            if bonus:
-                score += bonus
-                try:
-                    debug_parts.append(f"information_summary_bonus=+{bonus:.3f}")
-                except Exception:
-                    pass
+            # Check if this summary has evidence
+            without_evidence_component_ids = set(hallucination_meta.get("information_summary_without_evidence_component_ids", []))
+            
+            if id(component) in without_evidence_component_ids:
+                # No evidence: apply information_penalty (hallucination)
+                penalty = hallucination_meta.get("information_penalty", 0.0)
+                if penalty:
+                    score += penalty
+                    try:
+                        debug_parts.append(f"information_penalty={penalty:.3f} (no evidence)")
+                    except Exception:
+                        pass
+                    self.file_logger.info(f"[Penalty] Information summary at component {component_idx} penalized with {penalty:.3f} (no evidence)")
+            else:
+                # Has evidence: give bonus
+                bonus = hallucination_meta.get("information_summary_bonus", 0.0)
+                if bonus:
+                    score += bonus
+                    try:
+                        debug_parts.append(f"information_summary_bonus=+{bonus:.3f}")
+                    except Exception:
+                        pass
 
             if gt_component_id_set and id(component) in gt_component_id_set:
                 gt_bonus = hallucination_meta.get("information_summary_ground_truth_bonus", 0.0)

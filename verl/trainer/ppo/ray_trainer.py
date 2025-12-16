@@ -915,8 +915,6 @@ class RayPPOTrainer:
             retriever_timeout = self.config.retriever.timeout ,
             retriever_enable_global_rate_limit = self.config.retriever.enable_global_rate_limit,
             use_sliding = self.config.use_sliding,
-            full_context_ratio = self.config.full_context_ratio,
-            enable_kl_baseline = self.config.enable_kl_baseline,
             enable_debug_logs = self.config.enable_debug_logs
         )
 
@@ -1660,8 +1658,6 @@ class RayPPOTrainer:
             retriever_timeout = self.config.retriever.timeout ,
             retriever_enable_global_rate_limit = self.config.retriever.enable_global_rate_limit,
             use_sliding = self.config.use_sliding,
-            full_context_ratio = self.config.full_context_ratio,
-            enable_kl_baseline = self.config.enable_kl_baseline,
             enable_debug_logs = self.config.enable_debug_logs
         )
 
