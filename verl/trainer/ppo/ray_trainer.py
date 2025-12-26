@@ -66,7 +66,6 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
-from gigpo import core_gigpo
 
 from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
 from verl.utils.full_context_builder import FullContextBuilder
@@ -102,7 +101,6 @@ class AdvantageEstimator(str, Enum):
     REMAX = "remax"
     RLOO = "rloo"
     GRPO_PASSK = "grpo_passk"
-    GiGPO = 'gigpo'
 
 
 logger = logging.getLogger(__name__)
@@ -399,7 +397,7 @@ def compute_response_mask(data: DataProto):
         return response_mask
 
 
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, step_advantage_w=1.0, gigpo_mode="mean_std_norm", **kwargs):
+def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, **kwargs):
     """Compute advantage estimates for policy optimization.
 
     This function computes advantage estimates using various estimators like GAE, GRPO, REINFORCE++, etc.
@@ -501,19 +499,6 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
-    elif adv_estimator == AdvantageEstimator.GiGPO:
-        advantages, returns = core_gigpo.compute_gigpo_outcome_advantage(
-            token_level_rewards=data.batch['token_level_rewards'], # for episode group reward computing
-            step_rewards=data.batch['step_rewards'], # for step group reward computing
-            response_mask=data.batch['response_mask'],
-            anchor_obs=data.non_tensor_batch['anchor_obs'],
-            index=data.non_tensor_batch['uid'],
-            traj_index=data.non_tensor_batch['traj_uid'],
-            step_advantage_w=step_advantage_w,
-            mode=gigpo_mode,
-            )
-        data.batch['advantages'] = advantages
-        data.batch['returns'] = returns
     else:
         raise NotImplementedError
     return data
@@ -608,7 +593,6 @@ class RayPPOTrainer:
             AdvantageEstimator.REMAX,
             AdvantageEstimator.RLOO,
             AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
-            AdvantageEstimator.GiGPO
         ]:
             self.use_critic = False
         else:
@@ -1480,6 +1464,8 @@ class RayPPOTrainer:
                            f"Available keys: {list(batch.batch.keys())}")
         else:
             logger.warning(f"[ConsistencyDebug] Step {self.global_steps}: full_context_monitor_apply_grad=False (consistency_loss_weight might be 0 or not set)")
+            
+        return {"consistency_logprob_diff": mean_value}
 
     def _inject_full_context_batch(self, batch: DataProto, indices: list[int], full_dp: DataProto, full_log_probs: torch.Tensor = None):
         """
@@ -1931,15 +1917,6 @@ class RayPPOTrainer:
                     # del batch
                     # batch = gen_batch_output
 
-                    # if self.config.algorithm.adv_estimator == AdvantageEstimator.GiGPO:
-                    #     step_rewards_tensor = core_gigpo.compute_step_discounted_returns(
-                    #         batch=batch,
-                    #         gamma=self.config.algorithm.gamma
-                    #     )
-                    #     batch.batch['step_rewards'] = step_rewards_tensor
-                    
-                    # batch = adjust_batch(self.config, batch)
-
                     # batch.batch["response_mask"] = compute_response_mask(batch)
                     # # balance the number of valid tokens on each dp rank.
                     # # Note that this breaks the order of data inside the batch.
@@ -2085,14 +2062,14 @@ class RayPPOTrainer:
                             # use_pf_ppo=self.config.algorithm.use_pf_ppo,
                             # pf_ppo_reweight_method=self.config.algorithm.pf_ppo.reweight_method,
                             # pf_ppo_weight_pow=self.config.algorithm.pf_ppo.weight_pow,
-                            # step_advantage_w=self.config.algorithm.gigpo.step_advantage_w,
-                            # gigpo_mode=self.config.algorithm.gigpo.mode,
                         )
                         
                         # CRITICAL: Call _maybe_log_full_context_consistency AFTER compute_advantage
                         # This ensures old_log_probs and response_mask exist before injecting full_context_input_ids
                         # full_context_input_ids will be preserved during subsequent operations (reorder, etc.)
-                        self._maybe_log_full_context_consistency(batch)
+                        consistency_metrics = self._maybe_log_full_context_consistency(batch)
+                        if consistency_metrics:
+                            metrics.update(consistency_metrics)
                         
                         # DIAGNOSTIC: Verify full_context_input_ids was injected
                         if 'full_context_input_ids' in batch.batch:
@@ -2108,7 +2085,7 @@ class RayPPOTrainer:
                             _resp_check_freq = 10
                             _resp_check_verbose = False
                         
-                        if _resp_check_freq > 0 and (self.global_steps % _resp_check_freq == 0):
+                        if _resp_check_freq > 0 and (self.global_steps % _resp_check_freq == 0) and self.config.enable_debug_logs:
                             try:
                                 from verl.utils.check_responses import check_responses_in_training
                                 passed = check_responses_in_training(
@@ -2160,50 +2137,7 @@ class RayPPOTrainer:
                             import traceback
                             traceback.print_exc()
 
-                        # ==================== Gradient Flow Debug Check ====================
-                        # Comprehensive gradient flow diagnostics
-                        # Controlled by environment variable GRADIENT_FLOW_CHECK_FREQ (default: 1)
-                        # Set GRADIENT_FLOW_CHECK_FREQ=0 to disable checking
-                        try:
-                            from verl.utils.gradient_flow_debug import comprehensive_gradient_flow_check
-                            
-                            # Get advantage estimator name
-                            adv_estimator_name = str(self.config.algorithm.adv_estimator)
-                            
-                            # Get model for gradient check (if available)
-                            model_for_grad_check = None
-                            if hasattr(self, 'actor_rollout_wg') and hasattr(self.actor_rollout_wg, 'actor_module'):
-                                model_for_grad_check = self.actor_rollout_wg.actor_module
-                            
-                            # Loss history for stability check (optional, can be maintained separately)
-                            loss_history = getattr(self, '_loss_history', [])
-                            
-                            # Run comprehensive check
-                            gradient_flow_results = comprehensive_gradient_flow_check(
-                                batch=batch,
-                                step=self.global_steps,
-                                adv_estimator=adv_estimator_name,
-                                model=model_for_grad_check,
-                                check_loss_history=loss_history if len(loss_history) > 0 else None,
-                                sample_indices=[0, 1, 2] if batch.batch["responses"].shape[0] >= 3 else [0],
-                                verbose=False
-                            )
-                            
-                            # Store results for later analysis
-                            if not hasattr(self, '_gradient_flow_history'):
-                                self._gradient_flow_history = []
-                            self._gradient_flow_history.append(gradient_flow_results)
-                            
-                        except ImportError:
-                            # Fallback if module not available
-                            pass
-                        except Exception as e:
-                            # Don't let debug checks break training
-                            print(f"⚠️  [GRADIENT FLOW DEBUG] Exception at step {self.global_steps}: {e}")
-                            import traceback
-                            if os.environ.get("GRADIENT_FLOW_DEBUG_VERBOSE", "0") == "1":
-                                traceback.print_exc()
-                        # ========================================================================
+                     
 
                     # update critic
                     if self.use_critic:
