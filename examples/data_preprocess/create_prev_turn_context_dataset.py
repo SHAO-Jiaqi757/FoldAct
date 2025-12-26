@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -75,6 +76,48 @@ def find_latest_user_message(prompt: List[Dict[str, str]]) -> Optional[Dict[str,
     return None
 
 
+def truncate_information_content(content: str, max_chars: int = 4000) -> str:
+    """
+    Truncate <information> blocks in user messages to reduce context length.
+    Keeps the structure but limits the content size.
+    """
+    if "<information>" not in content:
+        return content
+    
+    # Pattern to match <information>...</information> blocks
+    pattern = r'(<information>)(.*?)(</information>)'
+    
+    def truncate_match(match):
+        tag_open = match.group(1)
+        tag_content = match.group(2)
+        tag_close = match.group(3)
+        
+        # If content is already short enough, return as is
+        if len(tag_content) <= max_chars:
+            return match.group(0)
+        
+        # Truncate to max_chars, trying to preserve structure
+        truncated = tag_content[:max_chars]
+        
+        # Try to cut at a reasonable boundary (end of a search result)
+        # Look for the last occurrence of "=======" (separator between searches)
+        last_separator = truncated.rfind("=======")
+        if last_separator > max_chars * 0.7:  # If separator is in last 30%, use it
+            truncated = truncated[:last_separator + 7]  # Include the separator
+        else:
+            # Otherwise, try to cut at end of a result number
+            last_result = truncated.rfind("\n\n## Web Results")
+            if last_result > max_chars * 0.7:
+                truncated = truncated[:last_result]
+            else:
+                # Just truncate and add ellipsis
+                truncated = truncated.rstrip() + "\n\n[... content truncated ...]"
+        
+        return tag_open + truncated + tag_close
+    
+    return re.sub(pattern, truncate_match, content, flags=re.DOTALL)
+
+
 def truncate_prompt(
     original_prompt: List[Dict[str, str]],
     initial_user_message: Optional[Dict[str, str]],
@@ -92,7 +135,13 @@ def truncate_prompt(
     })
 
     if latest_user_message and latest_user_message is not initial_user_message:
-        prompt_components.append(latest_user_message)
+        # Truncate information content in the latest user message
+        truncated_content = truncate_information_content(latest_user_message.get("content", ""))
+        truncated_user_message = {
+            "role": "user",
+            "content": truncated_content
+        }
+        prompt_components.append(truncated_user_message)
 
     return prompt_components
 

@@ -62,9 +62,15 @@ class MultiTurnSFTDataset(Dataset):
             import numpy
             import pandas
 
-            # Handle numpy arrays and pandas Series
-            while isinstance(ls, (pandas.core.series.Series, numpy.ndarray)) and len(ls) == 1:
-                ls = ls[0]
+            # Handle numpy arrays and pandas Series - convert to list first
+            if isinstance(ls, numpy.ndarray):
+                ls = ls.tolist()
+            elif isinstance(ls, pandas.core.series.Series):
+                ls = ls.tolist()
+            
+            # Handle nested numpy arrays (e.g., array containing a list)
+            while isinstance(ls, list) and len(ls) == 1 and isinstance(ls[0], (numpy.ndarray, pandas.core.series.Series)):
+                ls = ls[0].tolist() if hasattr(ls[0], 'tolist') else ls[0]
             
             # Ensure we always return a list of messages, even for single messages
             if isinstance(ls, dict):

@@ -77,7 +77,10 @@ def extract_context_from_multiturn(sample: Dict[str, Any]) -> str:
             elif content.startswith("<information>"):
                 context_parts.append(content)
         elif role == "assistant":
-            if content.startswith("<think>") or content.startswith("<search>"):
+            # Handle both old format (<search>) and new format (<tool_call>)
+            if (content.startswith("<think>") or 
+                content.startswith("<search>") or 
+                "<tool_call>" in content):
                 context_parts.append(content)
     
     return "\n\n".join(context_parts)
