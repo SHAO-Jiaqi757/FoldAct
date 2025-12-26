@@ -125,7 +125,6 @@ class LLMGenerationManager:
         if responses.shape[1] == 0:
             return False
         
-        print("[DEBUG] responses_types in turn:", turn['responses_types'])
         # Use responses_types if available (more accurate than text decoding)
         if 'responses_types' in turn:
             responses_types = turn['responses_types']

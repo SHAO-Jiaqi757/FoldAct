@@ -276,6 +276,8 @@ trainer:
   experiment_name: gsm8k
   logger: [ 'console', 'wandb' ]
   log_val_generations: 0
+  enable_experiment_logging: True 
+  experiment_log_dir: logs/paper_experiments
   rollout_data_dir: null # directory for logging the rollout data, no dump if null
   validation_data_dir: null # directory for logging the validation data, no dump if null
   nnodes: 1
