@@ -4,6 +4,7 @@
 
 **FoldAct** is a framework for training long-horizon reinforcement learning agents with context folding, addressing the fundamental non-stationary observation problem that arises when summary actions modify the agent's future observation space.
 
+- **[foldact-7b-local-qwen-2.5-it](https://huggingface.co/Luuvy/foldact-7b-local-qwen-2.5-it)**: A 7B parameter model fine-tuned from Qwen2.5-7B-Instruct using FoldAct framework.
 
 ## Installation
 
