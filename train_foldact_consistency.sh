@@ -237,8 +237,8 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.resume_mode=enable \
     +trainer.val_only=false \
     ++trainer.val_before_train=false \
-    +trainer.enable_experiment_logging=true \
-    +trainer.experiment_log_dir=logs/paper_experiments \
+    trainer.enable_experiment_logging=true \
+    trainer.experiment_log_dir=logs/paper_experiments \
     trainer.default_hdfs_dir=null \
     trainer.default_local_dir=verl_checkpoints/$EXPERIMENT_NAME \
     trainer.max_actor_ckpt_to_keep=2 \
@@ -271,31 +271,21 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     \
     `# ========== 🆕 CONTEXT WINDOW & KL-AWARE TRAINING ==========` \
     `# Enable sliding window: keep only the most recent 1 turn` \
-    +use_sliding=true \
-    `# KL-Aware Training: 10% full context, 90% compressed` \
-    +full_context_ratio=0.3 \
-    `# Enable KL baseline computation for compressed rollouts` \
-    +enable_kl_baseline=false \
+    +use_summary=true \
     \
     `# ========== 🚀 OPTIMIZED PER-TURN TRAINING ==========` \
-    `# Enable per-turn training for context mismatch correction` \
-    +use_per_turn_training=true \
     `# Selective per-turn: only use for final 2 turns (efficiency optimization)` \
-    +use_selective_per_turn=true \
+    +per_turn_dropout_prob=0.5 \
     \
     `# ========== 🆕 PER-TURN + SUMMARY TRAINING ==========` \
     `# Enable Per-Turn + Summary method (separated log_prob computation)` \
-    +actor_rollout_ref.actor.use_per_turn_summary=true \
+    `# +actor_rollout_ref.actor.use_separated_loss=true (Auto-enabled by use_summary=true)` \
     `# Enable Full Context Supervision for consistency loss` \
     +actor_rollout_ref.actor.use_full_context_supervision=true \
     `# Loss weights: λ for summary, (1-λ) for action, β for consistency` \
-    +actor_rollout_ref.actor.summary_loss_weight=0.3 \
-    +actor_rollout_ref.actor.action_loss_weight=0.7 \
-    +actor_rollout_ref.actor.consistency_loss_weight=0.1 \
-    `# Full context consistency computation settings` \
-    `# CRITICAL: Set interval=1 to compute consistency loss every step (default=100 means only every 100 steps)` \
-    +trainer.full_context_consistency_interval=1 \
-    +trainer.full_context_consistency_sample_size=4 \
+    +actor_rollout_ref.actor.summary_loss_weight=1 \
+    +actor_rollout_ref.actor.action_loss_weight=1 \
+    +actor_rollout_ref.actor.consistency_loss_weight=1 \
     \
     2>&1 | { if [ "$LOG_TO_FILE" = "1" ]; then tee -a "$LOG_FILE"; else cat; fi; }
 

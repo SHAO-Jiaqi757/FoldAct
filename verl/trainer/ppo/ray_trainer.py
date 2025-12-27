@@ -556,6 +556,20 @@ class RayPPOTrainer:
         self.tokenizer = tokenizer
         self.processor = processor
         self.config = config
+        
+        # Synchronize use_summary to actor config for FoldAct
+        # If use_summary is enabled (generating summary tokens), we should default to using 
+        # separated log_prob computation (use_separated_loss) in the actor, unless explicitly disabled.
+        if self.config.get('use_summary', False):
+            if 'actor' in self.config.actor_rollout_ref:
+                # We check if it is explicitly set to False by user, otherwise default to True
+                # Note: config is a DictConfig, so we can check existence
+                if self.config.actor_rollout_ref.actor.get('use_separated_loss') is None:
+                     print("[RayTrainer] Auto-enabling use_separated_loss because use_summary=True")
+                     # Use open_dict to temporarily disable struct mode for setting new keys
+                     with open_dict(self.config.actor_rollout_ref.actor):
+                         self.config.actor_rollout_ref.actor.use_separated_loss = True
+
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
         self.envs = envs
@@ -898,7 +912,7 @@ class RayPPOTrainer:
             retriever_rate_limit= self.config.retriever.rate_limit ,
             retriever_timeout = self.config.retriever.timeout ,
             retriever_enable_global_rate_limit = self.config.retriever.enable_global_rate_limit,
-            use_sliding = self.config.use_sliding,
+            use_summary = self.config.use_summary,
             enable_debug_logs = self.config.enable_debug_logs
         )
 
@@ -1643,7 +1657,7 @@ class RayPPOTrainer:
             retriever_rate_limit= self.config.retriever.rate_limit ,
             retriever_timeout = self.config.retriever.timeout ,
             retriever_enable_global_rate_limit = self.config.retriever.enable_global_rate_limit,
-            use_sliding = self.config.use_sliding,
+            use_summary = self.config.use_summary,
             enable_debug_logs = self.config.enable_debug_logs
         )
 
@@ -1750,9 +1764,11 @@ class RayPPOTrainer:
                                 final_gen_batch_output.batch[key] = final_gen_batch_output.batch[key].long()
 
                             with torch.no_grad():
-                                # Optional per-turn context log_prob computation
-                                use_per_turn = self.config.get("use_per_turn_training", False)
-                                if use_per_turn:
+                                # Per-turn training is automatically enabled when use_summary=True
+                                # because per-turn contexts are saved during generation
+                                use_summary = self.config.get("use_summary", False)
+                                print(f"[RayTrainer] use_summary: {use_summary}")
+                                if use_summary:
                                     try:
                                         from verl.utils.per_turn_training import PerTurnContextManager
                                         def _orig_compute(dp: DataProto):
@@ -1760,14 +1776,31 @@ class RayPPOTrainer:
                                             dp.meta_info[DataProtoConfig.auto_padding_key] = True
                                             return self.actor_rollout_wg.compute_log_prob(dp)
                                         
-                                        # SELECTIVE PER-TURN TRAINING: Only use per-turn for final turns
+                                        # SELECTIVE PER-TURN TRAINING: Randomly sample turns with dropout probability
                                         # This reduces computational overhead while maintaining accuracy
-                                        use_selective_per_turn = self.config.get("use_selective_per_turn", True)
-                                        if use_selective_per_turn:
-                                            # Only use per-turn for the last 1-2 turns per trajectory
+                                        # When dropout is enabled, turns with mask=False are skipped in per-turn processing
+                                        # and will use regular context computation (fallback behavior)
+                                        per_turn_dropout_prob = self.config.get("per_turn_dropout_prob", 0.0)
+                                        
+                                        per_turn_mask = None
+                                        if per_turn_dropout_prob > 0.0:
+                                            # Extract per-turn contexts to determine structure
+                                            per_turn_contexts_batch = PerTurnContextManager.extract_per_turn_contexts(final_gen_batch_output)
+                                            if per_turn_contexts_batch is not None:
+                                                # Generate random mask: True = use per-turn context, False = skip (use regular context)
+                                                # dropout_prob is the probability of NOT using per-turn context (i.e., probability of dropping)
+                                                import random
+                                                per_turn_mask = []
+                                                for traj in per_turn_contexts_batch:
+                                                    # For each turn, randomly decide: True if random > dropout_prob (use per-turn), False otherwise (drop)
+                                                    traj_mask = [random.random() > per_turn_dropout_prob for _ in traj]
+                                                    per_turn_mask.append(traj_mask)
+                                        
+                                            # Use per-turn with optional random dropout mask
                                             log_probs = PerTurnContextManager.compute_per_turn_log_probs_batched(
                                                 final_gen_batch_output, _orig_compute, 
-                                                use_per_turn_context=True
+                                                use_per_turn_context=True,
+                                                per_turn_mask=per_turn_mask
                                             )
                                         else:
                                             # Use per-turn for all turns (original behavior)
@@ -1807,21 +1840,6 @@ class RayPPOTrainer:
                                                     pad_mask = torch.zeros(log_probs.shape[0], pad_size, 
                                                                           dtype=log_probs.valid_mask.dtype, device=log_probs.device)
                                                     log_probs.valid_mask = torch.cat([log_probs.valid_mask, pad_mask], dim=1)
-                                        
-                                        # DIAGNOSIS: Check log_probs before storing
-                                        if isinstance(log_probs, torch.Tensor):
-                                            log_probs_zero_count = (log_probs == 0.0).sum().item()
-                                            log_probs_total = log_probs.numel()
-                                            log_probs_zero_ratio = log_probs_zero_count / log_probs_total if log_probs_total > 0 else 0.0
-                                            log_probs_mean = log_probs.mean().item() if log_probs.numel() > 0 else 0.0
-                                            log_probs_std = log_probs.std().item() if log_probs.numel() > 0 else 0.0
-                                            
-                                            if log_probs_zero_ratio > 0.9:  # More than 90% zeros
-                                                print(f"[Per-Turn Training] CRITICAL: log_probs has {log_probs_zero_ratio*100:.1f}% zeros! "
-                                                      f"shape={log_probs.shape}, mean={log_probs_mean:.6f}, std={log_probs_std:.6f}")
-                                            
-                                            print(f"[Per-Turn Training] Storing log_probs: shape={log_probs.shape}, "
-                                                  f"zero_ratio={log_probs_zero_ratio*100:.1f}%, mean={log_probs_mean:.6f}, std={log_probs_std:.6f}")
                                         
                                         final_gen_batch_output.batch['old_log_probs'] = log_probs
                                         

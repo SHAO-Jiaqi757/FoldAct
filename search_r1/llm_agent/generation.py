@@ -88,7 +88,7 @@ class GenerationConfig:
     # Increased to 16384 to accommodate longer tool responses (Jina search returns 5-10x longer)
     max_model_len: int = 16384
     # Enable sliding window context: keep only the most recent N turns (0 = keep all)
-    use_sliding: bool = False
+    use_summary: bool = False
     # Performance optimization: reduce logging overhead
     enable_debug_logs: bool = False
 
@@ -754,10 +754,9 @@ class LLMGenerationManager:
         rollings = gen_batch
 
         # Track history for sliding window if enabled
-        use_sliding = getattr(self.config, "use_sliding", False)
-        print(f"\n[DEBUG] use_sliding: {use_sliding}")
+        use_summary = getattr(self.config, "use_summary", False)
         
-        # Initialize turn_history and initial_question_ids regardless of use_sliding
+        # Initialize turn_history and initial_question_ids regardless of use_summary
         initial_question_ids = gen_batch.batch['input_ids'].clone()
         turn_history: List[Dict[str, torch.Tensor]] = []
         
@@ -765,9 +764,6 @@ class LLMGenerationManager:
         batch_size = gen_batch.batch['input_ids'].shape[0]
         event_ledgers = [EventLedger(trajectory_id=f"traj_{i}") for i in range(batch_size)]
         logger.info(f"[Event Ledger] Initialized {batch_size} event ledgers for full context tracking")
-        
-        if use_sliding:
-            print(f"[DEBUG] Sliding window enabled, turn history initialized")
         
         # Track if observation is too long (forces summarized context)
         force_summarized = False
@@ -1050,9 +1046,7 @@ class LLMGenerationManager:
                     f.write(json.dumps({"turn": turn_record}, ensure_ascii=False) + "\n")
 
             # Update states
-            if use_sliding:
-                print(f"\n[DEBUG] Turn {step}: Entering sliding window block")
-                print(f"[DEBUG] Turn history length before append: {len(turn_history)}")
+            if use_summary:
                 # Store current turn and rebuild rolling context using sliding window
                 turn_history.append({
                     'responses': responses_ids.clone(),
@@ -1063,14 +1057,6 @@ class LLMGenerationManager:
                     # False -> treated as non-info turn in context compression
                     'has_real_info': turn_has_real_info,
                 })
-                print(f"[DEBUG] Turn history length after append: {len(turn_history)}")
-                
-                # ========== CONTEXT DECISION LOGGING ==========
-                print(f"\n{'='*60}")
-                print(f"[CONTEXT DECISION] Turn {step} - Context Strategy Selection")
-                print(f"{'='*60}")
-                print(f"[CONTEXT DECISION] Force summarized: {force_summarized}")
-                print(f"[CONTEXT DECISION] Turn history length: {len(turn_history)}")
                 
                 if force_summarized:
                     # Observation too long: keep only last 2-3 turns
@@ -1090,27 +1076,11 @@ class LLMGenerationManager:
                 rollings.batch['attention_mask'] = self.tensor_fn.create_attention_mask(windowed_input_ids)
                 rollings.batch['position_ids'] = self.tensor_fn.create_position_ids(rollings.batch['attention_mask'])
                 
-                # ========== FINAL CONTEXT LOGGING ==========
-                print(f"\n{'='*60}")
-                print(f"[FINAL CONTEXT] Turn {step} - Context for Next Turn")
-                print(f"{'='*60}")
-                print(f"[FINAL CONTEXT] Final context length: {windowed_input_ids.shape[1]} tokens")
-                if hasattr(self, 'tokenizer') and self.tokenizer is not None and getattr(self.config, 'enable_debug_logs', False):
-                    final_context_text = self.tokenizer.decode(windowed_input_ids[0], skip_special_tokens=True)
-                    print(f"[FINAL CONTEXT] Final context preview: {final_context_text}")  # Last 300 chars
-                print(f"{'='*60}\n")
                 
                 # Monitor context length (after context decision is made)
                 current_context_length = windowed_input_ids.shape[1]
                 context_lengths_per_turn.append(current_context_length)
             else:
-                # ========== NON-SLIDING WINDOW LOGGING ==========
-                print(f"\n{'='*60}")
-                print(f"[NON-SLIDING] Turn {step} - Using Standard Context Update")
-                print(f"{'='*60}")
-                print(f"[NON-SLIDING] Using standard rolling state update")
-                print(f"{'='*60}\n")
-                
                 rollings = self._update_rolling_state(
                     rollings,
                     responses_ids,
@@ -1211,7 +1181,7 @@ class LLMGenerationManager:
             meta_info['avg_context_length'] = avg_context_length
             
             # Calculate compression ratio using turn_history and event_ledgers
-            if use_sliding and turn_history:
+            if use_summary and turn_history:
                 # Calculate full context length (all turns without compression)
                 full_context_tokens: List[torch.Tensor] = [initial_question_ids.clone()]
                 for turn in turn_history:
@@ -1231,20 +1201,7 @@ class LLMGenerationManager:
                     'tokens_saved': int(tokens_saved),
                     'compression_ratio': float(compression_ratio)
                 }
-                
-                # ========== FINAL CONTEXT SUMMARY LOGGING ==========
-                print(f"\n{'='*80}")
-                print(f"[FINAL CONTEXT SUMMARY] Rollout Complete - Context Statistics")
-                print(f"{'='*80}")
-                print(f"[FINAL CONTEXT SUMMARY] Total turns processed: {len(context_lengths_per_turn)}")
-                print(f"[FINAL CONTEXT SUMMARY] Full context length: {full_context_length} tokens")
-                print(f"[FINAL CONTEXT SUMMARY] Compressed context length: {final_context_length} tokens")
-                print(f"[FINAL CONTEXT SUMMARY] Tokens saved: {tokens_saved} tokens")
-                print(f"[FINAL CONTEXT SUMMARY] Compression ratio: {compression_ratio:.1%}")
-                print(f"[FINAL CONTEXT SUMMARY] Average context length: {avg_context_length:.1f} tokens")
-                
-                # Debug: Show individual turn lengths
-                print(f"[FINAL CONTEXT SUMMARY] Individual turn lengths: {context_lengths_per_turn}")
+             
             else:
                 # No compression (non-sliding window or no history)
                 meta_info['compression_stats'] = {
@@ -1254,17 +1211,6 @@ class LLMGenerationManager:
                     'compression_ratio': 0.0
                 }
                 
-                # ========== FINAL CONTEXT SUMMARY LOGGING ==========
-                print(f"\n{'='*80}")
-                print(f"[FINAL CONTEXT SUMMARY] Rollout Complete - Context Statistics")
-                print(f"{'='*80}")
-                print(f"[FINAL CONTEXT SUMMARY] Total turns processed: {len(context_lengths_per_turn)}")
-                print(f"[FINAL CONTEXT SUMMARY] Final context length: {final_context_length} tokens")
-                print(f"[FINAL CONTEXT SUMMARY] Average context length: {avg_context_length:.1f} tokens")
-                print(f"[FINAL CONTEXT SUMMARY] No compression applied (non-sliding window mode)")
-                
-                # Debug: Show individual turn lengths
-                print(f"[FINAL CONTEXT SUMMARY] Individual turn lengths: {context_lengths_per_turn}")
         else:
             # Fallback when context_lengths_per_turn is empty
             final_context_length = original_right_side['responses'].size(1) if 'responses' in original_right_side else 0
@@ -1272,7 +1218,7 @@ class LLMGenerationManager:
             meta_info['avg_context_length'] = final_context_length
             
             # Try to calculate compression ratio from turn_history if available
-            if use_sliding and turn_history:
+            if use_summary and turn_history:
                 full_context_tokens: List[torch.Tensor] = [initial_question_ids.clone()]
                 for turn in turn_history:
                     full_context_tokens.append(turn['responses'])
@@ -1298,20 +1244,7 @@ class LLMGenerationManager:
                     'compression_ratio': 0.0
                 }
             
-            print(f"\n{'='*80}")
-            print(f"[FINAL CONTEXT SUMMARY] Rollout Complete - Context Statistics")
-            print(f"{'='*80}")
-            print(f"[FINAL CONTEXT SUMMARY] Total turns processed: 0 (context tracking failed)")
-            print(f"[FINAL CONTEXT SUMMARY] Final context length: {final_context_length} tokens")
-            print(f"[FINAL CONTEXT SUMMARY] Average context length: {final_context_length} tokens (fallback)")
-            if use_sliding and turn_history and 'compression_stats' in meta_info:
-                comp_stats = meta_info['compression_stats']
-                print(f"[FINAL CONTEXT SUMMARY] Full context length: {comp_stats['full_context_length']} tokens")
-                print(f"[FINAL CONTEXT SUMMARY] Compression ratio: {comp_stats['compression_ratio']:.1%}")
-            print(f"[FINAL CONTEXT SUMMARY] ⚠️ WARNING: Context length tracking failed - using fallback values")
-            print(f"{'='*80}\n")
         
-        print("ACTIVE_TRAJ_NUM:", active_num_list)
         
         # Compose final output using _compose_final_output
         # The fingerprint has been added to meta_info above

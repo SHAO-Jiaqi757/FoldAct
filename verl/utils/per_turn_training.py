@@ -90,6 +90,7 @@ def _flatten_and_validate_turns(
     per_turn_contexts_batch: List[List[Dict]],
     max_turns_per_traj: Optional[int],
     pad_token_id: int = 0, # Assuming 0 is the pad_token_id for reconstruction
+    per_turn_mask: Optional[List[List[bool]]] = None,  # Optional mask for per-turn dropout
 ) -> Tuple[List[TurnData], List[Tuple[int, int, int, int]]]:
     """
     Flattens all turns from all trajectories into a single list, validating each one.
@@ -97,15 +98,32 @@ def _flatten_and_validate_turns(
     - Filters out turns with no real tokens in the context.
     - Reconstructs attention masks if they are faulty.
     - Encapsulates validated data into TurnData objects.
+    - If per_turn_mask is provided, only processes turns where mask is True.
     """
     valid_turns: List[TurnData] = []
     turn_mapping: List[Tuple[int, int, int, int]] = []
 
     for traj_idx, traj in enumerate(per_turn_contexts_batch):
         selected_turns = traj[-max_turns_per_traj:] if max_turns_per_traj and len(traj) > max_turns_per_traj else traj
+        
+        # Get per-turn mask for this trajectory if available
+        traj_mask = per_turn_mask[traj_idx] if per_turn_mask is not None else None
 
         for turn_idx_in_selection, turn_ctx in enumerate(selected_turns):
             original_turn_idx = (len(traj) - len(selected_turns) + turn_idx_in_selection) if max_turns_per_traj else turn_idx_in_selection
+            
+            # Apply per-turn dropout mask if provided
+            if traj_mask is not None:
+                # Map turn_idx_in_selection to original turn index in the full trajectory
+                if max_turns_per_traj:
+                    # For max_turns_per_traj, we need to check the mask at the original position
+                    mask_idx = original_turn_idx
+                else:
+                    mask_idx = turn_idx_in_selection
+                
+                # Check if mask exists and is False (turn should be dropped)
+                if mask_idx < len(traj_mask) and not traj_mask[mask_idx]:
+                    continue  # Skip this turn (use regular context instead)
 
             ctx_ids = turn_ctx['input_ids']
             ctx_mask = turn_ctx['attention_mask']
@@ -441,6 +459,54 @@ class PerTurnContextManager:
         return result
 
     @staticmethod
+    def _merge_log_probs(
+        full_log_probs: torch.Tensor,
+        per_turn_log_probs: torch.Tensor,
+        valid_turns: List[TurnData],
+        per_turn_contexts_batch: List[List[Dict]]
+    ) -> torch.Tensor:
+        """
+        Merges per-turn log probs into the full (regular) log probs tensor.
+        This handles the case where some turns were skipped (dropout).
+        """
+        final_output = full_log_probs.clone()
+        
+        for i, turn in enumerate(valid_turns):
+            # The log probs for this turn (slice to valid length)
+            # per_turn_log_probs is [Num_Valid_Turns, Max_Turn_Len]
+            # turn.resp_len is the actual length of this turn's response
+            turn_lp = per_turn_log_probs[i, :turn.resp_len]
+            
+            # Compute offset in the full response sequence
+            traj_ctxs = per_turn_contexts_batch[turn.traj_idx]
+            offset = 0
+            for k in range(turn.original_turn_idx):
+                # Add lengths of previous turns
+                # Handle both tensor and list/array response
+                resp = traj_ctxs[k].get('response')
+                if resp is not None:
+                     if hasattr(resp, 'shape'):
+                         offset += resp.shape[0]
+                     else:
+                         offset += len(resp)
+            
+            # Apply to final output
+            end_idx = offset + turn.resp_len
+            
+            # Safety check for bounds
+            if offset >= final_output.shape[1]:
+                continue
+                
+            if end_idx > final_output.shape[1]:
+                # Truncate if exceeds full log probs length
+                valid_len = final_output.shape[1] - offset
+                final_output[turn.traj_idx, offset:final_output.shape[1]] = turn_lp[:valid_len]
+            else:
+                final_output[turn.traj_idx, offset:end_idx] = turn_lp
+                
+        return final_output
+
+    @staticmethod
     def compute_per_turn_log_probs_batched(
         data: DataProto,
         compute_log_prob_fn,
@@ -448,7 +514,8 @@ class PerTurnContextManager:
         log_debug: bool = False,
         max_turns_per_traj: Optional[int] = None,
         # This should be passed from config, e.g., cfg.actor_rollout_ref.ref.log_prob_max_token_len_per_gpu
-        model_max_length: int = 8192 
+        model_max_length: int = 8192,
+        per_turn_mask: Optional[List[List[bool]]] = None,  # Optional mask for per-turn dropout
     ) -> torch.Tensor:
         """
         REFACTORED v2: A robust, single-batch, per-turn log_prob computation.
@@ -471,26 +538,60 @@ class PerTurnContextManager:
         num_traj = len(per_turn_contexts_batch)
         pad_token_id = getattr(data, 'pad_token_id', 0)
 
-        # 1. Flatten, validate, and encapsulate all turns
+        # 1. Check if we need fallback (regular computation)
+        # We need it if ANY turn is dropped (mask is False) or if we want to be safe
+        need_fallback = False
+        if per_turn_mask is not None:
+            for traj_mask in per_turn_mask:
+                # If any turn is False, we need fallback values
+                # If len(traj_mask) < num_turns, we also need fallback for the tail
+                # Simplified: if we have a mask, assume we are doing selective training and get fallback
+                need_fallback = True
+                break
+        
+        full_log_probs = None
+        if need_fallback:
+             # Compute regular log probs for the full batch as baseline
+             try:
+                 out = compute_log_prob_fn(data)
+                 full_log_probs = out.batch['old_log_probs'] if isinstance(out, DataProto) else out
+                 
+                 # Align lengths if needed
+                 responses_shape = data.batch.get('responses', torch.empty(0)).shape
+                 if len(responses_shape) == 2:
+                     max_response_length = responses_shape[1]
+                     if full_log_probs.shape[1] > max_response_length:
+                         full_log_probs = full_log_probs[:, -max_response_length:]
+             except Exception as e:
+                 logger.warning(f"[Per-Turn] Failed to compute fallback log probs: {e}")
+                 # If fallback fails, we might return partial results (legacy behavior) or error
+                 # For now, proceed and see if we can construct result from valid turns
+                 pass
+
+        # 2. Flatten, validate, and encapsulate all turns
         valid_turns, turn_mapping = _flatten_and_validate_turns(
-            per_turn_contexts_batch, max_turns_per_traj, pad_token_id
+            per_turn_contexts_batch, max_turns_per_traj, pad_token_id, per_turn_mask
         )
 
         if not valid_turns:
+            if full_log_probs is not None:
+                return full_log_probs
             logger.warning("[Per-Turn Refactor] No valid turns found after filtering. Returning empty tensor.")
             return torch.empty(num_traj, 0, dtype=torch.float32, device='cpu')
 
-        # 2. Build left-padded batch tensors using the robust flip-pad-flip method
+        # 3. Build left-padded batch tensors using the robust flip-pad-flip method
         batched_tensors = _build_batched_tensors(valid_turns, pad_token_id, model_max_length)
         
         if not batched_tensors:
+             if full_log_probs is not None:
+                return full_log_probs
              logger.warning("[Per-Turn Refactor] No valid turns after truncation. Returning empty tensor.")
              return torch.empty(num_traj, 0, dtype=torch.float32, device='cpu')
 
-        # 3. Prepare the final DataProto for the model (now much simpler)
+        # 4. Prepare the final DataProto for the model (now much simpler)
         turn_batch_for_compute = _prepare_for_computation(batched_tensors)
 
-        # 4. Execute the computation
+        # 5. Execute the computation
         try:
             out = compute_log_prob_fn(turn_batch_for_compute)
             log_probs = out.batch['old_log_probs'] if isinstance(out, DataProto) else out
@@ -502,11 +603,20 @@ class PerTurnContextManager:
 
         except Exception as e:
             logger.error(f"[Per-Turn Refactor] Error during compute_log_prob_fn: {e}", exc_info=True)
+            if full_log_probs is not None:
+                return full_log_probs
             # Return an empty tensor to avoid crashing the training loop
             return torch.empty(num_traj, 0, dtype=torch.float32, device='cpu')
         
-        # 5. Map the flat results back to the original trajectory structure
-        final_output = _map_results_to_trajectories(log_probs, valid_turns, num_traj)
+        # 6. Map results back
+        if full_log_probs is not None:
+            # If we have fallback, merge per-turn results into it
+            final_output = PerTurnContextManager._merge_log_probs(
+                full_log_probs, log_probs, valid_turns, per_turn_contexts_batch
+            )
+        else:
+            # If no fallback (all turns processed), map from scratch
+            final_output = _map_results_to_trajectories(log_probs, valid_turns, num_traj)
         
         # Attach a valid_mask for loss calculation, similar to the original implementation
         valid_mask = (final_output != 0.0)
