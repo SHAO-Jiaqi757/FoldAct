@@ -1,0 +1,473 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import asyncio
+import heapq
+import importlib
+import logging
+import os
+import socket
+import threading
+from abc import ABC, abstractmethod
+from contextlib import asynccontextmanager
+from typing import Any, Callable, Dict, List, Tuple, Type
+from uuid import uuid4
+
+import aiohttp
+import fastapi
+import ray
+import uvicorn
+from cachetools import LRUCache
+from omegaconf import DictConfig
+from openai import AsyncOpenAI
+from openai.types.chat.chat_completion import ChatCompletion
+from starlette.requests import Request
+
+from verl.protocol import DataProto
+from verl.single_controller.ray.base import RayWorkerGroup
+from verl.utils import hf_tokenizer
+from verl.utils.fs import copy_to_local
+
+logger = logging.getLogger(__file__)
+
+
+def _get_free_port():
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        return sock.getsockname()[1]
+
+
+class AsyncServerBase(ABC):
+    """Base class for AsyncServer."""
+
+    def __init__(self):
+        self.address = ray._private.services.get_node_ip_address()
+        self.port = None
+        self.server_ready = asyncio.Event()
+        asyncio.create_task(self._start_fastapi_server())
+
+    async def _start_fastapi_server(self):
+        @asynccontextmanager
+        async def lifespan(app: fastapi.FastAPI):
+            print("FastAPI startup")
+            self.server_ready.set()
+            yield
+
+            # There's no way to gracefully restart uvicorn server if port is already in use,
+            # so we exit the process directly and let AsyncLLMServerManager restart it.
+            print("FastAPI shutdown, maybe address already in use, exit process immediately.")
+            os._exit(-1)
+
+        app = fastapi.FastAPI(lifespan=lifespan)
+        app.router.add_api_route("/v1/chat/completions", self.chat_completion, methods=["POST"])
+
+        self.port = _get_free_port()
+        config = uvicorn.Config(app, host=["::", "0.0.0.0"], port=self.port, log_level="warning")
+        server = uvicorn.Server(config)
+        await server.serve()
+
+    async def get_server_address(self) -> Tuple[str, int]:
+        """Get FastAPI server address."""
+        await self.server_ready.wait()
+        return f"{self.address}:{self.port}"
+
+    @abstractmethod
+    async def chat_completion(self, raw_request: Request):
+        """OpenAI chat completion API.
+
+        API reference: https://platform.openai.com/docs/api-reference/chat/create
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def init_engine(self):
+        """Init async LLM engine."""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def wake_up(self):
+        """Wake up engine to load model weights and build kv cache."""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def sleep(self):
+        """Sleep engine to offload model weights and discard kv cache."""
+        raise NotImplementedError
+        
+    @abstractmethod
+    async def reload_model_from_hf_dir(self, hf_dir: str):
+        """Reload model from HuggingFace directory.
+        
+        Args:
+            hf_dir: str, huggingface model directory.
+        """
+        raise NotImplementedError
+
+
+class ChatCompletionScheduler:
+    def __init__(
+        self,
+        config: DictConfig,
+        model_path: str,
+        server_addresses: List[str],
+        max_cache_size: int = 10000,
+    ):
+        """
+        Args:
+            config: DictConfig, rollout config.
+            model_path: str, model path.
+            server_addresses: List[str], server addresses.
+            max_cache_size: int, max cache size of request_id to address mapping.
+        """
+        self.config = config
+        self.model_name = "/".join(model_path.split("/")[-2:])
+        local_path = copy_to_local(model_path)
+        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=True)
+
+        # Least requests load balancing
+        self.weighted_addresses = [[0, address] for address in server_addresses]
+        heapq.heapify(self.weighted_addresses)
+
+        # LRU cache to map request_id to address
+        self.request_id_to_address = LRUCache(maxsize=max_cache_size)
+
+    async def submit_chat_completions(
+        self,
+        callback: Callable[[ChatCompletion, Dict[str, Any], Exception], None],
+        callback_additional_info: Dict[str, Any],
+        **chat_complete_request,
+    ):
+        """
+        Submit a chat completion request to the server with the least number of requests.
+
+        Args:
+            callback: Callable[[ChatCompletion, Dict[str, Any], Exception], None], async callback function
+                to handle the response. The callback function should have the following signature:
+
+                ```python
+                async def callback(completions: ChatCompletion, info: Dict[str, Any], exception: Exception):
+                    ...
+                ```
+                - completions: chat completion response from server.
+                - info: user provided `callback_additional_info`.
+                - exception: exception raise from OpenAI client if request failed, otherwise None.
+
+                **CAUTION**: the callback function must be async and non-blocking, if you have any blocking operation,
+                please move to seperate thread or process pool to avoid blocking the event loop.
+
+            callback_additional_info: Dict[str, Any], additional info to pass to the callback function.
+
+            **chat_complete_request: dict, request parameters same as OpenAI AsyncCompletions.create.
+                OpenAI API reference: https://platform.openai.com/docs/api-reference/chat/create
+        """
+        if "extra_headers" not in chat_complete_request:
+            chat_complete_request["extra_headers"] = {}
+
+        extra_headers = chat_complete_request["extra_headers"]
+        request_id = extra_headers.get("x-request-id", None)
+        if request_id:
+            if request_id.startswith("chatcmpl-"):
+                request_id = request_id[len("chatcmpl-") :]
+                extra_headers["x-request-id"] = request_id
+
+            address = self.request_id_to_address.pop(request_id)
+        else:
+            address = self.weighted_addresses[0][1]
+            self.weighted_addresses[0][0] += 1
+            heapq.heapreplace(self.weighted_addresses, self.weighted_addresses[0])
+
+        # use new request_id to avoid duplicate request_id problem
+        request_id = uuid4().hex
+        self.request_id_to_address[request_id] = address
+        chat_complete_request["extra_headers"]["x-request-id"] = request_id
+
+        completions, exception = None, None
+        try:
+            # NOTE: OpenAI client uses httpx, seems to have performance issue in high concurrency requests.
+            completions = await self._chat_completions_aiohttp(address, **chat_complete_request)
+        except Exception as e:
+            # Let user handle the exception
+            exception = e
+
+        await callback(completions, callback_additional_info, exception)
+
+    async def _chat_completions_openai(self, address: str, **chat_complete_request) -> ChatCompletion:
+        client = AsyncOpenAI(base_url=f"http://{address}/v1", api_key="token-abc123", timeout=None, max_retries=0)
+        return await client.chat.completions.create(**chat_complete_request)
+
+    async def _chat_completions_aiohttp(self, address: str, **chat_complete_request) -> ChatCompletion:
+        try:
+            extra_headers = chat_complete_request.pop("extra_headers")
+            timeout = aiohttp.ClientTimeout(total=None)
+            session = aiohttp.ClientSession(timeout=timeout)
+            async with session.post(
+                url=f"http://{address}/v1/chat/completions",
+                headers={"Authorization": "Bearer token-abc123", **extra_headers},
+                json=chat_complete_request,
+            ) as resp:
+                data = await resp.json()
+                return ChatCompletion(**data)
+        finally:
+            await session.close()
+
+    async def generate_sequences(self, prompts: DataProto, **sampling_params) -> DataProto:
+        raise NotImplementedError
+
+
+class AsyncLLMServerManager:
+    """AsyncLLMServerManager manage a group of vllm instances, i.e AsyncvLLMServer."""
+
+    def __init__(self, config: DictConfig, worker_group: RayWorkerGroup, *, scheduler_kwargs: Dict[str, Any] = None):
+        """Initialize AsyncLLMServerManager.
+
+        Args:
+            config: DictConfig, actor_rollout_ref config.
+            worker_group: RayWorkerGroup, worker group of AsyncActorRolloutRefWorker.
+            scheduler_kwargs: Dict[str, Any], kwargs for chat scheduler.
+        """
+        self.config = config
+        self.worker_group = worker_group
+        self.scheduler_kwargs = scheduler_kwargs if scheduler_kwargs else {}
+
+        self.rollout_tp_size = self.config.rollout.tensor_model_parallel_size
+        self.rollout_dp_size = self.worker_group.world_size // self.rollout_tp_size
+        
+        # Allow overriding dp size to decouple async server count from worker_group size
+        dp_override = self.config.rollout.get("dp_size_override", None)
+        if isinstance(dp_override, int) and dp_override > 0:
+            logger.info(f"[AsyncLLMServerManager] Overriding DP size from {self.rollout_dp_size} to {dp_override}")
+            self.rollout_dp_size = dp_override
+
+        logger.info(f"[AsyncLLMServerManager] Initializing with TP size: {self.rollout_tp_size}, DP size: {self.rollout_dp_size}")
+        
+        register_center = ray.get_actor(f"{self.worker_group.name_prefix}_register_center")
+        workers_info = ray.get(register_center.get_worker_info.remote())
+        logger.info(f"[AsyncLLMServerManager] Workers info length: {len(workers_info)}, world_size: {self.worker_group.world_size}")
+        assert len(workers_info) == self.worker_group.world_size
+
+        self.async_llm_servers = [None] * self.rollout_dp_size
+        self.server_addresses = [None] * self.rollout_dp_size
+        self._is_awake = False
+        # For isolation mode hot-reload
+        # Accept either 'ckpt_dir' or 'checkpoint_root' via scheduler_kwargs
+        self.ckpt_dir = self.scheduler_kwargs.get("ckpt_dir") or self.scheduler_kwargs.get("checkpoint_root")
+        self._last_hf_dir: str | None = None
+
+        server_class = async_server_class(
+            rollout_backend=self.config.rollout.name,
+        )
+
+        # Start all server instances, restart if address already in use.
+        unready_dp_ranks = set(range(self.rollout_dp_size))
+        while len(unready_dp_ranks) > 0:
+            servers = {}
+            for rollout_dp_rank in unready_dp_ranks:
+                worker_index = (rollout_dp_rank * self.rollout_tp_size) % len(workers_info)
+                node_id = workers_info[worker_index]
+                logger.info(f"[AsyncLLMServerManager] Assigning rank {rollout_dp_rank} to node {node_id} (worker_index={worker_index})")
+                servers[rollout_dp_rank] = server_class.options(
+                    # make sure AsyncvLLMServer colocates with its corresponding workers
+                    scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                        node_id=node_id,
+                        soft=False,
+                    ),
+                    name=f"async_llm_server_{rollout_dp_rank}",
+                ).remote(config, self.rollout_dp_size, rollout_dp_rank, self.worker_group.name_prefix)
+
+            for rollout_dp_rank, server in servers.items():
+                try:
+                    address = ray.get(server.get_server_address.remote())
+                    self.server_addresses[rollout_dp_rank] = address
+                    self.async_llm_servers[rollout_dp_rank] = server
+                    unready_dp_ranks.remove(rollout_dp_rank)
+                except Exception as e:
+                    ray.kill(server)
+
+        # All server instances are ready, init AsyncLLM engine.
+        try:
+            ray.get([server.init_engine.remote() for server in self.async_llm_servers])
+        except Exception as e:
+            logger.error(f"[AsyncLLMServerManager] Error initializing engines: {e}")
+            raise
+
+        # Init user provided chat scheduler in sperate thread.
+        self.chat_scheduler: ChatCompletionScheduler = None
+        self.chat_scheduler_loop = None
+        self.chat_scheduler_ready = threading.Event()
+        self.chat_scheduler_thread = threading.Thread(target=self._init_chat_scheduler, daemon=True)
+        self.chat_scheduler_thread.start()
+        self.chat_scheduler_ready.wait()
+        logger.info("[AsyncLLMServerManager] Chat scheduler initialization completed")
+
+    def _init_chat_scheduler(self):
+        self.chat_scheduler_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.chat_scheduler_loop)
+
+        module_path, class_name = self.config.rollout.chat_scheduler.rsplit(".", 1)
+        module = importlib.import_module(module_path)
+        scheduler_cls = getattr(module, class_name)
+        # Filter out manager-only kwargs (e.g., ckpt_dir/checkpoint_root) not expected by schedulers
+        filtered_kwargs = dict(self.scheduler_kwargs)
+        filtered_kwargs.pop("ckpt_dir", None)
+        filtered_kwargs.pop("checkpoint_root", None)
+        self.chat_scheduler = scheduler_cls(
+            config=self.config.rollout,
+            model_path=self.config.model.path,
+            server_addresses=self.server_addresses,
+            **filtered_kwargs,
+        )
+
+        self.chat_scheduler_ready.set()
+        self.chat_scheduler_loop.run_forever()
+
+    def wake_up(self):
+        """Wake up rollout: ensure latest weights and warm HTTP engines.
+
+        - external_executor=True: delegate weight sync to workers via sharding manager.
+        - external_executor=False: if ckpt_dir provided, reload engine when
+          latest HF checkpoint path changes; then warm engines.
+        """
+        if self.config.rollout.get("external_executor", True):
+            try:
+                self.worker_group.execute_all_sync("execute_method", "wake_up")
+            except Exception as e:
+                logger.error(f"[AsyncLLMServerManager] Warning: worker wake_up failed: {e}")
+        else:
+            # Isolation mode: reload to latest HF export if present
+            if self.ckpt_dir:
+                from search_r1.utils.ckpt_utils import find_latest_hf_checkpoint
+                hf_dir = find_latest_hf_checkpoint(self.ckpt_dir)
+                logger.info(f"[AsyncLLMServerManager] Latest HF checkpoint: {hf_dir}, last used: {self._last_hf_dir}")
+                if hf_dir and hf_dir != self._last_hf_dir:
+                    ray.get([server.reload_model_from_hf_dir.remote(hf_dir) for server in self.async_llm_servers])
+                    self._last_hf_dir = hf_dir
+                    logger.info(f"[AsyncLLMServerManager] Reload completed successfully")
+        
+        ray.get([server.wake_up.remote() for server in self.async_llm_servers])
+        self._is_awake = True
+
+    def sleep(self):
+        """Sleep rollout: offload engines then release worker-side caches."""
+        logger.info("[AsyncLLMServerManager] sleep called")
+        # Phase 1: offload HTTP engines
+        ray.get([server.sleep.remote() for server in self.async_llm_servers])
+        
+        # Phase 2: ask workers to exit sharding context (offload weights)
+        try:
+            self.worker_group.execute_all_sync("execute_method", "sleep")
+        except Exception as e:
+            logger.error(f"[AsyncLLMServerManager] Warning: worker sleep failed: {e}")
+        self._is_awake = False
+
+    def ensure_ready(self):
+        """Ensure servers are ready with the latest weights without redundant wake/sleep."""
+        if self.config.rollout.get("external_executor", True):
+            self.wake_up()
+            return
+
+        # Isolation mode: reload only when HF path changes
+        if self.ckpt_dir:
+            from search_r1.utils.ckpt_utils import find_latest_hf_checkpoint, find_latest_actor_checkpoint
+            hf_dir = find_latest_hf_checkpoint(self.ckpt_dir)
+            logger.info(f"[AsyncLLMServerManager] Latest HF checkpoint: {hf_dir}, previous: {self._last_hf_dir}")
+            if hf_dir and hf_dir != self._last_hf_dir:
+                try:
+                    logger.info(f"[AsyncLLMServerManager] Attempting to reload {len(self.async_llm_servers)} servers")
+                    ray.get([server.reload_model_from_hf_dir.remote(hf_dir) for server in self.async_llm_servers])
+                    self._last_hf_dir = hf_dir
+                except Exception as e:
+                    logger.error(f"[AsyncLLMServerManager] Reload failed for {hf_dir}: {e}. Attempting rollback...")
+                   
+                    # Retry
+                    hf_dir2 = find_latest_hf_checkpoint(self.ckpt_dir) or _get_vllm_loadable_dir(find_latest_actor_checkpoint(self.ckpt_dir))
+                    logger.info(f"[AsyncLLMServerManager] Retry with checkpoint: {hf_dir2}")
+                    if hf_dir2 and hf_dir2 != hf_dir:
+                        self._last_hf_dir = hf_dir2
+                        logger.info(f"[AsyncLLMServerManager] Retry reload successful with {hf_dir2}")
+
+        if not self._is_awake:
+            ray.get([server.wake_up.remote() for server in self.async_llm_servers])
+            self._is_awake = True
+        
+    def submit_chat_completions(
+        self,
+        callback: Callable[[ChatCompletion, Dict[str, Any], Exception], None],
+        callback_additional_info: Dict[str, Any],
+        **chat_complete_request,
+    ):
+        """Submit a chat completion request to chat scheduler and wait until it is done.
+        To submit multiple requests in parallel, please use `generate_sequences` instead.
+
+        Args: same as ChatCompletionScheduler.submit_chat_completions.
+        """
+        assert self.chat_scheduler is not None, "chat scheduler is not initialized."
+        future = asyncio.run_coroutine_threadsafe(
+            self.chat_scheduler.submit_chat_completions(
+                callback=callback,
+                callback_additional_info=callback_additional_info,
+                **chat_complete_request,
+            ),
+            self.chat_scheduler_loop,
+        )
+        future.result()
+
+    def generate_sequences(self, prompts: DataProto, **sampling_params) -> DataProto:
+        """Generate multiple sequences in parallel via chat scheduler."""
+        assert self.chat_scheduler is not None, "chat scheduler is not initialized."
+
+        # Ensure engine has latest model weights before generation
+        self.ensure_ready()
+
+        future = asyncio.run_coroutine_threadsafe(self.chat_scheduler.generate_sequences(prompts, **sampling_params), self.chat_scheduler_loop)
+        return future.result()
+
+
+def async_server_class(rollout_backend: str) -> Type[AsyncServerBase]:
+    """Get async server class.
+
+    Args:
+        rollout_backend: str, rollout backend, should be "vllm" or "sglang".
+
+    Returns:
+        Type[AsyncServerBase]: async server class.
+    """
+    if rollout_backend == "vllm":
+        from verl.workers.rollout.vllm_rollout.vllm_async_server import AsyncvLLMServer
+        return AsyncvLLMServer
+    elif rollout_backend == "sglang":
+        from verl.workers.rollout.sglang_rollout.async_sglang_server import AsyncSglangServer
+
+        return AsyncSglangServer
+    else:
+        raise NotImplementedError
+
+def _get_vllm_loadable_dir(maybe_actor_dir: str) -> str | None:
+    """Return a path that vLLM can load as `model`.
+
+    Preference order:
+    - <actor_dir>/huggingface (expected HF export)
+    - <actor_dir> itself if it looks like HF (contains config.json)
+    Else return None.
+    """
+    try:
+        if not maybe_actor_dir:
+            return None
+        hf_sub = os.path.join(maybe_actor_dir, "huggingface")
+        if os.path.isdir(hf_sub):
+            return hf_sub
+        cfg = os.path.join(maybe_actor_dir, "config.json")
+        if os.path.isfile(cfg):
+            return maybe_actor_dir
+    except Exception:
+        pass
+    return None
