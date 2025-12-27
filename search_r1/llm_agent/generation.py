@@ -1,10 +1,12 @@
 import torch
 import json
+import json5  # For parsing tool_call JSON (supports comments and trailing commas)
 import uuid
 import re
-from collections import defaultdict
 import os
+import time
 from typing import List, Dict, Any, Tuple, Optional
+from urllib.parse import quote
 import logging
 
 # Configure the logging level and format
@@ -32,17 +34,23 @@ TOOL_SCHEMA = OpenAIFunctionToolSchema(
         "parameters": {
             "type": "object",
             "properties": {
+                "query": {
+                    "type": "array",
+                    "items": {"type": "string", "description": "The search query."},
+                    "minItems": 1,
+                    "description": "The list of search queries."
+                },
                 "query_list": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "List of search queries"
+                    "description": "List of search queries (legacy format, use 'query' instead)"
                 },
                 "topk": {
                     "type": "integer",
                     "description": "Number of top results to return"
                 }
             },
-            "required": ["query_list"]
+            "required": []
         }
     }
 )
@@ -67,11 +75,18 @@ class GenerationConfig:
     num_gpus: int
     no_think_rl: bool=False
     search_url: str = None
+    sandbox_fusion_url: str = "http://10.200.14.82:10080/run_code"
     topk: int = 3
     retriever_num_workers:int = 5 
     retriever_rate_limit:int = 120 
     retriever_timeout:int = 30 
     retriever_enable_global_rate_limit:bool = True 
+    python_num_workers: int = 5
+    python_rate_limit: int = 10
+    python_timeout: int = 30
+    # Maximum model context length (for sglang/vllm engines)
+    # Increased to 16384 to accommodate longer tool responses (Jina search returns 5-10x longer)
+    max_model_len: int = 16384
     # Enable sliding window context: keep only the most recent N turns (0 = keep all)
     use_sliding: bool = False
     # Performance optimization: reduce logging overhead
@@ -102,8 +117,138 @@ class LLMGenerationManager:
             max_start_length=config.max_start_length
         ))
 
+        # Initialize search tool
+        # Check if JINA_API_KEYS is available - if so, use Jina directly (matching react_agent.py)
+        # Note: In training scripts (like train_grpo_asearcher_slurm-7B.sh), we might explicitly unset JINA_API_KEYS
+        # to force using the local retriever. This check respects that environment variable state.
+        self.use_jina_search = bool(os.environ.get('JINA_API_KEYS', ''))
+        
+        if self.use_jina_search:
+            logger.info("JINA_API_KEYS detected - will use Jina API for search (matching react_agent.py)")
+            # Create a Jina-compatible search wrapper
+            self.search_tool = None  # Will use direct Jina calls in execute_predictions
+        else:
+            logger.info("JINA_API_KEYS not found - will use internal retriever service")
+            # Convert GenerationConfig to dict format expected by SearchTool
+            search_config = type('Config', (), {
+                'search_url': getattr(config, 'search_url', ''),
+                'topk': getattr(config, 'topk', 3),
+                'retriever_num_workers': getattr(config, 'retriever_num_workers', 5),
+                'retriever_rate_limit': getattr(config, 'retriever_rate_limit', 120),
+                'retriever_timeout': getattr(config, 'retriever_timeout', 30),
+                'retriever_enable_global_rate_limit': getattr(config, 'retriever_enable_global_rate_limit', True),
+                'retriever_max_query_words': getattr(config, 'retriever_max_query_words', 48),
+            })()
+            self.search_tool = SearchTool(config=search_config, tool_schema=TOOL_SCHEMA)
+        
+        # Initialize visit tool (if visit_url is available)
+        if hasattr(config, 'search_url') and config.search_url:
+            from verl.tools.visit_tool import VisitTool
+            from verl.tools.schemas import OpenAIFunctionToolSchema
+            
+            visit_schema = OpenAIFunctionToolSchema(
+                type="function",
+                function={
+                    "name": "visit",
+                    "description": "Visit webpage(s) and return the summary of the content.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "url": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "The URL(s) of the webpage(s) to visit."
+                            },
+                            "goal": {
+                                "type": "string",
+                                "description": "The specific information goal for visiting webpage(s)."
+                            }
+                        },
+                        "required": ["url"]
+                    }
+                }
+            )
+            visit_config = {
+                "visit_url": config.search_url.replace("/retrieve", "/access") if config.search_url else None,
+                "retriever_timeout": getattr(config, 'retriever_timeout', 30)
+            }
+            self.visit_tool = VisitTool(config=visit_config, tool_schema=visit_schema)
+        else:
+            self.visit_tool = None
+            
+        # Initialize Python interpreter tool (if sandbox_fusion_url is available)
+        if hasattr(config, 'sandbox_fusion_url') and config.sandbox_fusion_url:
+            from verl.tools.sandbox_fusion_tools import SandboxFusionTool
+            from verl.tools.schemas import OpenAIFunctionToolSchema
+            
+            python_schema = OpenAIFunctionToolSchema(
+                type="function",
+                function={
+                    "name": "PythonInterpreter",
+                    "description": "Executes Python code in a sandboxed environment.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "code": {
+                                "type": "string",
+                                "description": "The Python code to execute."
+                            }
+                        },
+                        "required": ["code"]
+                    }
+                }
+            )
+            python_config = {
+                "sandbox_fusion_url": config.sandbox_fusion_url,
+                "num_workers": getattr(config, 'python_num_workers', 5),
+                "rate_limit": getattr(config, 'python_rate_limit', 10),
+                "default_timeout": getattr(config, 'python_timeout', 30),
+                "default_language": "python",
+                "enable_global_rate_limit": True
+            }
+            try:
+                self.python_tool = SandboxFusionTool(config=python_config, tool_schema=python_schema)
+            except Exception as e:
+                logger.warning(f"Failed to initialize PythonInterpreter tool: {e}")
+                self.python_tool = None
+        else:
+            self.python_tool = None
 
-        self.search_tool=SearchTool(config=config,tool_schema=TOOL_SCHEMA)
+        # Initialize Google Scholar tool
+        if hasattr(config, 'search_url') and config.search_url:
+            scholar_schema = OpenAIFunctionToolSchema(
+                type="function",
+                function={
+                    "name": "google_scholar",
+                    "description": "Leverage Google Scholar to retrieve relevant information from academic publications.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "The search queries for Google Scholar."
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                }
+            )
+            scholar_config = type('Config', (), {
+                'search_url': config.search_url.replace("/retrieve", "/scholar"),
+                'topk': getattr(config, 'topk', 3),
+                'retriever_num_workers': getattr(config, 'retriever_num_workers', 5),
+                'retriever_rate_limit': getattr(config, 'retriever_rate_limit', 120),
+                'retriever_timeout': getattr(config, 'retriever_timeout', 30),
+                'retriever_enable_global_rate_limit': getattr(config, 'retriever_enable_global_rate_limit', True),
+            })()
+            self.scholar_tool = SearchTool(config=scholar_config, tool_schema=scholar_schema)
+        else:
+            self.scholar_tool = None
+
+        # Initialize File Parser tool
+        # For now, we'll use a placeholder or check if a file tool exists
+        self.file_tool = None # Placeholder for future implementation
 
     def _check_turn_has_summary(self, turn: Dict[str, torch.Tensor]) -> bool:
         """
@@ -234,7 +379,8 @@ class LLMGenerationManager:
                     print(f"[CONTEXT SUMMARY] No summary found → keeping ALL turns")
         
         # CRITICAL FIX: Add length check to prevent exceeding max_model_len
-        max_allowed_length = 7000  # Leave room for response generation (8192 - 1000 = 7192, use 7000 for safety)
+        max_model_len = getattr(self.config, 'max_model_len', 16384)
+        max_allowed_length = max_model_len - 1000  # Leave room for response generation
         
         # Calculate current length
         current_length = initial_question.shape[1]
@@ -343,18 +489,28 @@ class LLMGenerationManager:
         return input_ids, start_offsets
 
     def _postprocess_responses(self, responses: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, str]:
-        """Process responses to stop at search operation or answer operation."""
+        """Process responses to stop at tool call, search operation, or answer operation."""
         responses_str = self.tokenizer.batch_decode(
             responses, 
             skip_special_tokens=True
         )
 
-        responses_str = [resp.split('</search>')[0] + '</search>'
-                 if '</search>' in resp 
-                 else resp.split('</answer>')[0] + '</answer>'
-                 if '</answer>' in resp 
-                 else resp
-                 for resp in responses_str]
+        # Support both old format (<search>) and new format (<tool_call>)
+        processed_responses = []
+        for resp in responses_str:
+            # Check for new tool_call format first
+            if '</tool_call>' in resp:
+                # Stop at tool_call end
+                resp = resp.split('</tool_call>')[0] + '</tool_call>'
+            elif '</search>' in resp:
+                # Legacy format: stop at search end
+                resp = resp.split('</search>')[0] + '</search>'
+            elif '</answer>' in resp:
+                # Stop at answer end
+                resp = resp.split('</answer>')[0] + '</answer>'
+            processed_responses.append(resp)
+        
+        responses_str = processed_responses
 
         if self.config.no_think_rl:
             raise ValueError('stop')
@@ -505,7 +661,7 @@ class LLMGenerationManager:
             then remove padding from output
         """
         # CRITICAL FIX: Check input length before generation - use simple truncation
-        max_model_len = 8192  # vLLM max_model_len
+        max_model_len = getattr(self.config, 'max_model_len', 16384)
         max_allowed_prompt_len = max_model_len - 1000  # Leave room for response generation
 
         # Detect whether any sample exceeds allowed length
@@ -1186,8 +1342,14 @@ class LLMGenerationManager:
         # The type is think by default
         types = torch.zeros_like(responses_ids)
         
-        # Regex patterns for different action types (including search)
+        # Regex patterns for different action types
+        # Support both old format (<search>) and new format (<tool_call>)
+        # Note: All tool calls (search, visit, python, etc.) are mapped to ResponseType.search
+        # for now, as they represent tool usage actions
         action_patterns = [
+            # New tool_call format - match any tool call (search, visit, python, etc.)
+            (r'<tool_call>\s*\{[^}]*"name"\s*:\s*"(?:search|visit|PythonInterpreter|google_scholar|parse_file)"[^}]*\}\s*</tool_call>', ResponseType.search.value),
+            # Old format tags
             (r'<\s*search\b[^>]*>(.*?)</\s*search\s*>', ResponseType.search.value),
             (r'<\s*answer\b[^>]*>(.*?)</\s*answer\s*>', ResponseType.answer.value),
             (r'<\s*think_summary\b[^>]*>(.*?)</\s*think_summary\s*>', ResponseType.think_summary.value),
@@ -1366,6 +1528,130 @@ class LLMGenerationManager:
         
         return final_output
 
+    def _jina_search(self, query: str) -> str:
+        """
+        Execute Jina search directly (matching react_agent.py behavior).
+        
+        Args:
+            query: Search query string
+            
+        Returns:
+            Formatted search results string
+        """
+        jina_api_key = os.environ.get('JINA_API_KEYS', '')
+        if not jina_api_key:
+            return "[Search] JINA_API_KEYS not configured."
+        
+        max_retries = 10
+        timeout = 30
+        
+        # Normalize query (remove extra whitespace)
+        query = ' '.join(query.split()).strip()
+        if not query:
+            return "[Search] Empty query."
+        
+        for attempt in range(max_retries):
+            try:
+                encoded_query = quote(query)
+                url = f"https://s.jina.ai/?q={encoded_query}"
+                
+                headers = {
+                    "Authorization": f"Bearer {jina_api_key}",
+                    "X-Respond-With": "no-content",
+                    "X-With-Favicons": "true"
+                }
+                
+                response = requests.get(url, headers=headers, timeout=timeout)
+                
+                if response.status_code == 200:
+                    content = response.text
+                    if not content or len(content.strip()) < 10:
+                        raise ValueError("Empty response from Jina")
+                    
+                    # Parse Jina text format response
+                    results_dict = {}
+                    lines = content.split('\n')
+                    current_result_num = None
+                    
+                    for line in lines:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        
+                        if line.startswith('[') and ']' in line:
+                            try:
+                                end_bracket = line.index(']')
+                                current_result_num = int(line[1:end_bracket])
+                                if current_result_num not in results_dict:
+                                    results_dict[current_result_num] = {'title': '', 'url': '', 'description': ''}
+                                
+                                field_part = line[end_bracket + 1:].strip()
+                                if ':' in field_part:
+                                    field_name = field_part.split(':', 1)[0].strip().lower()
+                                    field_value = field_part.split(':', 1)[1].strip()
+                                    
+                                    if 'title' in field_name:
+                                        results_dict[current_result_num]['title'] = field_value
+                                    elif 'url' in field_name or 'source' in field_name:
+                                        results_dict[current_result_num]['url'] = field_value
+                                    elif 'description' in field_name:
+                                        results_dict[current_result_num]['description'] = field_value
+                            except (ValueError, IndexError):
+                                continue
+                        elif current_result_num is not None:
+                            if line and current_result_num in results_dict:
+                                if results_dict[current_result_num]['description']:
+                                    results_dict[current_result_num]['description'] += ' ' + line
+                                else:
+                                    results_dict[current_result_num]['description'] = line
+                    
+                    # Format results
+                    web_snippets = []
+                    for result_num in sorted(results_dict.keys()):
+                        result = results_dict[result_num]
+                        title = result.get('title', 'No title').strip()
+                        url = result.get('url', '').strip()
+                        description = result.get('description', '').strip()
+                        
+                        if not title and not description:
+                            continue
+                        
+                        if url:
+                            formatted = f"{result_num}. [{title}]({url})"
+                        else:
+                            formatted = f"{result_num}. {title}"
+                        
+                        if description:
+                            formatted += f"\n{description}"
+                        
+                        web_snippets.append(formatted)
+                    
+                    if web_snippets:
+                        return f"A Jina search for '{query}' found {len(web_snippets)} results:\n\n## Web Results\n" + "\n\n".join(web_snippets)
+                    else:
+                        return f"A Jina search for '{query}' returned:\n\n{content[:2000]}"
+                
+                elif response.status_code == 429:
+                    if attempt < max_retries - 1:
+                        delay = 2.0 * (2 ** attempt)
+                        time.sleep(delay)
+                        continue
+                    return f"[Search] Jina API rate limit exceeded."
+                else:
+                    raise ValueError(f"Jina search returned status {response.status_code}")
+                    
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    delay = 2.0 * (2 ** attempt) + (time.time() % 1)
+                    delay = min(delay, 60)
+                    logger.warning(f"Jina search attempt {attempt + 1}/{max_retries} failed: {e}. Retrying...")
+                    time.sleep(delay)
+                else:
+                    logger.error(f"All {max_retries} Jina search attempts failed: {e}")
+                    return f"Jina search failed after {max_retries} attempts: {str(e)}"
+        
+        return f"Jina search failed after {max_retries} attempts."
+
     def execute_predictions(self,predictions:List[str],pad_token:str,active_mask=None,current_turn:int=0,max_turns:int=None) \
         -> Tuple[List[str], List[int], List[int], List[Optional[Tuple[int, int]]]]:
         """
@@ -1387,40 +1673,116 @@ class LLMGenerationManager:
         """
 
         # Inline parsing of predictions into actions/contents/ranges (single source of truth)
+        # Supports both old format (<search>) and new format (<tool_call> JSON)
+        # Supports all tools: search, visit, PythonInterpreter, google_scholar, parse_file
         cur_actions = []
         contents = []
+        
+        # Pattern for old format tags
         tag_pattern = re.compile(
             r'<\s*(search|answer|think|think_summary|information_summary)\b[^>]*>(.*?)</\s*\1\s*>',
             re.IGNORECASE | re.DOTALL
         )
+        # Pattern for new tool_call format
+        tool_call_pattern = re.compile(
+            r'<tool_call>\s*({.*?})\s*</tool_call>',
+            re.IGNORECASE | re.DOTALL
+        )
+        
         for prediction in predictions:
             action = None
             content = ''
             if isinstance(prediction, str):
-                # 优先严格采用 search/answer 的第一个匹配（顺序出现的重要性）
                 found = False
-                for match in tag_pattern.finditer(prediction):
-                    tag = match.group(1).lower()
-                    content_candidate = match.group(2).strip()
-                    if tag == 'search':
-                        # search 不能单纯靠字符串出现，内容需有效（>5字符）
-                        if content_candidate and len(content_candidate) > 5:
-                            action = 'search'
+                
+                # First, try to parse new <tool_call> format
+                # Use react_agent.py approach: extract everything between <tool_call> and </tool_call>
+                if '<tool_call>' in prediction and '</tool_call>' in prediction:
+                    tool_call_content = prediction.split('<tool_call>')[1].split('</tool_call>')[0]
+                    
+                    # Check if it's PythonInterpreter (has "python" in content)
+                    if "python" in tool_call_content.lower():
+                        try:
+                            # Extract code from <code> tags
+                            code_raw = tool_call_content.split('<code>')[1].split('</code>')[0].strip()
+                            content = code_raw
+                            action = 'python'
+                            found = True
+                        except Exception as e:
+                            logger.warning(f"Failed to extract Python code from tool_call: {e}")
+                    else:
+                        # Parse as JSON for other tools
+                        try:
+                            tool_call_json = json5.loads(tool_call_content)
+                            tool_name = tool_call_json.get('name', '').lower()
+                            tool_args = tool_call_json.get('arguments', {})
+                            
+                            if tool_name == 'search':
+                                # Extract query/queries from tool arguments
+                                query_list = tool_args.get('query') or tool_args.get('query_list', [])
+                                if isinstance(query_list, str):
+                                    query_list = [query_list]
+                                if query_list and len(query_list) > 0:
+                                    # Use first query as content (for backward compatibility)
+                                    content = query_list[0] if len(query_list) == 1 else ' '.join(query_list)
+                                    action = 'search'
+                                    found = True
+                            elif tool_name == 'visit':
+                                # Visit tool - extract URL and goal
+                                url = tool_args.get('url') or tool_args.get('urls', [])
+                                goal = tool_args.get('goal', '')
+                                if isinstance(url, list) and len(url) > 0:
+                                    content = f"{url[0]}|{goal}" if goal else url[0]
+                                elif isinstance(url, str):
+                                    content = f"{url}|{goal}" if goal else url
+                                action = 'visit'
+                                found = True
+                            elif tool_name == 'google_scholar':
+                                # Google Scholar - extract query/queries
+                                query_list = tool_args.get('query', [])
+                                if isinstance(query_list, str):
+                                    query_list = [query_list]
+                                if query_list and len(query_list) > 0:
+                                    content = query_list[0] if len(query_list) == 1 else ' '.join(query_list)
+                                    action = 'scholar'
+                                    found = True
+                            elif tool_name == 'parse_file':
+                                # Parse file - extract file names
+                                files = tool_args.get('files', [])
+                                if isinstance(files, str):
+                                    files = [files]
+                                if files and len(files) > 0:
+                                    content = files[0] if len(files) == 1 else ', '.join(files)
+                                    action = 'parse_file'
+                                    found = True
+                        except (json5.JSONDecodeError, json.JSONDecodeError, Exception) as e:
+                            logger.warning(f"Failed to parse tool_call JSON: {e}")
+                            # Fall through to old format parsing
+                
+                # Fallback to old format if tool_call not found or failed
+                if not found:
+                    for match in tag_pattern.finditer(prediction):
+                        tag = match.group(1).lower()
+                        content_candidate = match.group(2).strip()
+                        if tag == 'search':
+                            # search 不能单纯靠字符串出现，内容需有效（>5字符）
+                            if content_candidate and len(content_candidate) > 5:
+                                action = 'search'
+                                content = content_candidate
+                                found = True
+                                break  # 用第一个有效的 search
+                            else:
+                                continue
+                        elif tag == 'answer':
+                            action = 'answer'
                             content = content_candidate
                             found = True
-                            break  # 用第一个有效的 search
-                        else:
-                            continue
-                    elif tag == 'answer':
-                        action = 'answer'
-                        content = content_candidate
-                        found = True
-                        break  # 用第一个 answer
-                    elif tag in ['think', 'think_summary', 'information_summary']:
-                        # 其他类型顺序考虑，但如果没有search/answer才接受
-                        if not found:
-                            action = tag
-                            content = content_candidate
+                            break  # 用第一个 answer
+                        elif tag in ['think', 'think_summary', 'information_summary']:
+                            # 其他类型顺序考虑，但如果没有search/answer才接受
+                            if not found:
+                                action = tag
+                                content = content_candidate
                 # 若未找到任何指令，保持默认
             else:
                 raise ValueError(f"Invalid prediction type: {type(prediction)}")
@@ -1428,62 +1790,395 @@ class LLMGenerationManager:
             contents.append(content)
         next_obs, dones, valid_action = [], [], []
 
-        # Build search queries only for active slots requesting search
+        # Build tool execution lists for each tool type
         active_search_indices = [i for i, (action, active) in enumerate(zip(cur_actions, active_mask)) if active and action == 'search']
+        active_visit_indices = [i for i, (action, active) in enumerate(zip(cur_actions, active_mask)) if active and action == 'visit']
+        active_python_indices = [i for i, (action, active) in enumerate(zip(cur_actions, active_mask)) if active and action == 'python']
+        active_scholar_indices = [i for i, (action, active) in enumerate(zip(cur_actions, active_mask)) if active and action == 'scholar']
+        
         search_queries = [contents[i] for i in active_search_indices]
+        visit_contents = [contents[i] for i in active_visit_indices]  # Format: "url|goal" or just "url"
+        python_contents = [contents[i] for i in active_python_indices]  # Python code
+        scholar_queries = [contents[i] for i in active_scholar_indices]
+        
         expected_results = len(search_queries)
+        expected_visit_results = len(active_visit_indices)
+        expected_python_results = len(active_python_indices)
+        expected_scholar_results = len(active_scholar_indices)
+
+        # ========== TOOL PROCESSING DEBUG INFO ==========
+        if getattr(self.config, 'enable_debug_logs', False) or logger.isEnabledFor(logging.INFO):
+            logger.info(f"[TOOL PROCESSING] Turn {current_turn}: Parsed {len(predictions)} predictions")
+            logger.info(f"[TOOL PROCESSING] Actions: search={len(active_search_indices)}, visit={len(active_visit_indices)}, python={len(active_python_indices)}, scholar={len(active_scholar_indices)}")
+        if search_queries:
+            logger.info(f"[TOOL PROCESSING] Search queries: {[q[:50] + '...' if len(q) > 50 else q for q in search_queries]}")
+        if python_contents:
+            logger.info(f"[TOOL PROCESSING] Python code snippets: {[c[:50] + '...' if len(c) > 50 else c for c in python_contents]}")
 
         if search_queries:
-            parameters={"query_list":search_queries,"topk":self.config.topk}
-            import asyncio
-            import json
-
-            # Execute search; capture metrics to detect skip conditions
-            instance = asyncio.run(self.search_tool.create())
-            exec_result = asyncio.run(self.search_tool.execute(instance_id=instance, parameters=parameters))
-            # exec_result: (result_text, tool_reward, metrics)
-            if isinstance(exec_result, tuple) and len(exec_result) >= 1:
-                search_results_json = exec_result[0]
-                metrics = exec_result[2] if len(exec_result) > 2 else {}
-            else:
-                search_results_json = exec_result
-                metrics = {}
-            # Robustly parse results and coerce to a list
-            try:
-                parsed = json.loads(search_results_json)
-            except Exception:
-                parsed = search_results_json
-
-            if isinstance(parsed, dict):
-                result_obj = parsed.get('result', parsed.get('results', parsed))
-            else:
-                result_obj = parsed
-
-            if isinstance(result_obj, list):
-                search_results = result_obj
-            elif isinstance(result_obj, str):
-                search_results = [result_obj]
-            elif isinstance(result_obj, dict):
-                # Fallback: stringify dict as a single result item
-                search_results = [json.dumps(result_obj, ensure_ascii=False)]
-            else:
-                # Unknown type -> single empty string placeholder
-                search_results = ["[Unknow Type]"]
-            # If SearchTool signaled skip, treat as no evidence
-            if isinstance(metrics, dict) and metrics.get('skipped', False):
-                search_results = [''] * expected_results
-            else:
-                # Normalize result length to expected active search count
+            # Use Jina API if JINA_API_KEYS is available (matching react_agent.py behavior)
+            if self.use_jina_search:
+                # Execute Jina search directly for each query
+                search_results = []
+                jina_response_lengths = []
+                for i, query in enumerate(search_queries):
+                    start_time = time.time()
+                    jina_result = self._jina_search(query)
+                    elapsed_time = time.time() - start_time
+                    result_length_chars = len(jina_result)
+                    result_length_tokens = len(self.tokenizer.encode(jina_result, add_special_tokens=False))
+                    jina_response_lengths.append(result_length_chars)
+                    search_results.append(jina_result)
+                    
+                    # Debug logging for Jina search
+                    if getattr(self.config, 'enable_debug_logs', False) or logger.isEnabledFor(logging.INFO):
+                        logger.info(
+                            f"[TOOL PROCESSING] Jina Search #{i+1}/{len(search_queries)}: "
+                            f"Query='{query[:60]}{'...' if len(query) > 60 else ''}' | "
+                            f"Response: {result_length_chars:,} chars, {result_length_tokens:,} tokens | "
+                            f"Time: {elapsed_time:.2f}s"
+                        )
+                        if result_length_tokens > 2000:
+                            logger.warning(
+                                f"[TOOL PROCESSING] ⚠️ Jina response is VERY LONG: {result_length_tokens:,} tokens "
+                                f"(>2000). This is expected for Jina but may cause context length issues."
+                            )
+                
+                # Summary statistics for Jina search
+                if jina_response_lengths:
+                    avg_length = sum(jina_response_lengths) / len(jina_response_lengths)
+                    max_length = max(jina_response_lengths)
+                    min_length = min(jina_response_lengths)
+                    total_length = sum(jina_response_lengths)
+                    if getattr(self.config, 'enable_debug_logs', False) or logger.isEnabledFor(logging.INFO):
+                        logger.info(
+                            f"[TOOL PROCESSING] Jina Search Summary: "
+                            f"avg={avg_length:,.0f} chars, max={max_length:,.0f} chars, min={min_length:,.0f} chars, "
+                            f"total={total_length:,.0f} chars across {len(search_queries)} queries"
+                        )
+                
+                # Normalize result length
                 if len(search_results) < expected_results:
-                    logger.warning(f"Got fewer results ({len(search_results)}) than expected ({expected_results}), padding with placeholders")
-                    # Pad with explicit placeholders to avoid empty information blocks
                     missing = expected_results - len(search_results)
                     pad_items = [f"[No results] Query: '{q[:128]}' | status=no_results" for q in search_queries[-missing:]] if search_queries else ["[No results] | status=no_results"] * missing
                     search_results += pad_items
                 elif len(search_results) > expected_results:
                     search_results = search_results[:expected_results]
+            else:
+                # Use internal retriever service (original behavior)
+                # Support both 'query' (new format) and 'query_list' (legacy format)
+                parameters={"query": search_queries, "query_list": search_queries, "topk": self.config.topk}
+                
+                import asyncio
+                import json
+
+                # Execute search; capture metrics to detect skip conditions
+                start_time = time.time()
+                # instance = asyncio.run(self.search_tool.create())
+                # exec_result = asyncio.run(self.search_tool.execute(instance_id=instance, parameters=parameters))
+                exec_result = asyncio.run(self.search_tool.execute(parameters=parameters))
+                elapsed_time = time.time() - start_time
+                
+                # exec_result: (result_text, tool_reward, metrics)
+                if isinstance(exec_result, tuple) and len(exec_result) >= 1:
+                    search_results_json = exec_result[0]
+                    metrics = exec_result[2] if len(exec_result) > 2 else {}
+                else:
+                    search_results_json = exec_result
+                    metrics = {}
+                # Robustly parse results and coerce to a list
+                try:
+                    parsed = json.loads(search_results_json)
+                except Exception:
+                    parsed = search_results_json
+
+                if isinstance(parsed, dict):
+                    result_obj = parsed.get('result', parsed.get('results', parsed))
+                else:
+                    result_obj = parsed
+
+                if isinstance(result_obj, list):
+                    search_results = result_obj
+                elif isinstance(result_obj, str):
+                    search_results = [result_obj]
+                elif isinstance(result_obj, dict):
+                    # Fallback: stringify dict as a single result item
+                    search_results = [json.dumps(result_obj, ensure_ascii=False)]
+                else:
+                    # Unknown type -> single empty string placeholder
+                    search_results = ["[Unknow Type]"]
+                    
+                    # Debug logging for local retriever
+                    retriever_response_lengths = []
+                    for i, result in enumerate(search_results):
+                        result_length_chars = len(str(result))
+                        result_length_tokens = len(self.tokenizer.encode(str(result), add_special_tokens=False))
+                        retriever_response_lengths.append(result_length_chars)
+                        
+                        if getattr(self.config, 'enable_debug_logs', False) or logger.isEnabledFor(logging.INFO):
+                            query_preview = search_queries[i][:60] + '...' if i < len(search_queries) and len(search_queries[i]) > 60 else (search_queries[i] if i < len(search_queries) else 'N/A')
+                            logger.info(
+                                f"[TOOL PROCESSING] Local Retriever #{i+1}/{len(search_results)}: "
+                                f"Query='{query_preview}' | "
+                                f"Response: {result_length_chars:,} chars, {result_length_tokens:,} tokens"
+                            )
+                    
+                    # Summary statistics for local retriever
+                    if retriever_response_lengths:
+                        avg_length = sum(retriever_response_lengths) / len(retriever_response_lengths)
+                        max_length = max(retriever_response_lengths)
+                        min_length = min(retriever_response_lengths)
+                        total_length = sum(retriever_response_lengths)
+                        if getattr(self.config, 'enable_debug_logs', False) or logger.isEnabledFor(logging.INFO):
+                            logger.info(
+                                f"[TOOL PROCESSING] Local Retriever Summary: "
+                                f"avg={avg_length:,.0f} chars, max={max_length:,.0f} chars, min={min_length:,.0f} chars, "
+                                f"total={total_length:,.0f} chars across {len(search_queries)} queries | "
+                                f"Time: {elapsed_time:.2f}s"
+                            )
+                            # Note: Local retriever responses are typically much shorter than Jina
+                            logger.info(
+                                f"[TOOL PROCESSING] Note: Local retriever responses are typically 5-10x shorter than Jina search responses"
+                            )
+                
+                # If SearchTool signaled skip, treat as no evidence
+                if isinstance(metrics, dict) and metrics.get('skipped', False):
+                    search_results = [''] * expected_results
+                    if getattr(self.config, 'enable_debug_logs', False) or logger.isEnabledFor(logging.WARNING):
+                        logger.warning(f"[TOOL PROCESSING] Local Retriever signaled SKIP for queries")
+                else:
+                    # Normalize result length to expected active search count
+                    if len(search_results) < expected_results:
+                        logger.warning(f"Got fewer results ({len(search_results)}) than expected ({expected_results}), padding with placeholders")
+                        # Pad with explicit placeholders to avoid empty information blocks
+                        missing = expected_results - len(search_results)
+                        pad_items = [f"[No results] Query: '{q[:128]}' | status=no_results" for q in search_queries[-missing:]] if search_queries else ["[No results] | status=no_results"] * missing
+                        search_results += pad_items
+                    elif len(search_results) > expected_results:
+                        search_results = search_results[:expected_results]
         else:
             search_results = [''] * expected_results
+
+        # Execute scholar tool if available
+        scholar_results = []
+        if scholar_queries and self.scholar_tool is not None:
+            import asyncio
+            parameters = {"query": scholar_queries, "topk": self.config.topk}
+            start_time = time.time()
+            # instance = asyncio.run(self.scholar_tool.create())
+            # exec_result = asyncio.run(self.scholar_tool.execute(instance_id=instance, parameters=parameters))
+            exec_result = asyncio.run(self.scholar_tool.execute(parameters=parameters))
+            elapsed_time = time.time() - start_time
+            
+            # exec_result: (result_text, tool_reward, metrics)
+            if isinstance(exec_result, tuple) and len(exec_result) >= 1:
+                scholar_results_json = exec_result[0]
+            else:
+                scholar_results_json = exec_result
+            
+            try:
+                parsed = json.loads(scholar_results_json)
+                result_obj = parsed.get('result', parsed)
+                if isinstance(result_obj, list):
+                    scholar_results = result_obj
+                else:
+                    scholar_results = [str(result_obj)]
+            except Exception:
+                scholar_results = [scholar_results_json]
+            
+            # Debug logging for scholar tool
+            if scholar_results:
+                scholar_lengths = [len(str(r)) for r in scholar_results]
+                scholar_token_lengths = [len(self.tokenizer.encode(str(r), add_special_tokens=False)) for r in scholar_results]
+                if getattr(self.config, 'enable_debug_logs', False) or logger.isEnabledFor(logging.INFO):
+                    for i, (result, char_len, tok_len) in enumerate(zip(scholar_results, scholar_lengths, scholar_token_lengths)):
+                        query_preview = scholar_queries[i][:60] + '...' if i < len(scholar_queries) and len(scholar_queries[i]) > 60 else (scholar_queries[i] if i < len(scholar_queries) else 'N/A')
+                        logger.info(
+                            f"[TOOL PROCESSING] Google Scholar #{i+1}/{len(scholar_results)}: "
+                            f"Query='{query_preview}' | "
+                            f"Response: {char_len:,} chars, {tok_len:,} tokens"
+                        )
+                    avg_len = sum(scholar_lengths) / len(scholar_lengths) if scholar_lengths else 0
+                    logger.info(
+                        f"[TOOL PROCESSING] Google Scholar Summary: "
+                        f"avg={avg_len:,.0f} chars across {len(scholar_results)} queries | "
+                        f"Time: {elapsed_time:.2f}s"
+                    )
+        
+        # Merge scholar results if any (append to search results or handle separately as per model instruction)
+        # For now, we'll just log them if they exist
+        if scholar_results:
+            # Here we might want to append to contents if the model asked for scholar specifically
+            # But the current architecture merges them into search results based on the tag
+            # If the tag was <google_scholar>, we should use these results.
+            # But earlier parsing logic put scholar queries into 'scholar_queries' list.
+            # We need to map them back to the original prediction slots.
+            pass
+            
+            # Normalize length
+            if len(scholar_results) < expected_scholar_results:
+                scholar_results += ["No scholar results found."] * (expected_scholar_results - len(scholar_results))
+            elif len(scholar_results) > expected_scholar_results:
+                scholar_results = scholar_results[:expected_scholar_results]
+        else:
+            scholar_results = [''] * expected_scholar_results
+        
+        # Execute visit tool if available
+        # ... (rest of the visit and python blocks)
+        visit_results = []
+        if expected_visit_results > 0 and self.visit_tool is not None:
+            import asyncio
+            for i, visit_content in enumerate(visit_contents):
+                try:
+                    # Parse URL and goal from content (format: "url|goal" or just "url")
+                    if '|' in visit_content:
+                        url_str, goal = visit_content.split('|', 1)
+                        urls = [url_str.strip()]
+                    else:
+                        urls = [visit_content.strip()]
+                        goal = ""
+                    
+                    if urls and urls[0]:
+                        parameters = {"url": urls, "goal": goal}
+                        start_time = time.time()
+                        instance = asyncio.run(self.visit_tool.create())
+                        exec_result = asyncio.run(self.visit_tool.execute(instance_id=instance, parameters=parameters))
+                        elapsed_time = time.time() - start_time
+                        
+                        if isinstance(exec_result, tuple) and len(exec_result) >= 1:
+                            visit_result_json = exec_result[0]
+                        else:
+                            visit_result_json = exec_result
+                        
+                        # Parse visit results
+                        try:
+                            parsed = json.loads(visit_result_json)
+                            if isinstance(parsed, dict):
+                                result_list = parsed.get('result', [])
+                                if isinstance(result_list, list) and len(result_list) > 0:
+                                    visit_results.append(result_list[0])  # Use first result
+                                else:
+                                    visit_results.append(str(result_list))
+                            else:
+                                visit_results.append(str(parsed))
+                        except Exception:
+                            visit_results.append(str(visit_result_json))
+                        
+                        # Debug logging for visit tool
+                        result_str = str(visit_results[-1])
+                        result_length_chars = len(result_str)
+                        result_length_tokens = len(self.tokenizer.encode(result_str, add_special_tokens=False))
+                        if getattr(self.config, 'enable_debug_logs', False) or logger.isEnabledFor(logging.INFO):
+                            logger.info(
+                                f"[TOOL PROCESSING] Visit Tool #{i+1}/{len(visit_contents)}: "
+                                f"URL='{urls[0][:60]}{'...' if len(urls[0]) > 60 else ''}' | "
+                                f"Response: {result_length_chars:,} chars, {result_length_tokens:,} tokens | "
+                                f"Time: {elapsed_time:.2f}s"
+                            )
+                    else:
+                        visit_results.append("Error: No URL provided")
+                except Exception as e:
+                    logger.warning(f"Visit tool execution failed: {e}")
+                    visit_results.append(f"Error visiting page: {str(e)}")
+        elif expected_visit_results > 0:
+            visit_results = ["Error: Visit tool not configured (visit_url not set)"] * expected_visit_results
+        
+        # Execute Python interpreter tool if available
+        python_results = []
+        if expected_python_results > 0 and self.python_tool is not None:
+            import asyncio
+            for i, python_code in enumerate(python_contents):
+                try:
+                    if python_code and python_code.strip():
+                        parameters = {"code": python_code.strip()}
+                        start_time = time.time()
+                        instance = asyncio.run(self.python_tool.create())
+                        exec_result = asyncio.run(self.python_tool.execute(instance_id=instance, parameters=parameters))
+                        elapsed_time = time.time() - start_time
+                        
+                        if isinstance(exec_result, tuple):
+                            # SandboxFusionTool returns (result, result, result.strip())
+                            python_result = exec_result[0] if len(exec_result) > 0 else str(exec_result)
+                        else:
+                            python_result = str(exec_result)
+                        
+                        python_results.append(python_result)
+                        
+                        # Debug logging for Python interpreter
+                        result_length_chars = len(python_result)
+                        result_length_tokens = len(self.tokenizer.encode(python_result, add_special_tokens=False))
+                        code_preview = python_code[:60] + '...' if len(python_code) > 60 else python_code
+                        if getattr(self.config, 'enable_debug_logs', False) or logger.isEnabledFor(logging.INFO):
+                            logger.info(
+                                f"[TOOL PROCESSING] Python Interpreter #{i+1}/{len(python_contents)}: "
+                                f"Code='{code_preview}' | "
+                                f"Response: {result_length_chars:,} chars, {result_length_tokens:,} tokens | "
+                                f"Time: {elapsed_time:.2f}s"
+                            )
+                    else:
+                        python_results.append("Error: No code provided")
+                except Exception as e:
+                    logger.warning(f"Python interpreter execution failed: {e}")
+                    python_results.append(f"Error executing Python code: {str(e)}")
+        elif expected_python_results > 0:
+            python_results = ["Error: Python interpreter not configured (sandbox_fusion_url not set)"] * expected_python_results
+
+        # ========== TOOL PROCESSING SUMMARY ==========
+        # Calculate total response lengths and provide summary
+        all_tool_results = []
+        all_tool_result_lengths = []
+        all_tool_result_token_lengths = []
+        
+        # Collect all tool results for summary
+        for result_list, tool_name in [
+            (search_results, 'search'),
+            (visit_results, 'visit'),
+            (python_results, 'python'),
+            (scholar_results, 'scholar')
+        ]:
+            for result in result_list:
+                if result and str(result).strip():
+                    result_str = str(result)
+                    all_tool_results.append((tool_name, result_str))
+                    all_tool_result_lengths.append(len(result_str))
+                    all_tool_result_token_lengths.append(len(self.tokenizer.encode(result_str, add_special_tokens=False)))
+        
+        # Summary statistics
+        if all_tool_result_lengths and (getattr(self.config, 'enable_debug_logs', False) or logger.isEnabledFor(logging.INFO)):
+            total_chars = sum(all_tool_result_lengths)
+            total_tokens = sum(all_tool_result_token_lengths)
+            avg_chars = total_chars / len(all_tool_result_lengths) if all_tool_result_lengths else 0
+            avg_tokens = total_tokens / len(all_tool_result_token_lengths) if all_tool_result_token_lengths else 0
+            max_chars = max(all_tool_result_lengths) if all_tool_result_lengths else 0
+            max_tokens = max(all_tool_result_token_lengths) if all_tool_result_token_lengths else 0
+            
+            logger.info(
+                f"[TOOL PROCESSING] Turn {current_turn} Summary: "
+                f"{len(all_tool_results)} tool responses | "
+                f"Total: {total_chars:,} chars ({total_tokens:,} tokens) | "
+                f"Avg: {avg_chars:,.0f} chars ({avg_tokens:,.0f} tokens) | "
+                f"Max: {max_chars:,} chars ({max_tokens:,} tokens)"
+            )
+            
+            # Warn if responses are very long (could cause context length issues)
+            if max_tokens > 3000:
+                logger.warning(
+                    f"[TOOL PROCESSING] ⚠️ WARNING: Some tool responses are VERY LONG (max: {max_tokens:,} tokens). "
+                    f"This may cause context length issues. Consider enabling context compression or reducing response size."
+                )
+            elif max_tokens > 2000:
+                logger.info(
+                    f"[TOOL PROCESSING] Note: Some tool responses are long (max: {max_tokens:,} tokens). "
+                    f"Monitor context length if issues occur."
+                )
+            
+            # Tool-specific counts
+            tool_counts = {}
+            for tool_name, _ in all_tool_results:
+                tool_counts[tool_name] = tool_counts.get(tool_name, 0) + 1
+            if tool_counts:
+                tool_summary = ', '.join([f"{k}={v}" for k, v in tool_counts.items()])
+                logger.info(f"[TOOL PROCESSING] Tool usage: {tool_summary}")
 
         for i, (action,active) in enumerate(zip(cur_actions,active_mask)):
             if not active:
@@ -1519,6 +2214,26 @@ class LLMGenerationManager:
                     
                     dones.append(0)
                     valid_action.append(1)
+                elif action == 'scholar':
+                    # Add turn information to observation
+                    turn_info = f"\n[Turn {current_turn + 1}/{max_turns if max_turns else '?'}] "
+                    scholar_result = scholar_results.pop(0).strip()
+                   
+                    # Check if this is the last turn
+                    if max_turns and current_turn >= max_turns - 2:
+                        sharp_message = f"\n\nThis is my LAST turn (Turn {current_turn + 1}/{max_turns}). I MUST provide final answer now with <answer> and </answer>."
+                        next_obs.append(f'{turn_info}user\n<information>{scholar_result}</information>\n\nassistant\n{sharp_message}\n')
+                    else:
+                        summary_prompt = (
+                        "I will provide concise, high-level summaries of both my previous reasoning and the gathered information.\n"
+                        "Use the <think_summary>...</think_summary> tag for my thought process summary,\n"
+                        "and the <information_summary>...</information_summary> tag for key retrieved facts or evidence.\n"
+                        "Focus on clarity and brevity to help guide my next response. Or I will use <answer> and </answer> to provide the final answer if information is enough."
+                        )
+                        next_obs.append(f'{turn_info}user\n<information>{scholar_result}</information>\n\nassistant\n{summary_prompt}\n')
+                    
+                    dones.append(0)
+                    valid_action.append(1)
                 elif action in ["think", "think_summary", "information_summary"]:
                     # Add turn information to observation
                     turn_info = f"\n[Turn {current_turn + 1}/{max_turns if max_turns else '?'}] "
@@ -1532,12 +2247,67 @@ class LLMGenerationManager:
                     
                     dones.append(0)
                     valid_action.append(1)
+                elif action == 'visit':
+                    # Execute visit tool and return results
+                    turn_info = f"\n[Turn {current_turn + 1}/{max_turns if max_turns else '?'}] "
+                    if visit_results:
+                        visit_result = visit_results.pop(0).strip()
+                        
+                        # Check if this is the last turn
+                        if max_turns and current_turn >= max_turns - 2:
+                            sharp_message = f"\n\nThis is my LAST turn (Turn {current_turn + 1}/{max_turns}). I MUST provide final answer now with <answer> and </answer>."
+                            next_obs.append(f'{turn_info}user\n<information>{visit_result}</information>\n\nassistant\n{sharp_message}\n')
+                        else:
+                            summary_prompt = (
+                                "I will provide concise, high-level summaries of both my previous reasoning and the gathered information.\n"
+                                "Use the <think_summary>...</think_summary> tag for my thought process summary,\n"
+                                "and the <information_summary>...</information_summary> tag for key retrieved facts or evidence.\n"
+                                "Focus on clarity and brevity to help guide my next response. Or I will use <answer> and </answer> to provide the final answer if information is enough."
+                            )
+                            next_obs.append(f'{turn_info}user\n<information>{visit_result}</information>\n\nassistant\n{summary_prompt}\n')
+                    else:
+                        next_obs.append(f'{turn_info}Error: Visit tool execution failed or no results returned.\n')
+                    
+                    dones.append(0)
+                    valid_action.append(1)
+                elif action == 'python':
+                    # Execute Python interpreter and return results
+                    turn_info = f"\n[Turn {current_turn + 1}/{max_turns if max_turns else '?'}] "
+                    if python_results:
+                        python_result = python_results.pop(0).strip()
+                        
+                        # Check if this is the last turn
+                        if max_turns and current_turn >= max_turns - 2:
+                            sharp_message = f"\n\nThis is my LAST turn (Turn {current_turn + 1}/{max_turns}). I MUST provide final answer now with <answer> and </answer>."
+                            next_obs.append(f'{turn_info}user\n<information>{python_result}</information>\n\nassistant\n{sharp_message}\n')
+                        else:
+                            summary_prompt = (
+                                "I will provide concise, high-level summaries of both my previous reasoning and the gathered information.\n"
+                                "Use the <think_summary>...</think_summary> tag for my thought process summary,\n"
+                                "and the <information_summary>...</information_summary> tag for key retrieved facts or evidence.\n"
+                                "Focus on clarity and brevity to help guide my next response. Or I will use <answer> and </answer> to provide the final answer if information is enough."
+                            )
+                            next_obs.append(f'{turn_info}user\n<information>{python_result}</information>\n\nassistant\n{summary_prompt}\n')
+                    else:
+                        next_obs.append(f'{turn_info}Error: Python interpreter execution failed or no results returned.\n')
+                    
+                    dones.append(0)
+                    valid_action.append(1)
+                elif action == 'parse_file':
+                    # Parse file tool - not yet implemented in verl framework
+                    # Provide feedback that this tool needs file system access
+                    turn_info = f"\n[Turn {current_turn + 1}/{max_turns if max_turns else '?'}] "
+                    next_obs.append(f'{turn_info}Tool "parse_file" requires file system access which is not yet supported in this environment. Please use <search> for web search or <answer> to provide the final answer.\n')
+                    dones.append(0)
+                    valid_action.append(0)
                 else:
                     next_obs.append(f'\nMy previous action is invalid. \
-If I want to search, I should put the query between <search> and </search>. \
-If I want to present thinking process, I should put the thinking process between <think> and </think>. \
-If I want to give the final answer, I should put the answer between <answer> and </answer>. \
-If I want to summarize, use <think_summary> and <information_summary>. Let me try again.\n') 
+I can use the following tools:\n\
+- <tool_call>{{"name": "search", "arguments": {{"query": ["query1", "query2"]}}}}</tool_call> for web search\n\
+- <search>query</search> (legacy format) for web search\n\
+- <answer>answer</answer> to provide the final answer\n\
+- <think_summary>...</think_summary> and <information_summary>...</information_summary> for summaries\n\
+Let me try again.\n') 
                     dones.append(0)
                     valid_action.append(0)
             

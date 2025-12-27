@@ -230,10 +230,14 @@ class SearchTool(BaseTool):
             tool_metrics: The metrics of the tool.
         """
         timeout = self.timeout
-        query_list_from_params = parameters.get("query_list")
+        query_list_from_params = parameters.get("query_list") or parameters.get("query")
+        
+        # Handle single string query (convert to list)
+        if isinstance(query_list_from_params, str):
+            query_list_from_params = [query_list_from_params]
 
         if not query_list_from_params or not isinstance(query_list_from_params, list):
-            error_msg = "Error: 'query_list' is missing, empty, or not a list in parameters."
+            error_msg = "Error: 'query_list' (or 'query') is missing, empty, or not a list in parameters."
             logger.error(f"[SearchTool] {error_msg} Received parameters: {parameters}")
             return json.dumps({"result": error_msg}), 0.0, {}
 

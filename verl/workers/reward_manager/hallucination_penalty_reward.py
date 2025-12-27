@@ -15,10 +15,13 @@
 import re
 import logging
 from typing import Dict, List, Optional, Tuple, Any
+import json
+import time
 
 import torch
 import numpy as np
 import threading
+import requests
 
 from verl import DataProto
 from verl.tools.schemas import TrajectoryComponent, TrajectoryFeedback
@@ -93,6 +96,24 @@ class HallucinationPenaltyRewardManager:
         if kwargs:
             self.config.update(kwargs)
 
+        # Initialize LLM judge settings
+        self.use_llm_judge = self.config.get("use_llm_judge", False)
+        if self.use_llm_judge:
+            # Get API key from config or environment variable
+            self.llm_judge_api_key = self.config.get("llm_judge_api_key") or os.environ.get("OPENAI_API_KEY")
+            self.llm_judge_base_url = self.config.get("llm_judge_base_url") or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+            self.llm_judge_model = self.config.get("llm_judge_model", "gpt-5-mini")
+            self.llm_judge_timeout = self.config.get("llm_judge_timeout", 30)
+            self.llm_judge_max_retries = self.config.get("llm_judge_max_retries", 3)
+            self.llm_judge_temperature = self.config.get("llm_judge_temperature", 0.3)
+            
+            if not self.llm_judge_api_key:
+                logger.warning("LLM judge enabled but no API key provided. Falling back to rule-based scoring.")
+                self.use_llm_judge = False
+            else:
+                logger.info(f"LLM judge enabled: model={self.llm_judge_model}, base_url={self.llm_judge_base_url}")
+                self.file_logger.info(f"LLM judge enabled: model={self.llm_judge_model}, base_url={self.llm_judge_base_url}")
+
         # In-memory caches
         self._cache_lock = threading.Lock()
         
@@ -101,8 +122,10 @@ class HallucinationPenaltyRewardManager:
         
         logger.info(f"HallucinationPenaltyRewardManager initialized.")
         logger.info(f"Reward config: per_step_distribution={self.config.get('per_step_distribution', 'last_token')}")
+        logger.info(f"LLM judge: {'enabled' if self.use_llm_judge else 'disabled'}")
         self.file_logger.info(f"Reward file path: {self.log_filename}")
         self.file_logger.info(f"Reward config: per_step_distribution={self.config.get('per_step_distribution', 'last_token')}")
+        self.file_logger.info(f"LLM judge: {'enabled' if self.use_llm_judge else 'disabled'}")
     
     def _get_hallucination_penalty_config(self):
         """Get configuration for hallucination penalty reward system"""
@@ -119,6 +142,14 @@ class HallucinationPenaltyRewardManager:
             "smooth_reward_transition": False,
             "step_level_allocation": True,
             "per_step_distribution": "even",  # Changed from "even" to "last_token" for stronger gradient signals
+            # LLM Judge configuration (for web tool correctness checking)
+            "use_llm_judge": False,                  # Enable/disable LLM as judge
+            "llm_judge_base_url": None,              # Base URL for OpenAI-compatible API (e.g., "https://api.openai.com/v1")
+            "llm_judge_api_key": None,               # API key (can also use OPENAI_API_KEY env var)
+            "llm_judge_model": "gpt-4o-mini",       # Model name for judging
+            "llm_judge_timeout": 30,                 # Timeout in seconds for API calls
+            "llm_judge_max_retries": 3,              # Maximum retries for API calls
+            "llm_judge_temperature": 0.0,           # Temperature for judge (0.0 for deterministic)
         }
     
     def _setup_logging(self):
@@ -194,8 +225,8 @@ class HallucinationPenaltyRewardManager:
             ground_truth=ground_truth
         )
         
-        # Compute component scores
-        answer_quality_score = self._score_answer_quality_simplified(answer_components, ground_truth)
+        # Compute component scores (with question for LLM judge if enabled)
+        answer_quality_score = self._score_answer_quality_simplified(answer_components, ground_truth, question=question)
         
         logger.info(f"Component scores - Answer: {answer_quality_score:.3f}")
         
@@ -431,9 +462,131 @@ class HallucinationPenaltyRewardManager:
             parts = [str(ground_truth).strip()]
         return [p for p in parts if isinstance(p, str) and p.strip()]
 
+    def _call_llm_judge(self, question: str, ground_truth: Any, model_response: str) -> Optional[float]:
+        """
+        Call LLM judge API to evaluate correctness of model response.
+        
+        Args:
+            question: The question being answered
+            ground_truth: The ground truth answer(s)
+            model_response: The model's response to evaluate
+            
+        Returns:
+            Score between 0.0 and 1.0, or None if API call fails
+        """
+        if not self.use_llm_judge or not self.llm_judge_api_key:
+            return None
+        
+        # Extract ground truth as string
+        gt_parts = self._extract_ground_truth_parts(ground_truth)
+        ground_truth_str = "; ".join(gt_parts) if gt_parts else str(ground_truth)
+        
+        # Construct judge prompt
+        judge_prompt = f"""You are an expert judge evaluating the correctness of an AI assistant's response.
+
+Question: {question}
+
+Ground Truth Answer: {ground_truth_str}
+
+Model's Response: {model_response}
+
+Evaluate whether the model's response is correct based on the ground truth. Consider:
+1. Factual correctness
+2. Completeness (does it answer the question fully?)
+3. Relevance (does it address the question asked?)
+
+Respond with ONLY a JSON object in this exact format:
+{{
+    "score": <float between 0.0 and 1.0>,
+    "reasoning": "<brief explanation>"
+}}
+
+Where score is:
+- 1.0: Completely correct and complete
+- 0.5-0.9: Partially correct or mostly correct with minor issues
+- 0.0-0.4: Incorrect or significantly flawed
+
+JSON response:"""
+        
+        # Prepare API request
+        headers = {
+            "Authorization": f"Bearer {self.llm_judge_api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": self.llm_judge_model,
+            "messages": [
+                {"role": "system", "content": "You are a precise evaluator. Always respond with valid JSON only."},
+                {"role": "user", "content": judge_prompt}
+            ],
+            "temperature": self.llm_judge_temperature,
+            "max_tokens": 200
+        }
+        
+        # Make API call with retries
+        for attempt in range(self.llm_judge_max_retries):
+            try:
+                response = requests.post(
+                    f"{self.llm_judge_base_url}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=self.llm_judge_timeout
+                )
+                response.raise_for_status()
+                
+                result = response.json()
+                content = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                
+                # Parse JSON response
+                try:
+                    # Try to extract JSON from response (handle cases where model adds extra text)
+                    json_match = re.search(r'\{[^{}]*"score"[^{}]*\}', content, re.DOTALL)
+                    if json_match:
+                        judge_result = json.loads(json_match.group(0))
+                    else:
+                        judge_result = json.loads(content)
+                    
+                    score = float(judge_result.get("score", 0.0))
+                    reasoning = judge_result.get("reasoning", "")
+                    
+                    # Clamp score to [0, 1]
+                    score = max(0.0, min(1.0, score))
+                    
+                    self.file_logger.info(f"[LLM Judge] Score: {score:.3f}, Reasoning: {reasoning}")
+                    return score
+                    
+                except (json.JSONDecodeError, KeyError, ValueError) as e:
+                    logger.warning(f"Failed to parse LLM judge response (attempt {attempt + 1}): {e}")
+                    self.file_logger.warning(f"[LLM Judge] Failed to parse response: {content[:200]}")
+                    if attempt < self.llm_judge_max_retries - 1:
+                        time.sleep(1)  # Brief delay before retry
+                        continue
+                    return None
+                    
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"LLM judge API call failed (attempt {attempt + 1}): {e}")
+                self.file_logger.warning(f"[LLM Judge] API call failed: {e}")
+                if attempt < self.llm_judge_max_retries - 1:
+                    time.sleep(1)  # Brief delay before retry
+                    continue
+                return None
+        
+        # All retries failed
+        logger.error("LLM judge API call failed after all retries")
+        self.file_logger.error("[LLM Judge] All retries failed, falling back to rule-based scoring")
+        return None
+
     def _score_answer_quality_simplified(self, answer_components: List[TrajectoryComponent], 
-                                       ground_truth) -> float:
-        """Simplified answer quality score: only consider exact matches"""
+                                       ground_truth, question: Optional[str] = None) -> float:
+        """
+        Score answer quality using LLM judge (if enabled) or rule-based matching.
+        
+        Args:
+            answer_components: List of answer components
+            ground_truth: Ground truth answer(s)
+            question: The question being answered (required for LLM judge)
+        """
         if not answer_components:
             return 0.0
         
@@ -447,8 +600,19 @@ class HallucinationPenaltyRewardManager:
             pass
         self.file_logger.debug(f"Scoring final answer: {final_answer[:100]}...")
         
-        gt_parts = self._extract_ground_truth_parts(ground_truth)
+        # Try LLM judge if enabled and question is available
+        if self.use_llm_judge and question:
+            llm_score = self._call_llm_judge(question, ground_truth, final_answer)
+            if llm_score is not None:
+                logger.debug(f"LLM judge score: {llm_score:.3f}")
+                self.file_logger.info(f"[LLM Judge] Final score: {llm_score:.3f}")
+                return llm_score
+            else:
+                logger.warning("LLM judge failed, falling back to rule-based scoring")
+                self.file_logger.warning("[LLM Judge] API call failed, using rule-based fallback")
         
+        # Fallback to rule-based scoring (exact match)
+        gt_parts = self._extract_ground_truth_parts(ground_truth)
         logger.debug(f"Ground truth parts: {gt_parts}")
         
         # Only check exact matches (case-insensitive)
