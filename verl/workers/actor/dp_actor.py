@@ -934,8 +934,8 @@ class DataParallelPPOActor(BasePPOActor):
                         calculate_entropy = True
                     
                     # Check if we need logits for consistency loss
-                    # Only needed if BOTH use_per_turn_summary AND use_full_context_supervision are enabled
-                    use_per_turn_summary = self.config.get('use_per_turn_summary', False)
+                    # Only needed if BOTH use_separated_loss AND use_full_context_supervision are enabled
+                    use_separated_loss = self.config.get('use_separated_loss', False)
                     use_full_context_supervision = self.config.get('use_full_context_supervision', False)
                     
                     # Forward pass: get log_probs (no need for logits!)
@@ -968,9 +968,10 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     trace_step = epoch * len(dataloader) + batch_idx
                     
-                    # use_per_turn_summary already checked above
-                    if use_per_turn_summary:
+                    # use_separated_loss already checked above
+                    if use_separated_loss:
                         # Use Per-Turn + Summary loss
+                        print(f"[DP Actor] use_separated_loss: {use_separated_loss}")
                         from verl.trainer.ppo.per_turn_summary_algos import compute_per_turn_summary_loss_wrapper
                         
                         # Get responses_types from data if available (for optimized summary mask extraction)

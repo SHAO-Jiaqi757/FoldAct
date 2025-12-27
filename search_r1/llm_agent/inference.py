@@ -553,7 +553,7 @@ def run_inference(
         max_response_length=config.get('max_response_length', 500),
         max_obs_length=config.get('max_obs_length', 2000),
         num_gpus=config.get('num_gpus', 1),
-        use_sliding=config.get('use_sliding_window', True),
+        use_summary=config.get('use_summary', False),  # Enable summary token generation (<think_summary>, <information_summary>)
         enable_debug_logs=config.get('enable_debug_logs', False),
         search_url=config.get('retriever_url'),
         topk=config.get('top_k', 3)
@@ -566,7 +566,7 @@ def run_inference(
         retriever_url=config.get('retriever_url', 'http://10.201.8.114:8000/retrieve'),
         top_k=config.get('top_k', 3),
         do_search=config.get('do_search', True),
-        use_sliding_window=config.get('use_sliding_window', True),
+        use_sliding_window=config.get('use_sliding_window', True),  # Enable sliding window context compression
         enable_debug_logs=config.get('enable_debug_logs', False)
     )
     
@@ -717,6 +717,8 @@ def main():
                         help="Enable search functionality")
     
     # Context management arguments
+    parser.add_argument("--use_summary", action='store_true',
+                        help="Enable summary token generation (<think_summary>, <information_summary>)")
     parser.add_argument("--use_sliding_window", action='store_true',
                         help="Enable sliding window context compression")
     parser.add_argument("--enable_debug_logs", action='store_true',
@@ -772,6 +774,7 @@ def main():
         'retriever_url': args.retriever_url,
         'top_k': args.top_k,
         'do_search': args.do_search,
+        'use_summary': args.use_summary,
         'use_sliding_window': args.use_sliding_window,
         'enable_debug_logs': args.enable_debug_logs,
         'prompt_template': args.prompt_template,

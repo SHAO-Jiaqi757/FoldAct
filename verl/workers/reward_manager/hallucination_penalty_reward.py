@@ -107,7 +107,7 @@ class HallucinationPenaltyRewardManager:
     def _get_hallucination_penalty_config(self):
         """Get configuration for hallucination penalty reward system"""
         return {
-            "information_penalty": -0.1,              # Penalty for <information> components (hallucination)
+            "information_penalty": -0.2,              # Penalty for <information> components (hallucination)
             "information_summary_bonus": 0.0,           # Bonus for <information_summary> components with context
             "information_summary_ground_truth_bonus": 0.2,  # Bonus when summaries correctly echo ground-truth evidence
             "format_bonus": 0.1,                     # Bonus for proper format (sequence ends with answer)
