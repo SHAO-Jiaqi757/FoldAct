@@ -485,7 +485,8 @@ def compute_policy_loss(
     # These are padding positions from per-turn training or other sources
     # Including them in loss calculation causes ratio explosion
     # When old_log_prob=0, ratio=exp(new_log_prob-0)=exp(new_log_prob) can be huge (e.g., exp(10)=22026)
-    is_invalid = (old_log_prob == 0.0) | (old_log_prob > -1e-6)  # Also catch very small negative values
+    # Also filter out extremely negative values (e.g. -1e8) used as padding markers by PerTurnContextManager
+    is_invalid = (old_log_prob == 0.0) | (old_log_prob > -1e-6) | (old_log_prob < -1e5)
     original_mask_count = mask.sum().item()
     mask = mask * (~is_invalid).float()
     filtered_mask_count = mask.sum().item()

@@ -913,7 +913,8 @@ class RayPPOTrainer:
             retriever_timeout = self.config.retriever.timeout ,
             retriever_enable_global_rate_limit = self.config.retriever.enable_global_rate_limit,
             use_summary = self.config.use_summary,
-            enable_debug_logs = self.config.enable_debug_logs
+            enable_debug_logs = self.config.enable_debug_logs,
+            max_model_len = self.config.get("max_model_len", 16384)
         )
 
         #Agent config preparation
@@ -1658,7 +1659,8 @@ class RayPPOTrainer:
             retriever_timeout = self.config.retriever.timeout ,
             retriever_enable_global_rate_limit = self.config.retriever.enable_global_rate_limit,
             use_summary = self.config.use_summary,
-            enable_debug_logs = self.config.enable_debug_logs
+            enable_debug_logs = self.config.enable_debug_logs,
+            max_model_len = self.config.get("max_model_len", 16384)
         )
 
         generation_manager = LLMGenerationManager(
@@ -1729,6 +1731,79 @@ class RayPPOTrainer:
                                 gen_batch=gen_batch,
                                 initial_input_ids=first_input_ids,
                             )
+
+                            # Filter out sequences that are too long to avoid OOM/AssertionError in log_prob computation
+                            # This handles the case where max_token_len is fixed and cannot be increased
+                            _max_len_cfg = self.config.actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu
+                            if _max_len_cfg is not None:
+                                try:
+                                    _max_len = int(_max_len_cfg)
+                                    _attention_mask = final_gen_batch_output.batch['attention_mask']
+                                    _seq_lens = _attention_mask.sum(dim=1)
+                                    _valid_mask = _seq_lens <= _max_len
+                                    
+                                    if not _valid_mask.all():
+                                        _num_dropped = (~_valid_mask).sum().item()
+                                        _total = len(_seq_lens)
+                                        print(f"[RayTrainer] Length Filtering: Dropping {_num_dropped}/{_total} sequences exceeding max_token_len {_max_len}. Max len found: {_seq_lens.max().item()}")
+                                        
+                                        if _num_dropped == _total:
+                                            print("[RayTrainer] All sequences dropped due to length limit! Skipping batch.")
+                                            continue
+                                            
+                                        # Filter DataProto using boolean mask
+                                        final_gen_batch_output = final_gen_batch_output[_valid_mask]
+                                except Exception as e:
+                                    print(f"[RayTrainer] Warning: Failed to apply length filtering: {e}")
+
+                            # ==================== CRITICAL DIAGNOSTIC FOR EMPTY RESPONSES ====================
+                            if 'responses' in final_gen_batch_output.batch:
+                                resp = final_gen_batch_output.batch['responses']
+                                # Handle empty response tensor (shape [batch_size, 0])
+                                if resp.dim() == 2 and resp.shape[1] == 0:
+                                    logger.error(f"[FATAL] Empty responses generated in run_llm_loop! Shape: {resp.shape}")
+                                    logger.error("Skipping this batch due to empty responses.")
+                                    continue
+                                
+                                # Handle dummy EOS-only responses (length 1) - Filter them out
+                                if resp.dim() == 2 and resp.shape[1] == 1:
+                                    # Check if all tokens are EOS/PAD
+                                    eos_id = self.tokenizer.eos_token_id
+                                    pad_id = self.tokenizer.pad_token_id
+                                    is_dummy = torch.logical_or(resp == eos_id, resp == pad_id).all(dim=1)
+                                    
+                                    if is_dummy.any():
+                                        num_dummy = is_dummy.sum().item()
+                                        total = resp.shape[0]
+                                        logger.warning(f"[RayTrainer] Detected {num_dummy}/{total} dummy responses (length 1, EOS/PAD). Filtering...")
+                                        
+                                        if num_dummy == total:
+                                            logger.error("All responses are dummy/empty. Skipping batch.")
+                                            continue
+                                            
+                                        # Filter out dummy responses
+                                        valid_mask = ~is_dummy
+                                        final_gen_batch_output = final_gen_batch_output[valid_mask]
+                                        
+                                        # Also filter the original batch (prompts etc) to match
+                                        # But wait, 'gen_batch' was already consumed by run_llm_loop.
+                                        # 'batch' variable holds the full data. We need to filter 'batch' too?
+                                        # Actually, final_gen_batch_output contains everything we need for the next steps
+                                        # because run_llm_loop returns a union of input and output.
+                                        # BUT, ray_trainer logic below does: batch = batch.union(final_gen_batch_output)
+                                        # So we MUST filter 'batch' (the original prompts) to match valid_mask
+                                        
+                                        # HACK: Re-align batch with valid_mask
+                                        # We need to filter the 'gen_batch' or 'batch' that corresponds to these responses.
+                                        # Since we are inside the 'else' block of async_rollout_mode check, 
+                                        # 'gen_batch' was passed to run_llm_loop.
+                                        # But 'batch' is what we union with.
+                                        
+                                        # We need to filter 'batch' using valid_mask
+                                        if isinstance(batch, DataProto):
+                                            batch = batch[valid_mask]
+                                        
+                            # =================================================================================
 
                             # HYPOTHESIS VERIFICATION: Check the fingerprint after serialization
                             # Use standard Python logging to avoid conflict with Tracking logger
@@ -2068,6 +2143,42 @@ class RayPPOTrainer:
                         # compute advantages, executed on the driver process
 
                         # norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
+                        # ==================== CRITICAL INVARIANT CHECK ====================
+                        # If response length is 0, downstream GAE will crash (stack expects non-empty list),
+                        # and reward managers / mask builders can also produce inconsistent shapes.
+                        # This should be extremely rare; when it happens, skip this batch with enough context to debug.
+                        try:
+                            _resp = batch.batch.get("responses", None)
+                            _rews = batch.batch.get("token_level_rewards", None)
+                            if isinstance(_resp, torch.Tensor) and _resp.dim() == 2 and _resp.size(1) == 0:
+                                uid_preview = None
+                                try:
+                                    uid_preview = batch.non_tensor_batch.get("uid", None)
+                                except Exception:
+                                    uid_preview = None
+                                logger.error(
+                                    "[EmptyResponse] step=%s: responses.shape=%s token_level_rewards.shape=%s "
+                                    "old_log_probs.shape=%s responses_types.shape=%s attention_mask.shape=%s uid=%s. "
+                                    "Skipping this batch.",
+                                    getattr(self, "global_steps", "NA"),
+                                    tuple(_resp.shape),
+                                    tuple(_rews.shape) if isinstance(_rews, torch.Tensor) else None,
+                                    tuple(batch.batch["old_log_probs"].shape) if "old_log_probs" in batch.batch else None,
+                                    tuple(batch.batch["responses_types"].shape) if "responses_types" in batch.batch else None,
+                                    tuple(batch.batch["attention_mask"].shape) if "attention_mask" in batch.batch else None,
+                                    uid_preview,
+                                )
+                                continue
+                            if isinstance(_rews, torch.Tensor) and _rews.dim() == 2 and _rews.size(1) == 0:
+                                logger.error(
+                                    "[EmptyRewards] step=%s: token_level_rewards.shape=%s responses.shape=%s. Skipping this batch.",
+                                    getattr(self, "global_steps", "NA"),
+                                    tuple(_rews.shape),
+                                    tuple(_resp.shape) if isinstance(_resp, torch.Tensor) else None,
+                                )
+                                continue
+                        except Exception as _e:
+                            logger.warning(f"[InvariantCheck] Exception during empty-length check: {_e}")
 
                         batch = compute_advantage(
                             batch,

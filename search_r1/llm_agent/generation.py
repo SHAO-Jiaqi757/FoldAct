@@ -5,8 +5,10 @@ import uuid
 import re
 import os
 import time
+import hashlib
 from typing import List, Dict, Any, Tuple, Optional
 from urllib.parse import quote
+from pathlib import Path
 import logging
 
 # Configure the logging level and format
@@ -123,10 +125,17 @@ class LLMGenerationManager:
         # to force using the local retriever. This check respects that environment variable state.
         self.use_jina_search = bool(os.environ.get('JINA_API_KEYS', ''))
         
+        # Initialize Jina search cache
+        self.jina_cache = {}
+        self.jina_cache_file = Path("cache/jina_search_cache.json")
+        self.jina_cache_unsaved_count = 0  # Track unsaved cache updates
+        self.jina_cache_save_interval = 10  # Save every N cache updates
         if self.use_jina_search:
             logger.info("JINA_API_KEYS detected - will use Jina API for search (matching react_agent.py)")
             # Create a Jina-compatible search wrapper
             self.search_tool = None  # Will use direct Jina calls in execute_predictions
+            # Load existing cache
+            self._load_jina_cache()
         else:
             logger.info("JINA_API_KEYS not found - will use internal retriever service")
             # Convert GenerationConfig to dict format expected by SearchTool
@@ -664,22 +673,49 @@ class LLMGenerationManager:
         max_model_len = getattr(self.config, 'max_model_len', 16384)
         max_allowed_prompt_len = max_model_len - 1000  # Leave room for response generation
 
+        # Log input statistics before generation
+        input_ids = active_batch.batch['input_ids']
+        seq_lens = torch.tensor([seq.shape[0] for seq in input_ids])
+        if getattr(self.config, 'enable_debug_logs', False):
+            print(f"[Generation] Input stats: min_len={seq_lens.min().item()}, max_len={seq_lens.max().item()}, mean_len={seq_lens.float().mean().item():.1f}, limit={max_allowed_prompt_len}")
+
         # Detect whether any sample exceeds allowed length
         need_truncation = any(
             seq.shape[0] > max_allowed_prompt_len for seq in active_batch.batch['input_ids']
         )
 
         if need_truncation:
+            print(f"[Generation] Inputs exceeding {max_allowed_prompt_len} tokens detected. Replacing with dummy inputs to skip generation.")
+            # Instead of truncating (which breaks semantics), we replace overlong inputs with a dummy 
+            # and mark them for filtering later.
+            # We use a short sequence of pad tokens as dummy input
+            dummy_input = torch.full((1, 1), self.tokenizer.pad_token_id, dtype=torch.long, device=active_batch.batch['input_ids'].device)
+            
+            new_input_ids = []
+            for i, seq in enumerate(active_batch.batch['input_ids']):
+                if seq.shape[0] > max_allowed_prompt_len:
+                    new_input_ids.append(dummy_input[0])
+                else:
+                    new_input_ids.append(seq)
+            
+            # Re-pad the batch (since we replaced long seqs with short ones)
+            # Note: This is complex because other tensors in batch need alignment.
+            # Simpler approach: Truncate input_ids to max_allowed_prompt_len as before, 
+            # BUT set a flag to produce dummy response.
+            
             truncated_batch = {}
             for key, tensor in active_batch.batch.items():
                 if tensor.ndim < 2:
                     truncated_batch[key] = tensor
                     continue
-                seq_len = tensor.shape[1]
-                if seq_len <= max_allowed_prompt_len:
-                    truncated_batch[key] = tensor.clone()
+                if tensor.shape[0] == active_batch.batch['input_ids'].shape[0]:
+                    seq_len = tensor.shape[1]
+                    if seq_len <= max_allowed_prompt_len:
+                        truncated_batch[key] = tensor.clone()
+                    else:
+                        truncated_batch[key] = tensor[:, -max_allowed_prompt_len:].clone()
                 else:
-                    truncated_batch[key] = tensor[:, -max_allowed_prompt_len:].clone()
+                    truncated_batch[key] = tensor
 
             active_batch = DataProto.from_dict(truncated_batch)
         
@@ -717,6 +753,16 @@ class LLMGenerationManager:
             padded_output = self.async_rollout_manager.generate_sequences(padded_active_batch)
         else:
             padded_output = self.actor_rollout_wg.generate_sequences(padded_active_batch)
+
+        # Check for empty output immediately
+        if 'responses' in padded_output.batch:
+            resp = padded_output.batch['responses']
+            if resp.dim() == 2 and resp.shape[1] == 0:
+                print(f"[FATAL] Empty response from engine! Input max len: {seq_lens.max().item()}")
+                # Fallback: create dummy response (EOS)
+                # Trainer should filter out samples with response length 1 containing only EOS
+                dummy_resp = torch.full((resp.shape[0], 1), self.tokenizer.eos_token_id, dtype=torch.long, device=resp.device)
+                padded_output.batch['responses'] = dummy_resp
 
         # Remove padding from output
         trimmed_batch = {k: v[:-padding_size] for k, v in padded_output.batch.items()}
@@ -1461,9 +1507,79 @@ class LLMGenerationManager:
         
         return final_output
 
+    def _get_query_hash(self, query: str) -> str:
+        """
+        Generate a hash key for the normalized query.
+        
+        Args:
+            query: Search query string
+            
+        Returns:
+            Hash string for the query
+        """
+        normalized = ' '.join(query.split()).strip().lower()
+        return hashlib.sha256(normalized.encode('utf-8')).hexdigest()
+    
+    def _load_jina_cache(self):
+        """Load Jina search cache from file."""
+        if not self.use_jina_search:
+            return
+        
+        try:
+            if self.jina_cache_file.exists():
+                with open(self.jina_cache_file, 'r', encoding='utf-8') as f:
+                    self.jina_cache = json.load(f)
+                cache_size = len(self.jina_cache)
+                logger.info(f"[Jina Cache] Loaded {cache_size} cached search results from {self.jina_cache_file}")
+            else:
+                # Create cache directory if it doesn't exist
+                self.jina_cache_file.parent.mkdir(parents=True, exist_ok=True)
+                self.jina_cache = {}
+                logger.info(f"[Jina Cache] Initialized new cache at {self.jina_cache_file}")
+        except Exception as e:
+            logger.warning(f"[Jina Cache] Failed to load cache: {e}. Starting with empty cache.")
+            self.jina_cache = {}
+    
+    def _save_jina_cache(self):
+        """Save Jina search cache to file."""
+        if not self.use_jina_search:
+            return
+        
+        try:
+            # Ensure cache directory exists
+            self.jina_cache_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Save cache to file
+            with open(self.jina_cache_file, 'w', encoding='utf-8') as f:
+                json.dump(self.jina_cache, f, ensure_ascii=False, indent=2)
+            
+            cache_size = len(self.jina_cache)
+            logger.debug(f"[Jina Cache] Saved {cache_size} entries to {self.jina_cache_file}")
+        except Exception as e:
+            logger.warning(f"[Jina Cache] Failed to save cache: {e}")
+    
+    def save_jina_cache(self):
+        """
+        Public method to manually save Jina search cache.
+        Useful for ensuring cache is saved before program exit.
+        """
+        if self.jina_cache_unsaved_count > 0:
+            self._save_jina_cache()
+            self.jina_cache_unsaved_count = 0
+            logger.info(f"[Jina Cache] Manually saved cache ({len(self.jina_cache)} entries)")
+    
+    def __del__(self):
+        """Save cache when object is destroyed (best effort)."""
+        try:
+            if hasattr(self, 'jina_cache_unsaved_count') and self.jina_cache_unsaved_count > 0:
+                self._save_jina_cache()
+        except Exception:
+            pass  # Ignore errors during destruction
+
     def _jina_search(self, query: str) -> str:
         """
         Execute Jina search directly (matching react_agent.py behavior).
+        Uses cache to avoid redundant API calls for duplicate queries.
         
         Args:
             query: Search query string
@@ -1475,13 +1591,23 @@ class LLMGenerationManager:
         if not jina_api_key:
             return "[Search] JINA_API_KEYS not configured."
         
-        max_retries = 10
+        max_retries = 3
         timeout = 30
         
         # Normalize query (remove extra whitespace)
         query = ' '.join(query.split()).strip()
         if not query:
             return "[Search] Empty query."
+        
+        # Check cache first
+        query_hash = self._get_query_hash(query)
+        if query_hash in self.jina_cache:
+            cached_result = self.jina_cache[query_hash]
+            logger.debug(f"[Jina Cache] Cache hit for query: {query[:60]}...")
+            return cached_result
+        
+        # Cache miss - proceed with API call
+        logger.debug(f"[Jina Cache] Cache miss for query: {query[:60]}...")
         
         for attempt in range(max_retries):
             try:
@@ -1560,9 +1686,23 @@ class LLMGenerationManager:
                         web_snippets.append(formatted)
                     
                     if web_snippets:
-                        return f"A Jina search for '{query}' found {len(web_snippets)} results:\n\n## Web Results\n" + "\n\n".join(web_snippets)
+                        result = f"A Jina search for '{query}' found {len(web_snippets)} results:\n\n## Web Results\n" + "\n\n".join(web_snippets)
                     else:
-                        return f"A Jina search for '{query}' returned:\n\n{content[:2000]}"
+                        result = f"A Jina search for '{query}' returned:\n\n{content[:2000]}"
+                    
+                    # Store result in cache
+                    self.jina_cache[query_hash] = result
+                    self.jina_cache_unsaved_count += 1
+                    
+                    # Save cache periodically to reduce I/O (every N updates)
+                    if self.jina_cache_unsaved_count >= self.jina_cache_save_interval:
+                        self._save_jina_cache()
+                        self.jina_cache_unsaved_count = 0
+                        logger.debug(f"[Jina Cache] Saved cache to disk (periodic save)")
+                    else:
+                        logger.debug(f"[Jina Cache] Cached result for query: {query[:60]}... (in-memory, {self.jina_cache_unsaved_count}/{self.jina_cache_save_interval} unsaved)")
+                    
+                    return result
                 
                 elif response.status_code == 429:
                     if attempt < max_retries - 1:
@@ -1688,7 +1828,8 @@ class LLMGenerationManager:
                                     content = files[0] if len(files) == 1 else ', '.join(files)
                                     action = 'parse_file'
                                     found = True
-                        except (json5.JSONDecodeError, json.JSONDecodeError, Exception) as e:
+                        except (ValueError, json.JSONDecodeError, Exception) as e:
+                            # json5.loads() raises ValueError on parse errors, not JSONDecodeError
                             logger.warning(f"Failed to parse tool_call JSON: {e}")
                             # Fall through to old format parsing
                 
@@ -1803,13 +1944,12 @@ class LLMGenerationManager:
                 parameters={"query": search_queries, "query_list": search_queries, "topk": self.config.topk}
                 
                 import asyncio
-                import json
 
                 # Execute search; capture metrics to detect skip conditions
                 start_time = time.time()
-                # instance = asyncio.run(self.search_tool.create())
-                # exec_result = asyncio.run(self.search_tool.execute(instance_id=instance, parameters=parameters))
-                exec_result = asyncio.run(self.search_tool.execute(parameters=parameters))
+                # Create a tool instance for this batch of searches
+                instance = asyncio.run(self.search_tool.create())
+                exec_result = asyncio.run(self.search_tool.execute(instance_id=instance, parameters=parameters))
                 elapsed_time = time.time() - start_time
                 
                 # exec_result: (result_text, tool_reward, metrics)

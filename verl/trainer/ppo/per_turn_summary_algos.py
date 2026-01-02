@@ -548,6 +548,16 @@ def compute_per_turn_summary_loss_wrapper(
         per_turn_valid_mask = _align_optional(per_turn_valid_mask).to(device=response_mask.device, dtype=response_mask.dtype)
         response_mask = response_mask * per_turn_valid_mask
     
+    # CRITICAL FIX: Filter out invalid old_log_probs (e.g. padding from PerTurnContextManager set to -1e8)
+    # This prevents huge negative KL divergence (-10^7) and exploding loss when resuming from checkpoint
+    # where mask alignment might be slightly off due to truncation or padding differences
+    is_invalid_old_log_prob = (old_log_prob < -1e5)
+    if is_invalid_old_log_prob.any():
+        if enable_debug:
+             # logging is not available here easily, but we silently fix it
+             pass
+        response_mask = response_mask * (~is_invalid_old_log_prob).float()
+
     # Compute Per-Turn + Summary loss
     loss_dict = compute_per_turn_summary_loss(
         log_probs=log_prob,
