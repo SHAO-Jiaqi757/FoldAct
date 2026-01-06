@@ -185,6 +185,7 @@ class Worker(Worker):
         # Profile the memory usage of the model and get the maximum number of
         # cache blocks that can be allocated with the remaining free memory.
         torch.cuda.empty_cache()
+        self.init_gpu_memory = torch.cuda.mem_get_info()[0]
         # torch.cuda.reset_peak_memory_stats()
 
         # Execute a forward pass with dummy inputs to profile the memory usage
@@ -195,7 +196,7 @@ class Worker(Worker):
         # profiled peak memory.
         torch.cuda.synchronize()
         free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info()
-        peak_memory = total_gpu_memory - free_gpu_memory
+        peak_memory = self.init_gpu_memory - free_gpu_memory
 
         assert peak_memory > 0, "Error in memory profiling. This happens when the GPU memory was not properly cleaned up before initializing the vLLM instance."
 
