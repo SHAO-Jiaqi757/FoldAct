@@ -1,6 +1,5 @@
 import torch
 import json
-import json5  # For parsing tool_call JSON (supports comments and trailing commas)
 import uuid
 import re
 import os
@@ -1786,6 +1785,7 @@ class LLMGenerationManager:
                     else:
                         # Parse as JSON for other tools
                         try:
+                            import json5
                             tool_call_json = json5.loads(tool_call_content)
                             tool_name = tool_call_json.get('name', '').lower()
                             tool_args = tool_call_json.get('arguments', {})
@@ -1829,7 +1829,6 @@ class LLMGenerationManager:
                                     action = 'parse_file'
                                     found = True
                         except (ValueError, json.JSONDecodeError, Exception) as e:
-                            # json5.loads() raises ValueError on parse errors, not JSONDecodeError
                             logger.warning(f"Failed to parse tool_call JSON: {e}")
                             # Fall through to old format parsing
                 
@@ -2374,10 +2373,17 @@ class LLMGenerationManager:
                     dones.append(0)
                     valid_action.append(0)
                 else:
-                    next_obs.append(f'\nMy previous action is invalid. \
+                    if self.use_jina_search:
+                        next_obs.append(f'\nMy previous action is invalid. \
 I can use the following tools:\n\
 - <tool_call>{{"name": "search", "arguments": {{"query": ["query1", "query2"]}}}}</tool_call> for web search\n\
-- <search>query</search> (legacy format) for web search\n\
+- <answer>answer</answer> to provide the final answer\n\
+- <think_summary>...</think_summary> and <information_summary>...</information_summary> for summaries\n\
+Let me try again.\n') 
+                    else:
+                        next_obs.append(f'\nMy previous action is invalid. \
+I can use the following tools:\n\
+- <search>query</search> for information search\n\
 - <answer>answer</answer> to provide the final answer\n\
 - <think_summary>...</think_summary> and <information_summary>...</information_summary> for summaries\n\
 Let me try again.\n') 

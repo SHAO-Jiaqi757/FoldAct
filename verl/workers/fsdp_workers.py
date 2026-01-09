@@ -913,18 +913,28 @@ class CriticWorker(Worker):
         if getattr(critic_model_config, "model_type", None) == "kimi_vl":
             critic_model_config.text_config.topk_method = "greedy"
 
-        init_context = get_init_weight_context_manager(use_meta_tensor=not critic_model_config.tie_word_embeddings, mesh=self.device_mesh)
+        use_meta_tensor = not critic_model_config.tie_word_embeddings
+        init_context = get_init_weight_context_manager(use_meta_tensor=use_meta_tensor, mesh=self.device_mesh)
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
             critic_model_config.classifier_dropout = 0.0
             critic_model_config.hidden_dropout = "0"
-            critic_module = AutoModelForTokenClassification.from_pretrained(
-                pretrained_model_name_or_path=local_path,
-                torch_dtype=torch_dtype,
-                config=critic_model_config,
-                trust_remote_code=config.model.get("trust_remote_code", False),
-            )
+            # Use low_cpu_mem_usage to reduce memory footprint during loading
+            # Only use device_map="cpu" when not using meta tensor (tie_word_embeddings=True)
+            # Meta tensor initialization doesn't load weights, so device_map is not needed
+            from_pretrained_kwargs = {
+                "pretrained_model_name_or_path": local_path,
+                "torch_dtype": torch_dtype,
+                "config": critic_model_config,
+                "trust_remote_code": config.model.get("trust_remote_code", False),
+                "low_cpu_mem_usage": True,
+            }
+            # Only set device_map when not using meta tensor to avoid conflicts
+            if not use_meta_tensor:
+                from_pretrained_kwargs["device_map"] = "cpu"  # Keep model on CPU until FSDP wraps it
+            
+            critic_module = AutoModelForTokenClassification.from_pretrained(**from_pretrained_kwargs)
 
             use_remove_padding = config.model.get("use_remove_padding", False)
 
@@ -935,7 +945,14 @@ class CriticWorker(Worker):
             )
 
             # some parameters may not in torch_dtype
+            # Ensure model stays on CPU - don't move to GPU here
+            # FSDP will handle device placement during wrapping
             critic_module.to(torch_dtype)
+            # Explicitly ensure model is on CPU before FSDP wrapping to prevent OOM
+            # This is critical when tie_word_embeddings=True (no meta tensor)
+            if not use_meta_tensor and next(critic_module.parameters(), None) is not None:
+                if next(critic_module.parameters()).is_cuda:
+                    critic_module = critic_module.cpu()
 
             if config.model.get("enable_gradient_checkpointing", False):
                 critic_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -974,9 +991,27 @@ class CriticWorker(Worker):
         auto_wrap_policy = get_fsdp_wrap_policy(module=critic_module, config=self.config.model.fsdp_config.wrap_policy, is_lora=self.config.model.get('lora_rank', 0) > 0)
 
         log_gpu_memory_usage("Before critic FSDP", logger=None)
+        
+        # Verify model is on CPU before FSDP wrapping to prevent OOM
+        if self.rank == 0:
+            first_param = next(critic_module.parameters(), None)
+            if first_param is not None:
+                param_device = "cuda" if first_param.is_cuda else "cpu"
+                logger.info(f"[CriticInit] Model parameters on {param_device} before FSDP wrapping")
+                if first_param.is_cuda:
+                    logger.warning(f"[CriticInit] WARNING: Model is on GPU before FSDP wrapping! This may cause OOM. Moving to CPU...")
+                    critic_module = critic_module.cpu()
+                    log_gpu_memory_usage("After moving critic model to CPU", logger=logger)
 
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
+        
+        # Get the correct device ID for FSDP
+        # When CUDA_VISIBLE_DEVICES is set, current_device() returns the logical device (0, 1, ...)
+        # which corresponds to the visible physical devices
+        device_id = get_torch_device().current_device()
+        if self.rank == 0:
+            logger.info(f"[CriticInit] FSDP device_id={device_id}, world_size={torch.distributed.get_world_size()}, rank={self.rank}")
 
         # Note: We force turn off CPUOffload for critic because it causes incorrect results when using grad accumulation
         if config.strategy == "fsdp":
@@ -985,7 +1020,7 @@ class CriticWorker(Worker):
                 param_init_fn=init_fn,
                 use_orig_params=False,
                 auto_wrap_policy=auto_wrap_policy,
-                device_id=get_torch_device().current_device(),
+                device_id=device_id,
                 sharding_strategy=sharding_strategy,
                 mixed_precision=mixed_precision,
                 sync_module_states=True,
