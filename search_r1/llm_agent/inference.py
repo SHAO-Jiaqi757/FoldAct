@@ -10,6 +10,7 @@
 
 import argparse
 import json
+import os
 import re
 import torch
 from typing import List, Dict, Optional, Tuple, Union
@@ -738,14 +739,53 @@ def main():
     elif model_path:
         model_path = _normalize_local_path(model_path)
     
+    # Convert to absolute path to ensure it's treated as a local path, not a HF repo ID
+    model_path = os.path.abspath(model_path)
+    
+    # Verify the path exists and is a directory
+    if not os.path.isdir(model_path):
+        raise FileNotFoundError(f"Model directory not found: {model_path}")
+    
+    # Check if required files exist locally to confirm it's a valid local model directory
+    config_file = os.path.join(model_path, "config.json")
+    if not os.path.isfile(config_file):
+        raise FileNotFoundError(f"config.json not found in model directory: {model_path}")
+    
     logger.info(f"Loading model from: {model_path}")
     
     # 加载模型和 tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path, 
-        padding_side='left',
-        trust_remote_code=True
-    )
+    # Workaround: Set HF_HUB_OFFLINE to bypass Hub validation for local paths
+    # The transformers library validates path format before checking local_files_only
+    original_hf_offline = os.environ.get("HF_HUB_OFFLINE", None)
+    try:
+        # Force offline mode to bypass Hub validation
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, 
+            padding_side='left',
+            trust_remote_code=True,
+            local_files_only=True
+        )
+    except Exception as e:
+        # If still fails, try without local_files_only (will check local first)
+        error_str = str(e)
+        if "HFValidationError" in str(type(e).__name__) or "repo id must be" in error_str.lower():
+            logger.warning(f"HF Hub path validation failed, trying alternative load method: {error_str}")
+            # Try loading without local_files_only - transformers checks local first automatically
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path, 
+                padding_side='left',
+                trust_remote_code=True,
+                local_files_only=False
+            )
+        else:
+            raise
+    finally:
+        # Restore original HF_HUB_OFFLINE setting
+        if original_hf_offline is None:
+            os.environ.pop("HF_HUB_OFFLINE", None)
+        else:
+            os.environ["HF_HUB_OFFLINE"] = original_hf_offline
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     

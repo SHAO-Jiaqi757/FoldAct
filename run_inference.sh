@@ -6,7 +6,7 @@
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=4,5
 
-MODEL_PATH="verl_checkpoints/consistency-loss-agent-drop0.5-qwen2.5-3b-it-context-monitoring/global_step_120/actor/huggingface"
+MODEL_PATH="verl_checkpoints/consistency-loss-agent-dropout-0.8-qwen2.5-3b-it-context-monitoring/global_step_120/actor/huggingface"
 
 # Run inference for HotpotQA and PopQA using a for loop
 
@@ -29,7 +29,7 @@ for dataset in "${!DATASETS[@]}"; do
         --output_path "$output_path" \
         --max_turns 8 \
         --max_new_tokens 2048 \
-        --val_batch_size 20 \
+        --val_batch_size 32 \
         --retriever_url "http://10.200.14.82:5000/retrieve" \
         --top_k 3 \
         --do_search \

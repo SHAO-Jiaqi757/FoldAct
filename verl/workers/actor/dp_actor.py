@@ -21,6 +21,7 @@ import itertools
 import logging
 import os
 from typing import Tuple, Optional
+import gc
 from contextlib import nullcontext
 import numpy as np
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
@@ -1111,6 +1112,11 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss / self.gradient_accumulation
                     
                     # Use scaler.scale() if using mixed precision training
+                    # Clean cache to avoid OOM
+                    gc.collect()
+                    if is_cuda_available:
+                        torch.cuda.empty_cache()
+
                     if self.scalar is not None:
                         self.scalar.scale(loss).backward()
                     else:

@@ -8,7 +8,6 @@
 # - Enable KL-aware training (10% full context, 90% compressed)
 # - Enable context length monitoring for WandB
 ################################################################################
-bash set_proxy.sh
 
 # GPU Configuration
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
@@ -70,7 +69,7 @@ echo "[INFO] Checkpoint contents:"
 ls -lh "$CHECKPOINT_DIR" | head -10
 
 # Experiment Name
-export EXPERIMENT_NAME=consistency-loss-agent-gae-qwen2.5-3b-it-context-monitoring
+export EXPERIMENT_NAME=consistency-loss-agent-dropout-0.8-qwen2.5-3b-it-context-monitoring
 
 ################################################################################
 # vLLM Configuration
@@ -189,11 +188,11 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.clip_ratio_c=5.0 \
     \
     `# ========== ACTOR FSDP & BATCH SIZE ==========` \
-    actor_rollout_ref.actor.ppo_mini_batch_size=128 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=64 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.actor.use_dynamic_bsz=true \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192 \
-    actor_rollout_ref.actor.fsdp_config.param_offload=false \
+    actor_rollout_ref.actor.fsdp_config.param_offload=true \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
     +actor_rollout_ref.actor.fsdp_config.grad_offload=true \
     +actor_rollout_ref.actor.dtype=float16 \
@@ -204,20 +203,20 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.max_model_len=8192 \
     actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.2 \
     actor_rollout_ref.rollout.enable_chunked_prefill=true \
     actor_rollout_ref.rollout.n_agent=1 \
     env.rollout.n=6 \
     \
     `# ========== LOG PROB & DYNAMIC BATCH SIZE ==========` \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=true \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=8192 \
     \
     `# ========== REFERENCE MODEL CONFIGURATION ==========` \
     +actor_rollout_ref.ref.model.path=$BASE_MODEL \
     +actor_rollout_ref.ref.dtype=float16 \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=true \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=8192 \
     actor_rollout_ref.ref.fsdp_config.param_offload=true \
@@ -231,7 +230,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.total_epochs=15 \
-    trainer.total_training_steps=402 \
+    trainer.total_training_steps=390 \
     trainer.save_freq=30 \
     trainer.test_freq=100 \
     trainer.resume_mode=enable \
@@ -241,7 +240,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.experiment_log_dir=logs/paper_experiments \
     trainer.default_hdfs_dir=null \
     trainer.default_local_dir=verl_checkpoints/$EXPERIMENT_NAME \
-    trainer.max_actor_ckpt_to_keep=2 \
+    trainer.max_actor_ckpt_to_keep=1 \
     trainer.max_critic_ckpt_to_keep=1 \
     trainer.log_val_generations=5 \
     \
@@ -275,7 +274,8 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     \
     `# ========== 🚀 OPTIMIZED PER-TURN TRAINING ==========` \
     `# Selective per-turn: only use for final 2 turns (efficiency optimization)` \
-    +per_turn_dropout_prob=0.5 \
+    +per_turn_dropout_prob=0.8 \
+    trainer.full_context_consistency_interval=100 
     \
     `# ========== 🆕 PER-TURN + SUMMARY TRAINING ==========` \
     `# Enable Per-Turn + Summary method (separated log_prob computation)` \
